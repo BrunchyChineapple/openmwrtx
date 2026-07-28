@@ -13,6 +13,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -104,6 +105,36 @@ namespace
         }
     }
 
+    /// True when an environment variable is set to anything other than empty or "0".
+    bool envFlag(const char* name)
+    {
+        const char* value = std::getenv(name);
+        return value != nullptr && *value != '\0' && *value != '0';
+    }
+
+    /// Parses "1600x900" out of an environment variable. Leaves the outputs untouched and returns
+    /// false when the variable is unset or malformed.
+    bool envWindowSize(const char* name, uint32_t& width, uint32_t& height)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return false;
+
+        unsigned parsedWidth = 0;
+        unsigned parsedHeight = 0;
+        if (std::sscanf(value, "%ux%u", &parsedWidth, &parsedHeight) != 2 || parsedWidth == 0
+            || parsedHeight == 0)
+        {
+            Log(Debug::Warning) << "Remix: ignoring " << name << "='" << value
+                                << "', expected a size like 1600x900";
+            return false;
+        }
+
+        width = parsedWidth;
+        height = parsedHeight;
+        return true;
+    }
+
     HWND nativeHandle(SDL_Window* window)
     {
         if (window == nullptr)
@@ -126,49 +157,101 @@ namespace
 
     constexpr const wchar_t* kHiddenWindowClass = L"OpenMWRemixPresentSink";
 
-    /// Creates the offscreen window Remix presents into.
+    LRESULT CALLBACK presentWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+    {
+        // Closing this window must not destroy it. Remix's swapchain is bound to this HWND and the
+        // runtime keeps presenting into it every frame, so a destroyed window would leave the device
+        // presenting to nothing. Hide instead, which lets the user dismiss the Remix view without
+        // taking the runtime down.
+        if (message == WM_CLOSE)
+        {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    /// Creates the window Remix presents into.
     ///
     /// Remix only produces its raytracing output as part of presenting, so a frame has to be driven.
-    /// Presenting onto OpenMW's window would mean two presenters -- a Vulkan swapchain and OpenMW's
-    /// OpenGL context -- fighting over the same surface. Instead Remix gets a window of its own that is
-    /// never shown, and we take the finished image via dxvk_CopyRenderingOutput and composite it into
-    /// OpenMW's frame ourselves.
+    /// Presenting onto OpenMW's own window would mean two presenters -- a Vulkan swapchain and
+    /// OpenMW's OpenGL context -- fighting over one surface, so Remix gets a window of its own and we
+    /// take the finished image via dxvk_CopyRenderingOutput.
     ///
     /// It is sized to the intended render resolution rather than 1x1, because the swapchain dimensions
     /// determine what resolution Remix renders at.
-    HWND createHiddenPresentWindow(uint32_t width, uint32_t height)
+    ///
+    /// @param visible show the window. Worth understanding what this does and does not change:
+    ///        nothing about the render path, because the runtime already presents into this window's
+    ///        swapchain every frame whether or not anyone can see it. What it buys is the **Remix
+    ///        developer menu**, which the runtime rasterises into the presented swapchain image inside
+    ///        D3D9SwapChainEx::PresentImage -- after the backbuffer has been blitted in, so it exists
+    ///        only in the presented image and is not reachable through either the D3D9 backbuffer or
+    ///        rtOutput.m_finalOutput. Showing the window is therefore the only way to reach that menu
+    ///        that does not require a fork-side capture of the post-overlay image. DXVK subclasses
+    ///        this HWND when it creates the swapchain, so once the window is visible and focused its
+    ///        input reaches ImGui without any forwarding on our side.
+    HWND createPresentWindow(uint32_t width, uint32_t height, bool visible)
     {
         static bool classRegistered = false;
         if (!classRegistered)
         {
             WNDCLASSEXW wc = {};
             wc.cbSize = sizeof(wc);
-            wc.lpfnWndProc = DefWindowProcW;
+            // Our own proc rather than DefWindowProcW for the WM_CLOSE handling above. It also keeps
+            // DXVK's subclassing on the ordinary path: it chains to whatever proc it replaced, and a
+            // null previous proc is what makes it fall back to the 32-bit bridge message channel,
+            // which has nothing to do with us.
+            wc.lpfnWndProc = presentWindowProc;
             wc.hInstance = GetModuleHandleW(nullptr);
             wc.lpszClassName = kHiddenWindowClass;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            // A deliberately unmistakable background. With a null brush an unpainted window shows
+            // whatever the compositor last had, which reads as plain white -- indistinguishable from
+            // "Remix presented a blown-out frame". Anything still this colour has never been presented
+            // into, which turns a guess into an observation.
+            wc.hbrBackground = CreateSolidBrush(RGB(40, 0, 60));
             if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
             {
-                Log(Debug::Error) << "Remix: could not register the present-sink window class, error "
+                Log(Debug::Error) << "Remix: could not register the present window class, error "
                                   << GetLastError();
                 return nullptr;
             }
             classRegistered = true;
         }
 
-        // Never shown, so there is no ShowWindow call and the compositor never has to present it.
-        // WS_EX_NOREDIRECTIONBITMAP would additionally suppress the redirection surface, but it needs
-        // _WIN32_WINNT >= 0x0602 and OpenMW targets lower; not worth raising the whole project's
-        // Windows version for a window that stays hidden.
+        // A caption when visible, so the window can be moved off OpenMW's; borderless when not, since
+        // nothing will ever look at it. Sizing is the trap here: CreateWindowExW takes the *whole*
+        // window size including non-client area, so a captioned window asked for 3840x2160 yields a
+        // 3824x2121 client area, and Remix sizes its swapchain -- hence its render resolution -- to
+        // the client area. AdjustWindowRectEx inflates the request by exactly the non-client size, so
+        // the client area comes out at the resolution asked for whatever the style is. The previous
+        // revision used WS_POPUP to dodge this by having no non-client area at all; doing it properly
+        // means the style is now free to change.
         //
-        // WS_POPUP rather than WS_OVERLAPPED, and this is not cosmetic: CreateWindowExW sizes the whole
-        // window including borders and caption, so WS_OVERLAPPED at 3840x2160 yielded a 3824x2121 client
-        // area and Remix sized its swapchain -- and therefore its render resolution -- to that instead.
-        // WS_POPUP has no non-client area, so client size equals the size requested.
-        const HWND hwnd = CreateWindowExW(0, kHiddenWindowClass, L"OpenMW Remix present sink", WS_POPUP,
-            0, 0, static_cast<int>(width), static_cast<int>(height), nullptr, nullptr,
-            GetModuleHandleW(nullptr), nullptr);
+        // No thick frame or maximise box: a resize would change the client area, and the runtime
+        // reacts to that by resetting the swapchain underneath us.
+        const DWORD style = visible ? (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) : WS_POPUP;
+        RECT rect = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+        AdjustWindowRectEx(&rect, style, FALSE, 0);
+
+        const HWND hwnd = CreateWindowExW(0, kHiddenWindowClass, L"RTX Remix (OpenMW)", style,
+            CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr,
+            nullptr, GetModuleHandleW(nullptr), nullptr);
         if (hwnd == nullptr)
-            Log(Debug::Error) << "Remix: could not create the present-sink window, error " << GetLastError();
+        {
+            Log(Debug::Error) << "Remix: could not create the present window, error " << GetLastError();
+            return nullptr;
+        }
+
+        if (visible)
+        {
+            // SHOWNOACTIVATE so OpenMW keeps keyboard focus at startup: its own menu is what starts a
+            // game, and there is no 3D scene to look at until one is running. Click this window when
+            // you want the Remix menu.
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
         return hwnd;
     }
 }
@@ -191,6 +274,7 @@ namespace RemixRT
         IDirect3DSurface9* mOutputSurface = nullptr;
         ExternalImage mOutputImage;
         bool mHaveOutput = false;
+        ExternalSync mOutputSync;
 
         // Built-in test scene, created once on first submit.
         remixapi_MaterialHandle mTestMaterial = nullptr;
@@ -276,7 +360,13 @@ namespace RemixRT
             return false;
         }
 
-        mImpl->mPresentWindow = createHiddenPresentWindow(width, height);
+        // Optional override of Remix's render resolution. Independent of OpenMW's window because it is
+        // the present window's client area that sizes the swapchain. Useful for tuning: a 4K path
+        // traced view is both slow and large enough to bury OpenMW's window.
+        envWindowSize("OPENMW_REMIX_WINDOW_SIZE", width, height);
+
+        const bool showPresentWindow = envFlag("OPENMW_REMIX_WINDOW");
+        mImpl->mPresentWindow = createPresentWindow(width, height, showPresentWindow);
         if (mImpl->mPresentWindow == nullptr)
         {
             unloadModule();
@@ -338,10 +428,89 @@ namespace RemixRT
 
         Log(Debug::Info) << "Remix: runtime initialised from " << runtimePath << " (API "
                          << REMIXAPI_VERSION_MAJOR << "." << REMIXAPI_VERSION_MINOR << "."
-                         << REMIXAPI_VERSION_PATCH << ", " << width << "x" << height
-                         << ", presenting to an offscreen window)";
+                         << REMIXAPI_VERSION_PATCH << ", " << width << "x" << height << ", presenting to "
+                         << (showPresentWindow ? "its own visible window" : "an offscreen window") << ")";
 
-        return createOutputTarget(width, height);
+        // No longer conditional on the window being visible. The runtime now draws its menu into the
+        // output image that copyOutputSynced copies, so the menu arrives through OpenMW's own frame
+        // and does not need Remix's presenter -- which does not reach the screen in this process
+        // anyway.
+        enableDeveloperMenu();
+
+        if (!createOutputTarget(width, height))
+            return false;
+
+        // Not fatal. Without the semaphores the GL consumer has no ordering against the copy, which is
+        // undefined under GL_EXT_memory_object and reads as black; the composite logs that and carries
+        // on so the failure is visible rather than silent.
+        createOutputSync();
+        return true;
+    }
+
+    int Runtime::uiState() const
+    {
+        if (!mImpl->mStarted || mImpl->mApi.GetUIState == nullptr)
+            return -1;
+        return static_cast<int>(mImpl->mApi.GetUIState());
+    }
+
+    bool Runtime::setUiState(int state)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.SetUIState == nullptr)
+            return false;
+
+        remixapi_UIState mapped;
+        switch (state)
+        {
+            case 0:
+                mapped = REMIXAPI_UI_STATE_NONE;
+                break;
+            case 1:
+                mapped = REMIXAPI_UI_STATE_BASIC;
+                break;
+            case 2:
+                mapped = REMIXAPI_UI_STATE_ADVANCED;
+                break;
+            default:
+                return false;
+        }
+        return mImpl->mApi.SetUIState(mapped) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    void Runtime::enableDeveloperMenu()
+    {
+        // The runtime only draws the menu when its UI state is non-zero, and it defaults to none, so a
+        // visible window on its own would show a bare render. 0 = none, 1 = basic, 2 = advanced;
+        // advanced is the one carrying weather and the atmosphere presets.
+        //
+        // Set through SetUIState rather than setConfigVariable("rtx.showUI", "2"). The config route
+        // takes a string, and its return value reports only that the option *name* resolved -- a value
+        // that fails to parse into the runtime's enum is indistinguishable from success. SetUIState
+        // takes the enum directly and routes to the same switchMenu the runtime's own hotkey uses.
+        // Default off. The menu is drawn into the same image OpenMW composites, so leaving it on by
+        // default would put it over every frame of an ordinary run and muddle any comparison against
+        // the raster path. run-remix-menu.cmd asks for it explicitly.
+        int requested = 0;
+        if (const char* fromEnv = std::getenv("OPENMW_REMIX_UI"); fromEnv != nullptr && *fromEnv != '\0')
+            requested = std::atoi(fromEnv);
+
+        if (requested == 0)
+            return;
+
+        const bool uiOk = setUiState(requested);
+
+        // Unlike the UI state this one genuinely is a config option with no typed entry point. It only
+        // affects which menu the runtime's own Alt+X reopens after a close, so a silent parse failure
+        // here costs a keystroke, not the feature.
+        setConfigVariable("rtx.defaultToAdvancedUI", "True");
+
+        // Deliberately not logging "accepted" here. The state change is deferred to the end of the
+        // Remix frame, so nothing can be confirmed yet -- engine.cpp reads it back a few frames in and
+        // logs what the runtime actually reports.
+        Log(Debug::Info) << "Remix: requested developer menu state " << requested << " ("
+                         << (uiOk ? "call succeeded, applies at end of frame" : "CALL FAILED")
+                         << "). Alt+X toggles it, Alt+Delete its mouse cursor; the Remix window needs "
+                            "keyboard focus first.";
     }
 
     bool Runtime::createOutputTarget(unsigned int width, unsigned int height)
@@ -426,6 +595,53 @@ namespace RemixRT
             return false;
         return mImpl->mApi.dxvk_CopyRenderingOutput(
                    mImpl->mOutputSurface, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR)
+            == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    bool Runtime::createOutputSync()
+    {
+        mImpl->mOutputSync = {};
+
+        if (!mImpl->mStarted)
+            return false;
+        if (mImpl->mApi.dxvk_GetOutputSyncSemaphores == nullptr)
+        {
+            Log(Debug::Error) << "Remix: this runtime predates dxvk_GetOutputSyncSemaphores. Rebuild "
+                                 "the Remix runtime from the matching branch, or the composited frame "
+                                 "will keep reading as black.";
+            return false;
+        }
+
+        remixapi_dxvk_OutputSyncInfo info = {};
+        const remixapi_ErrorCode status = mImpl->mApi.dxvk_GetOutputSyncSemaphores(&info);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+        {
+            Log(Debug::Error) << "Remix: dxvk_GetOutputSyncSemaphores failed: " << describe(status);
+            return false;
+        }
+
+        mImpl->mOutputSync.mCopyComplete = info.copyComplete;
+        mImpl->mOutputSync.mConsumerDone = info.consumerDone;
+
+        Log(Debug::Info) << "Remix: output sync semaphores acquired (copyComplete 0x" << std::hex
+                         << info.copyComplete << ", consumerDone 0x" << info.consumerDone << std::dec
+                         << "); these are NT handles, unlike the image's KMT handle";
+        return mImpl->mOutputSync.valid();
+    }
+
+    const Runtime::ExternalSync& Runtime::outputSync() const
+    {
+        return mImpl->mOutputSync;
+    }
+
+    bool Runtime::copyOutputSynced(bool consumerSignalledSinceLastCall)
+    {
+        if (!mImpl->mHaveOutput || mImpl->mApi.dxvk_CopyRenderingOutputSynced == nullptr)
+            return false;
+
+        return mImpl->mApi.dxvk_CopyRenderingOutputSynced(mImpl->mOutputSurface,
+                   REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR,
+                   consumerSignalledSinceLastCall ? 1u : 0u)
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
@@ -739,6 +955,7 @@ namespace RemixRT
     {
         std::string mLoadedFrom;
         ExternalImage mOutputImage;
+        ExternalSync mOutputSync;
     };
 
     bool Runtime::requested()
@@ -763,6 +980,18 @@ namespace RemixRT
     void Runtime::shutdown() {}
 
     bool Runtime::isReady() const
+    {
+        return false;
+    }
+
+    void Runtime::enableDeveloperMenu() {}
+
+    int Runtime::uiState() const
+    {
+        return -1;
+    }
+
+    bool Runtime::setUiState(int)
     {
         return false;
     }
@@ -798,6 +1027,21 @@ namespace RemixRT
     }
 
     bool Runtime::copyOutput()
+    {
+        return false;
+    }
+
+    bool Runtime::createOutputSync()
+    {
+        return false;
+    }
+
+    const Runtime::ExternalSync& Runtime::outputSync() const
+    {
+        return mImpl->mOutputSync;
+    }
+
+    bool Runtime::copyOutputSynced(bool)
     {
         return false;
     }

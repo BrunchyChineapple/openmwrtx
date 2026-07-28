@@ -1,5 +1,7 @@
 #include "glinterop.hpp"
 
+#include <cstdlib>
+
 #include <components/debug/debuglog.hpp>
 
 #include <osg/GLExtensions>
@@ -12,10 +14,20 @@ namespace
     // From GL_EXT_memory_object and GL_EXT_memory_object_win32. Declared locally because the GL headers
     // OSG pulls in do not reliably define them.
     constexpr GLenum kTextureTilingExt = 0x9580;
+    constexpr GLenum kDedicatedMemoryObjectExt = 0x9581;
     constexpr GLenum kOptimalTilingExt = 0x9584;
     constexpr GLenum kLinearTilingExt = 0x9585;
-    constexpr GLenum kHandleTypeOpaqueWin32Ext = 0x9586;
-    constexpr GLenum kHandleTypeOpaqueWin32KmtExt = 0x9587;
+    // Values checked against the Khronos registry text for EXT_external_objects_win32, not inferred.
+    // An earlier revision of this file had both of these one lower -- 0x9586 is
+    // HANDLE_TYPE_OPAQUE_FD_EXT, from the *fd* extension, and 0x9587 is the NT-handle type -- so a KMT
+    // handle was being imported while GL was told it was an NT handle. NVIDIA's driver accepted that
+    // without raising a GL error, which is exactly why it went unnoticed.
+    constexpr GLenum kHandleTypeOpaqueWin32Ext = 0x9587;
+    constexpr GLenum kHandleTypeOpaqueWin32KmtExt = 0x9588;
+    // From EXT_external_objects. GL_LAYOUT_GENERAL_EXT is the counterpart of VK_IMAGE_LAYOUT_GENERAL,
+    // which is where DXVK leaves shared images: d3d9_common_texture.cpp skips its layout optimisation
+    // whenever the image is shared.
+    constexpr GLenum kLayoutGeneralExt = 0x958D;
 
     // VkExternalMemoryHandleTypeFlagBits values we know how to translate.
     constexpr unsigned int kVkHandleTypeOpaqueWin32 = 0x00000002;
@@ -30,18 +42,45 @@ namespace
     using PFN_glCreateMemoryObjectsEXT = void(GL_APIENTRY*)(GLsizei, GLuint*);
     using PFN_glDeleteMemoryObjectsEXT = void(GL_APIENTRY*)(GLsizei, const GLuint*);
     using PFN_glImportMemoryWin32HandleEXT = void(GL_APIENTRY*)(GLuint, GLuint64, GLenum, void*);
+    using PFN_glMemoryObjectParameterivEXT = void(GL_APIENTRY*)(GLuint, GLenum, const GLint*);
     using PFN_glTexStorageMem2DEXT = void(GL_APIENTRY*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
+
+    // Note glImportSemaphoreWin32HandleEXT takes no size, unlike the memory equivalent.
+    using PFN_glGenSemaphoresEXT = void(GL_APIENTRY*)(GLsizei, GLuint*);
+    using PFN_glDeleteSemaphoresEXT = void(GL_APIENTRY*)(GLsizei, const GLuint*);
+    using PFN_glImportSemaphoreWin32HandleEXT = void(GL_APIENTRY*)(GLuint, GLenum, void*);
+    // (semaphore, numBufferBarriers, buffers, numTextureBarriers, textures, layouts) -- the layouts
+    // argument is srcLayouts on wait and dstLayouts on signal.
+    using PFN_glWaitSemaphoreEXT
+        = void(GL_APIENTRY*)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
+    using PFN_glSignalSemaphoreEXT
+        = void(GL_APIENTRY*)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
 
     struct Entrypoints
     {
         PFN_glCreateMemoryObjectsEXT createMemoryObjects = nullptr;
         PFN_glDeleteMemoryObjectsEXT deleteMemoryObjects = nullptr;
         PFN_glImportMemoryWin32HandleEXT importMemoryWin32Handle = nullptr;
+        PFN_glMemoryObjectParameterivEXT memoryObjectParameteriv = nullptr;
         PFN_glTexStorageMem2DEXT texStorageMem2D = nullptr;
+        PFN_glGenSemaphoresEXT genSemaphores = nullptr;
+        PFN_glDeleteSemaphoresEXT deleteSemaphores = nullptr;
+        PFN_glImportSemaphoreWin32HandleEXT importSemaphoreWin32Handle = nullptr;
+        PFN_glWaitSemaphoreEXT waitSemaphore = nullptr;
+        PFN_glSignalSemaphoreEXT signalSemaphore = nullptr;
 
         bool complete() const
         {
             return createMemoryObjects && deleteMemoryObjects && importMemoryWin32Handle && texStorageMem2D;
+        }
+
+        /// The semaphore half is reported separately: a driver can advertise the memory extensions
+        /// without the semaphore ones, and the image import is worth attempting either way even though
+        /// sampling it is not safe without the semaphores.
+        bool semaphoresComplete() const
+        {
+            return genSemaphores && deleteSemaphores && importSemaphoreWin32Handle && waitSemaphore
+                && signalSemaphore;
         }
     };
 
@@ -51,7 +90,13 @@ namespace
         osg::setGLExtensionFuncPtr(fns.createMemoryObjects, "glCreateMemoryObjectsEXT");
         osg::setGLExtensionFuncPtr(fns.deleteMemoryObjects, "glDeleteMemoryObjectsEXT");
         osg::setGLExtensionFuncPtr(fns.importMemoryWin32Handle, "glImportMemoryWin32HandleEXT");
+        osg::setGLExtensionFuncPtr(fns.memoryObjectParameteriv, "glMemoryObjectParameterivEXT");
         osg::setGLExtensionFuncPtr(fns.texStorageMem2D, "glTexStorageMem2DEXT");
+        osg::setGLExtensionFuncPtr(fns.genSemaphores, "glGenSemaphoresEXT");
+        osg::setGLExtensionFuncPtr(fns.deleteSemaphores, "glDeleteSemaphoresEXT");
+        osg::setGLExtensionFuncPtr(fns.importSemaphoreWin32Handle, "glImportSemaphoreWin32HandleEXT");
+        osg::setGLExtensionFuncPtr(fns.waitSemaphore, "glWaitSemaphoreEXT");
+        osg::setGLExtensionFuncPtr(fns.signalSemaphore, "glSignalSemaphoreEXT");
         return fns;
     }
 
@@ -110,13 +155,96 @@ namespace
         }
         return clean;
     }
+
+    /// Empties the GL error queue without attributing what it finds to us.
+    ///
+    /// glGetError returns errors accumulated since it was last called, from anywhere. The composite
+    /// runs at the end of OSG's draw traversal, so anything OSG left pending would otherwise be
+    /// reported against whichever of our calls happens to be checked first. Drain before measuring, so
+    /// that a reported error is genuinely ours.
+    void drainGl(const char* whose)
+    {
+        unsigned int count = 0;
+        for (GLenum error = glGetError(); error != GL_NO_ERROR; error = glGetError())
+        {
+            ++count;
+            if (count <= 4)
+            {
+                Log(Debug::Verbose) << "Remix GL interop: discarding a pre-existing GL error 0x"
+                                    << std::hex << error << std::dec << " that arrived before " << whose
+                                    << "; not ours";
+            }
+        }
+        if (count > 0)
+            Log(Debug::Verbose) << "Remix GL interop: drained " << count << " pre-existing GL error(s)";
+    }
+
+    /// Imports Remix's synchronisation semaphore pair.
+    ///
+    /// A free function rather than a member of ImportOperation because Entrypoints is file-local and
+    /// so cannot appear in the class declaration.
+    ///
+    /// Failure is logged but left non-fatal to the image import: having the texture present with the
+    /// reason recorded is more useful than unwinding everything. The consumer checks syncAvailable()
+    /// and refuses to wait if the semaphores are missing, since waiting on a semaphore that has had no
+    /// signal submitted is undefined behaviour in its own right.
+    void importSyncSemaphores(unsigned int contextId, const Entrypoints& fns,
+        const RemixRT::Runtime::ExternalSync& sync, unsigned int& outWait, unsigned int& outSignal)
+    {
+        if (!sync.valid())
+        {
+            Log(Debug::Warning) << "Remix GL interop: the runtime reported no synchronisation "
+                                   "semaphores, so sampling the shared image would have no ordering "
+                                   "against Remix's writes -- undefined, and in practice black.";
+            return;
+        }
+
+        const bool haveSemaphore = osg::isGLExtensionSupported(contextId, "GL_EXT_semaphore");
+        const bool haveSemaphoreWin32 = osg::isGLExtensionSupported(contextId, "GL_EXT_semaphore_win32");
+        if (!haveSemaphore || !haveSemaphoreWin32 || !fns.semaphoresComplete())
+        {
+            Log(Debug::Error) << "Remix GL interop: driver lacks the semaphore extensions "
+                              << "(GL_EXT_semaphore " << (haveSemaphore ? "yes" : "NO")
+                              << ", GL_EXT_semaphore_win32 " << (haveSemaphoreWin32 ? "yes" : "NO")
+                              << "); the shared image cannot be sampled safely.";
+            return;
+        }
+
+        GLuint semaphores[2] = { 0, 0 };
+        fns.genSemaphores(2, semaphores);
+        if (semaphores[0] == 0 || semaphores[1] == 0 || !checkGl("glGenSemaphoresEXT"))
+            return;
+
+        // NT handles here, where the image used a KMT handle: Remix builds these through
+        // RtxSemaphore::createBinary, which exports
+        // VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT. Importing does not transfer ownership,
+        // so Remix stays responsible for closing them.
+        fns.importSemaphoreWin32Handle(semaphores[0], kHandleTypeOpaqueWin32Ext,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(sync.mCopyComplete)));
+        fns.importSemaphoreWin32Handle(semaphores[1], kHandleTypeOpaqueWin32Ext,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(sync.mConsumerDone)));
+        if (!checkGl("glImportSemaphoreWin32HandleEXT"))
+        {
+            fns.deleteSemaphores(2, semaphores);
+            return;
+        }
+
+        outWait = semaphores[0];
+        outSignal = semaphores[1];
+
+        Log(Debug::Info) << "Remix GL interop: imported sync semaphores as GL " << outWait
+                         << " (wait for Remix's copy) and " << outSignal
+                         << " (signal when sampling is done)";
+    }
 }
 
 namespace RemixRT
 {
-    ImportOperation::ImportOperation(const Runtime::ExternalImage& image)
+    ImportOperation::ImportOperation(
+        const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync)
         : osg::GraphicsOperation("RemixImportOperation", false)
         , mImage(image)
+        , mSync(sync)
     {
     }
 
@@ -183,6 +311,28 @@ namespace RemixRT
         if (memoryObject == 0 || !checkGl("glCreateMemoryObjectsEXT"))
             return;
 
+        // Remix's shared images are allocated with VkMemoryDedicatedAllocateInfo -- which is also why
+        // the reported memory offset is always 0. The spec requires DEDICATED_MEMORY_OBJECT_EXT to be
+        // set before importing such a handle, and the parameter becomes immutable once the import has
+        // happened, so it has to be here rather than after. Omitting it was an earlier defect: the
+        // import still succeeded without a GL error, which is exactly what made it easy to miss.
+        if (fns.memoryObjectParameteriv != nullptr)
+        {
+            const GLint dedicated = GL_TRUE;
+            fns.memoryObjectParameteriv(memoryObject, kDedicatedMemoryObjectExt, &dedicated);
+            if (!checkGl("glMemoryObjectParameterivEXT(GL_DEDICATED_MEMORY_OBJECT_EXT)"))
+            {
+                fns.deleteMemoryObjects(1, &memoryObject);
+                return;
+            }
+        }
+        else
+        {
+            Log(Debug::Warning) << "Remix GL interop: glMemoryObjectParameterivEXT is unavailable, so "
+                                   "the dedicated-allocation flag cannot be set; the import may be "
+                                   "rejected or silently wrong.";
+        }
+
         // The handle stays owned by Remix, so this must not be the *_KMT variant's ownership-transfer
         // form. glImportMemoryWin32HandleEXT does not take ownership of a KMT handle, which suits us:
         // Remix frees it with the surface.
@@ -238,6 +388,8 @@ namespace RemixRT
                          << (mImage.mOptimalTiling ? "optimal" : "linear") << " tiling"
                          << (needsSwizzle ? ", BGRA source needs a red/blue swap when sampling" : "")
                          << (isSrgb ? ", sRGB" : "");
+
+        importSyncSemaphores(contextId, fns, mSync, mWaitSemaphore, mSignalSemaphore);
     }
 }
 
@@ -309,11 +461,17 @@ namespace RemixRT
         GLuint program = 0;
         GLuint vao = 0;
         GLint imageLocation = -1;
+        Entrypoints fns;
     };
 
     CompositeCallback::CompositeCallback(const ImportOperation* import)
         : mImport(import)
     {
+        if (const char* value = std::getenv("OPENMW_REMIX_SYNC_NO_TEXBARRIER");
+            value != nullptr && *value != '\0' && *value != '0')
+        {
+            mSkipTextureBarrier = true;
+        }
     }
 
     void CompositeCallback::operator()(osg::RenderInfo& renderInfo) const
@@ -375,9 +533,14 @@ namespace RemixRT
             resources->imageLocation = ext->glGetUniformLocation(resources->program, "uImage");
             // A VAO is required in core profile even with no vertex attributes.
             ext->glGenVertexArrays(1, &resources->vao);
+            resources->fns = resolveEntrypoints();
 
             mResources = std::move(resources);
-            Log(Debug::Info) << "Remix composite: ready" << (swizzle ? " (BGRA swizzle)" : "");
+            Log(Debug::Info) << "Remix composite: ready" << (swizzle ? " (BGRA swizzle)" : "")
+                             << (mImport->syncAvailable()
+                                        ? ", synchronised against Remix"
+                                        : ", WITHOUT synchronisation -- reads of this image are "
+                                          "undefined and will most likely be black");
         }
 
         const osg::Viewport* viewport = renderInfo.getCurrentCamera()
@@ -398,6 +561,47 @@ namespace RemixRT
                 static_cast<GLsizei>(viewport->width()), static_cast<GLsizei>(viewport->height()));
         }
 
+        // Only order against Remix when a synchronised copy was actually issued for this frame.
+        // Waiting on a semaphore with no signal submitted since the last wait is undefined behaviour
+        // by the spec, not merely ineffective, so this must never be assumed.
+        const bool sync = mImport->syncAvailable() && mSyncArmed.load(std::memory_order_relaxed)
+            && !mSyncFailed.load(std::memory_order_relaxed);
+
+        if (sync)
+        {
+            // Clear anything OSG left behind first, so the check after the wait measures only the wait.
+            drainGl("the Remix semaphore wait");
+
+            // The texture is named in the barrier so the driver makes Remix's write visible to it and
+            // initialises its internal layout tracking. GL_LAYOUT_GENERAL_EXT is correct because DXVK
+            // leaves shared images in VK_IMAGE_LAYOUT_GENERAL -- it skips its layout optimisation for
+            // anything shared. A wrong layout here corrupts contents rather than raising an error.
+            const GLuint barrierTexture = texture;
+            const GLenum barrierLayout = kLayoutGeneralExt;
+
+            // Diagnostic bisect for GL_INVALID_OPERATION out of the wait: this call carries both a
+            // semaphore and a texture barrier, and either can be at fault. Dropping the barrier
+            // separates "the semaphore is unacceptable" from "the texture barrier is unacceptable".
+            // Correctness needs the barrier, so this is for isolating a fault, not for shipping.
+            const bool skipBarrier = mSkipTextureBarrier;
+            mResources->fns.waitSemaphore(static_cast<GLuint>(mImport->waitSemaphore()), 0, nullptr,
+                skipBarrier ? 0u : 1u, skipBarrier ? nullptr : &barrierTexture,
+                skipBarrier ? nullptr : &barrierLayout);
+            if (skipBarrier)
+                Log(Debug::Warning) << "Remix composite: waited with NO texture barrier "
+                                       "(OPENMW_REMIX_SYNC_NO_TEXBARRIER) -- diagnostic only, the "
+                                       "sampled image is not guaranteed visible or correctly laid out";
+            if (!checkGl("glWaitSemaphoreEXT"))
+            {
+                // Do not signal back after a failed wait, and do not try again on later frames: see
+                // syncFailed(). The engine falls back to the unsynchronised copy from here on.
+                mSyncFailed.store(true, std::memory_order_relaxed);
+                Log(Debug::Error) << "Remix composite: the semaphore wait failed, so synchronisation is "
+                                     "disabled from here on and the composited image is undefined. This "
+                                     "is the black-frame case, not a cosmetic warning.";
+            }
+        }
+
         ext->glUseProgram(mResources->program);
         state->setActiveTextureUnit(0);
         glBindTexture(GL_TEXTURE_2D, texture);
@@ -411,6 +615,25 @@ namespace RemixRT
         glBindTexture(GL_TEXTURE_2D, 0);
         ext->glUseProgram(0);
         glDepthMask(GL_TRUE);
+
+        // Re-read the failure flag: the wait above may have set it, in which case the matching signal
+        // must be skipped too.
+        if (sync && !mSyncFailed.load(std::memory_order_relaxed))
+        {
+            const bool skipBarrier = mSkipTextureBarrier;
+            // Hand the image back in the layout Remix expects to find it in, then record that the
+            // signal happened. The engine reads that flag and only then lets Remix wait, which is what
+            // keeps this binary pair balanced -- an unmatched wait would block Remix's render thread.
+            const GLuint barrierTexture = texture;
+            const GLenum barrierLayout = kLayoutGeneralExt;
+            mResources->fns.signalSemaphore(static_cast<GLuint>(mImport->signalSemaphore()), 0, nullptr,
+                skipBarrier ? 0u : 1u, skipBarrier ? nullptr : &barrierTexture,
+                skipBarrier ? nullptr : &barrierLayout);
+            if (checkGl("glSignalSemaphoreEXT"))
+                mSignalled.store(true, std::memory_order_release);
+            else
+                mSyncFailed.store(true, std::memory_order_relaxed);
+        }
 
         state->dirtyAllModes();
         state->dirtyAllAttributes();

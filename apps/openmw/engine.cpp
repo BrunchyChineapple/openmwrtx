@@ -371,7 +371,25 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const bool cameraOk = useTestScene ? mRemix->submitTestScene()
                                            : mRemix->setupCamera(view.ptr(), projection.ptr());
         const bool presentOk = mRemix->present();
-        const bool copyOk = mRemix->copyOutput();
+
+        // Report whether the composite signalled Remix since the previous copy. Remix may only wait on
+        // that semaphore when a matching signal genuinely happened: the pair is binary, so an unmatched
+        // wait stalls Remix's render thread with no way to recover. The composite runs during
+        // renderingTraversals below, so this reads last frame's result, which is exactly the frame
+        // whose sampling the upcoming copy has to avoid overwriting.
+        const bool consumerSignalled
+            = mRemixComposite != nullptr && mRemixComposite->takeConsumerSignalled();
+
+        // Once the GL side has reported a semaphore failure, stop using the synchronised copy: it
+        // would keep signalling a binary semaphore that nothing consumes.
+        const bool syncBroken = mRemixComposite != nullptr && mRemixComposite->syncFailed();
+        const bool copyOk
+            = syncBroken ? mRemix->copyOutput() : mRemix->copyOutputSynced(consumerSignalled);
+
+        // And symmetrically: the composite may only wait if a synchronised copy really was issued for
+        // this frame, because waiting on an unsignalled semaphore is undefined in its own right.
+        if (mRemixComposite != nullptr)
+            mRemixComposite->setSyncArmed(copyOk && !syncBroken);
 
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
         // the difference between "Remix rendered black" and "Remix was never asked to render", and
@@ -392,6 +410,17 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                                  << " proj[14]=" << projection(3, 2)
                                  << " (reversed-Z shows as a positive proj[10] with an inverted near/far)";
             }
+        }
+        // Report the developer-menu state the runtime actually holds. Deliberately not on frame 1: the
+        // request made during initialisation is applied at the end of a Remix frame, so an earlier read
+        // would report the pre-request value and look like a failure.
+        if (remixFrames == 3)
+        {
+            const int ui = mRemix->uiState();
+            Log(Debug::Info) << "Remix: runtime reports developer menu state " << ui
+                             << " (0 none, 1 basic, 2 advanced, -1 unavailable)"
+                             << (ui > 0 ? " -- the menu is being drawn into Remix's own window"
+                                        : " -- no menu is being drawn");
         }
         // Probe late enough that shader compilation has finished and Remix has had many frames to
         // converge, but only once -- it stalls on a GPU readback.
@@ -803,7 +832,7 @@ void OMW::Engine::prepareEngine()
             // createWindow()). Queueing on the context runs it there at the next frame instead.
             if (osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext())
             {
-                mRemixImport = new RemixRT::ImportOperation(mRemix->outputImage());
+                mRemixImport = new RemixRT::ImportOperation(mRemix->outputImage(), mRemix->outputSync());
                 gc->add(mRemixImport);
 
                 // Final draw callback: runs after OpenMW's frame, before the swap.

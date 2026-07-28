@@ -1,6 +1,7 @@
 #ifndef OPENMW_COMPONENTS_REMIXRT_GLINTEROP_H
 #define OPENMW_COMPONENTS_REMIXRT_GLINTEROP_H
 
+#include <atomic>
 #include <memory>
 
 #include <osg/Camera>
@@ -32,7 +33,7 @@ namespace RemixRT
     class ImportOperation : public osg::GraphicsOperation
     {
     public:
-        explicit ImportOperation(const Runtime::ExternalImage& image);
+        ImportOperation(const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync);
 
         void operator()(osg::GraphicsContext* context) override;
 
@@ -48,10 +49,23 @@ namespace RemixRT
         /// format, so the image is imported as RGBA8 and the swap is left to whoever samples it.
         bool needsChannelSwap() const { return mNeedsChannelSwap; }
 
+        /// GL semaphore to wait on before sampling the image. Zero when unavailable.
+        unsigned int waitSemaphore() const { return mWaitSemaphore; }
+
+        /// GL semaphore to signal once sampling is finished. Zero when unavailable.
+        unsigned int signalSemaphore() const { return mSignalSemaphore; }
+
+        /// True when both semaphores imported, so the consumer can order itself against Remix.
+        /// When false, sampling the image is undefined -- the import is not usable as it stands.
+        bool syncAvailable() const { return mWaitSemaphore != 0 && mSignalSemaphore != 0; }
+
     private:
         Runtime::ExternalImage mImage;
+        Runtime::ExternalSync mSync;
         unsigned int mMemoryObject = 0;
         unsigned int mTextureName = 0;
+        unsigned int mWaitSemaphore = 0;
+        unsigned int mSignalSemaphore = 0;
         bool mSucceeded = false;
         bool mCompleted = false;
         bool mNeedsChannelSwap = false;
@@ -79,6 +93,28 @@ namespace RemixRT
         void setEnabled(bool enabled) { mEnabled = enabled; }
         bool enabled() const { return mEnabled; }
 
+        /// Tells the callback whether a synchronised copy was issued for this frame.
+        ///
+        /// Only then may it wait on Remix's semaphore: the spec makes waiting on a semaphore that has
+        /// had no signal submitted undefined behaviour, so the wait has to be gated on the producer
+        /// actually having run. Called from the engine's frame loop before the draw traversal.
+        void setSyncArmed(bool armed) { mSyncArmed.store(armed, std::memory_order_relaxed); }
+
+        /// Reports, and clears, whether the callback signalled Remix since this was last asked.
+        ///
+        /// The engine feeds the answer straight back to copyOutputSynced. This is what keeps the
+        /// binary semaphore pairing honest: Remix only waits when a signal genuinely happened.
+        /// Read from the main thread, written from the draw thread, hence the atomic.
+        bool takeConsumerSignalled() const { return mSignalled.exchange(false, std::memory_order_acq_rel); }
+
+        /// True once a semaphore operation has failed.
+        ///
+        /// Latching rather than retrying, because a failed wait leaves Remix's signal unconsumed, and
+        /// these are binary semaphores: carrying on would signal again with no intervening wait and
+        /// corrupt the pairing for every frame after. The engine drops to the unsynchronised copy so
+        /// the degradation is visible and bounded instead.
+        bool syncFailed() const { return mSyncFailed.load(std::memory_order_relaxed); }
+
     private:
         struct Resources;
 
@@ -86,6 +122,12 @@ namespace RemixRT
         mutable std::unique_ptr<Resources> mResources;
         mutable bool mFailed = false;
         bool mEnabled = true;
+        std::atomic<bool> mSyncArmed{ false };
+        mutable std::atomic<bool> mSignalled{ false };
+        mutable std::atomic<bool> mSyncFailed{ false };
+        /// Diagnostic: drop the texture barrier from the semaphore operations, to tell a rejected
+        /// semaphore apart from a rejected texture barrier. Read once at construction.
+        bool mSkipTextureBarrier = false;
     };
 }
 
