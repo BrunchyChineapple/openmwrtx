@@ -364,9 +364,25 @@ namespace RemixRT
         }
 
         // Optional override of Remix's render resolution. Independent of OpenMW's window because it is
-        // the present window's client area that sizes the swapchain. Useful for tuning: a 4K path
-        // traced view is both slow and large enough to bury OpenMW's window.
-        envWindowSize("OPENMW_REMIX_WINDOW_SIZE", width, height);
+        // the present window's client area that sizes the swapchain.
+        //
+        // Overriding it has a consequence that is not obvious and is worth the warning below: the
+        // developer menu is drawn by the runtime into the output image, but ImGui measures itself
+        // against OpenMW's window. If the two disagree, ImGui's clip rectangles land outside the
+        // smaller render target and the menu's contents are scissored away -- you get a window frame
+        // and a title bar with nothing in them, which looks like a broken menu rather than a
+        // resolution mismatch.
+        const uint32_t windowWidth = width;
+        const uint32_t windowHeight = height;
+        if (envWindowSize("OPENMW_REMIX_WINDOW_SIZE", width, height)
+            && (width != windowWidth || height != windowHeight))
+        {
+            Log(Debug::Warning) << "Remix: rendering at " << width << "x" << height
+                                << " while OpenMW's window is " << windowWidth << "x" << windowHeight
+                                << ". The developer menu will be clipped to an empty frame, because "
+                                   "ImGui measures against the window and draws into the render "
+                                   "target. Unset OPENMW_REMIX_WINDOW_SIZE to use the menu.";
+        }
 
         const bool showPresentWindow = envFlag("OPENMW_REMIX_WINDOW");
         mImpl->mPresentWindow = createPresentWindow(width, height, showPresentWindow);
@@ -428,6 +444,24 @@ namespace RemixRT
 
         mImpl->mStarted = true;
         mImpl->mLoadedFrom = runtimePath.string();
+
+        // Point the developer menu's input at OpenMW's own window, not at the present window Remix's
+        // swapchain sits on. The runtime derives ImGui's display size from this window's client rect and
+        // positions its raw-input sink over it, hit-testing the cursor against that rectangle. Left
+        // pointing at our present window -- which is hidden and somewhere else entirely -- keyboard
+        // still works, because keystrokes carry no coordinates, but the mouse silently does nothing.
+        if (const HWND gameWindow = nativeHandle(window))
+        {
+            if (mImpl->mApi.dxvk_SetDevMenuWindow != nullptr)
+            {
+                mImpl->mApi.dxvk_SetDevMenuWindow(gameWindow);
+            }
+            else
+            {
+                Log(Debug::Warning) << "Remix: this runtime predates dxvk_SetDevMenuWindow; the "
+                                       "developer menu will draw but the mouse will not reach it.";
+            }
+        }
 
         Log(Debug::Info) << "Remix: runtime initialised from " << runtimePath << " (API "
                          << REMIXAPI_VERSION_MAJOR << "." << REMIXAPI_VERSION_MINOR << "."

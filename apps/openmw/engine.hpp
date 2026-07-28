@@ -144,6 +144,12 @@ namespace OMW
         // Scratch for the readback display path. A member so the allocation is reused across frames
         // rather than churning a multi-megabyte buffer every frame.
         std::vector<unsigned char> mRemixReadback;
+        // Whether the Remix developer menu currently owns the mouse. Tracked so the pointer is released
+        // on transitions only; doing it every frame re-warps the cursor and pins it again.
+        bool mRemixMenuHasMouse = false;
+        // Pointer state to put back when the menu closes, captured when it opens.
+        bool mRemixSavedMouseRelative = false;
+        bool mRemixSavedMouseGrab = false;
         std::unique_ptr<VFS::Manager> mVFS;
         std::unique_ptr<Resource::ResourceSystem> mResourceSystem;
         osg::ref_ptr<SceneUtil::WorkQueue> mWorkQueue;

@@ -537,15 +537,16 @@ namespace RemixRT
                          << " (override with OPENMW_REMIX_FLIP=none|v|h|both)";
     }
 
-    void CompositeCallback::setReadbackFrame(
-        const unsigned char* pixels, unsigned int width, unsigned int height)
+    void CompositeCallback::takeReadbackFrame(
+        std::vector<unsigned char>& pixels, unsigned int width, unsigned int height)
     {
-        if (pixels == nullptr || width == 0 || height == 0)
+        if (width == 0 || height == 0)
+            return;
+        if (pixels.size() < static_cast<size_t>(width) * height * 4)
             return;
 
-        const size_t bytes = static_cast<size_t>(width) * height * 4;
         const std::lock_guard<std::mutex> lock(mReadbackMutex);
-        mReadbackPixels.assign(pixels, pixels + bytes);
+        mReadbackPixels.swap(pixels);
         mReadbackWidth = width;
         mReadbackHeight = height;
         mReadbackFresh = true;
@@ -566,7 +567,8 @@ namespace RemixRT
             height = mReadbackHeight;
             if (fresh)
             {
-                mReadbackUpload = mReadbackPixels;
+                // Swapped, not copied: the upload buffer's old contents go back to be refilled.
+                mReadbackUpload.swap(mReadbackPixels);
                 mReadbackFresh = false;
             }
         }

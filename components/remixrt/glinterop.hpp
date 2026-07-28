@@ -126,8 +126,13 @@ namespace RemixRT
 
         /// Hands over one frame of CPU-read pixels, tightly packed B8G8R8A8.
         ///
+        /// Takes the buffer by swap rather than by copy: at 4K a frame is 33 MB, and copying it here
+        /// and again before upload was two thirds of the path's memory traffic for no benefit. The
+        /// caller gets back a buffer of arbitrary contents to refill, which is fine because the reader
+        /// resizes and overwrites it completely.
+        ///
         /// Called from the engine's frame loop on the main thread; consumed on the draw thread.
-        void setReadbackFrame(const unsigned char* pixels, unsigned int width, unsigned int height);
+        void takeReadbackFrame(std::vector<unsigned char>& pixels, unsigned int width, unsigned int height);
 
     private:
         struct Resources;

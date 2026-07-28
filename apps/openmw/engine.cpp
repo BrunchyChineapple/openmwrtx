@@ -391,6 +391,52 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         if (mRemixComposite != nullptr)
             mRemixComposite->setSyncArmed(copyOk && !syncBroken);
 
+        // Hand the mouse over while Remix's developer menu is open, and take it back afterwards.
+        //
+        // The menu gets its cursor position from GetCursorPos, and in gameplay OpenMW holds the pointer
+        // in relative mode with the cursor grabbed, which pins the OS cursor in place. The menu then
+        // draws a cursor that does not track the mouse and receives clicks at a stale position -- it
+        // looks like the menu is ignoring input when in fact it is being told the mouse never moves.
+        //
+        // Remix normally solves this with rtx.blockInputToGameInUI, which signals the game over the
+        // 32-bit bridge. There is no bridge in a native host, so the host has to do it.
+        //
+        // Done through SDL directly, and not through MWBase::InputManager::changeInputMode, which was
+        // tried first and cannot work: MouseManager::updateCursorMode ignores the flag it is passed and
+        // derives both relative mode and grab from WindowManager::isGuiMode(). OpenMW's input API has
+        // no way to express "an external overlay wants the pointer", which is why the menu only becomes
+        // clickable when OpenMW happens to enter its own GUI mode -- on death, for instance.
+        //
+        // Safe to go behind SDLUtil::InputWrapper's back specifically because this is symmetric: the
+        // prior state is captured on open and restored on close, so the wrapper's cached values still
+        // describe reality either side of the menu being up. Transitions only, since
+        // updateCursorMode warps the cursor whenever it leaves relative mode.
+        {
+            const bool menuWantsMouse = mRemix->uiState() > 0;
+            if (menuWantsMouse != mRemixMenuHasMouse)
+            {
+                mRemixMenuHasMouse = menuWantsMouse;
+                if (menuWantsMouse)
+                {
+                    mRemixSavedMouseRelative = SDL_GetRelativeMouseMode() == SDL_TRUE;
+                    mRemixSavedMouseGrab = mWindow != nullptr && SDL_GetWindowGrab(mWindow) == SDL_TRUE;
+                    SDL_SetRelativeMouseMode(SDL_FALSE);
+                    if (mWindow != nullptr)
+                        SDL_SetWindowGrab(mWindow, SDL_FALSE);
+                }
+                else
+                {
+                    SDL_SetRelativeMouseMode(mRemixSavedMouseRelative ? SDL_TRUE : SDL_FALSE);
+                    if (mWindow != nullptr)
+                        SDL_SetWindowGrab(mWindow, mRemixSavedMouseGrab ? SDL_TRUE : SDL_FALSE);
+                }
+                Log(Debug::Info) << "Remix: developer menu " << (menuWantsMouse ? "opened" : "closed")
+                                 << "; pointer " << (menuWantsMouse ? "released to it" : "returned")
+                                 << " (was relative=" << mRemixSavedMouseRelative
+                                 << " grab=" << mRemixSavedMouseGrab << ")";
+            }
+        }
+
         // When the composite is on the readback path -- either forced, or because the handshake failed
         // -- it has no way to see Remix's pixels on its own, so read them here and hand them over. This
         // is a GPU-to-CPU round trip on the main thread and it costs real frame time; it buys a
@@ -400,7 +446,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             unsigned int readWidth = 0;
             unsigned int readHeight = 0;
             if (mRemix->readOutputPixels(mRemixReadback, readWidth, readHeight))
-                mRemixComposite->setReadbackFrame(mRemixReadback.data(), readWidth, readHeight);
+                mRemixComposite->takeReadbackFrame(mRemixReadback, readWidth, readHeight);
         }
 
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
