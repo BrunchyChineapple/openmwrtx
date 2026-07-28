@@ -46,6 +46,7 @@
 #include <components/misc/frameratelimiter.hpp>
 
 #include <components/sceneutil/color.hpp>
+#include <components/remixrt/runtime.hpp>
 #include <components/sceneutil/depth.hpp>
 #include <components/sceneutil/screencapture.hpp>
 #include <components/sceneutil/unrefqueue.hpp>
@@ -430,6 +431,9 @@ OMW::Engine::~Engine()
 
     mEncoder = nullptr;
 
+    // Must precede SDL_DestroyWindow: the Remix device holds the HWND that Startup() was given.
+    mRemix.reset();
+
     if (mWindow)
     {
         SDL_DestroyWindow(mWindow);
@@ -733,6 +737,19 @@ void OMW::Engine::prepareEngine()
     mViewer->setSceneData(rootNode);
 
     createWindow();
+
+    // Bring Remix up directly after the window exists, because Startup() wants its native handle, and
+    // before any asset loading, so that a runtime that cannot initialise fails fast and cheaply.
+    // Failure is not fatal: mRemix simply reports not-ready and OpenMW renders normally.
+    if (RemixRT::Runtime::requested())
+    {
+        mRemix = std::make_unique<RemixRT::Runtime>();
+        if (!mRemix->initialize(mWindow))
+        {
+            Log(Debug::Warning) << "Remix: initialisation failed, continuing with normal rendering";
+            mRemix.reset();
+        }
+    }
 
     mVFS = std::make_unique<VFS::Manager>();
 

@@ -136,6 +136,12 @@ add_component_dir (shader
     shadermanager shadervisitor removedalphafunc
     )
 
+# RTX Remix backend. Builds on every platform; the runtime itself is Windows x64 only, so the
+# non-Windows path compiles to stubs that report the backend as unavailable.
+add_component_dir (remixrt
+    runtime
+    )
+
 add_component_dir (sceneutil
     clone attach visitor util statesetupdater stateupdater controller skeleton riggeometry morphgeometry lightcontroller
     lightmanager lightutil positionattitudetransform workqueue pathgridutil waterutil writescene serialize optimizer

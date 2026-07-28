@@ -118,6 +118,11 @@ namespace L10n
     class Manager;
 }
 
+namespace RemixRT
+{
+    class Runtime;
+}
+
 struct SDL_Window;
 
 namespace OMW
@@ -126,6 +131,9 @@ namespace OMW
     class Engine
     {
         SDL_Window* mWindow;
+        // Declared right after mWindow so destruction order releases Remix before the window it is
+        // attached to. Only constructed when the backend is requested; null otherwise.
+        std::unique_ptr<RemixRT::Runtime> mRemix;
         std::unique_ptr<VFS::Manager> mVFS;
         std::unique_ptr<Resource::ResourceSystem> mResourceSystem;
         osg::ref_ptr<SceneUtil::WorkQueue> mWorkQueue;
