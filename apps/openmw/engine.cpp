@@ -365,9 +365,25 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // outlive the call.
         const osg::Matrixf view(camera->getViewMatrix());
         const osg::Matrixf projection(camera->getProjectionMatrix());
-        mRemix->setupCamera(view.ptr(), projection.ptr());
-        mRemix->present();
-        mRemix->copyOutput();
+
+        const bool cameraOk = mRemix->setupCamera(view.ptr(), projection.ptr());
+        const bool presentOk = mRemix->present();
+        const bool copyOk = mRemix->copyOutput();
+
+        // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
+        // the difference between "Remix rendered black" and "Remix was never asked to render", and
+        // guessing between those wastes far more time than one log line costs.
+        static bool pumpReported = false;
+        if (!pumpReported)
+        {
+            pumpReported = true;
+            Log(Debug::Info) << "Remix pump: setupCamera=" << cameraOk << " present=" << presentOk
+                             << " copyOutput=" << copyOk;
+            const osg::Vec3d eye = osg::Matrixd::inverse(camera->getViewMatrix()).getTrans();
+            Log(Debug::Info) << "Remix pump: camera eye " << eye.x() << ", " << eye.y() << ", " << eye.z()
+                             << "; proj[10]=" << projection(2, 2) << " proj[14]=" << projection(3, 2)
+                             << " (reversed-Z shows as a positive proj[10] with an inverted near/far)";
+        }
     }
 
     mViewer->renderingTraversals();
