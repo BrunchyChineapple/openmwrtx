@@ -1,6 +1,7 @@
 #include "glinterop.hpp"
 
 #include <cstdlib>
+#include <string>
 
 #include <components/debug/debuglog.hpp>
 
@@ -28,6 +29,9 @@ namespace
     // which is where DXVK leaves shared images: d3d9_common_texture.cpp skips its layout optimisation
     // whenever the image is shared.
     constexpr GLenum kLayoutGeneralExt = 0x958D;
+    // Core GL since 1.2, but <GL/gl.h> on Windows stops at 1.1, so it is not necessarily declared.
+    // Valid as a transfer format only, which is exactly how the readback path uses it.
+    constexpr GLenum kBgra = 0x80E1;
 
     // VkExternalMemoryHandleTypeFlagBits values we know how to translate.
     constexpr unsigned int kVkHandleTypeOpaqueWin32 = 0x00000002;
@@ -398,35 +402,45 @@ namespace
     // Minimal pass-through. Positions come from gl_VertexID rather than a vertex buffer so there is no
     // attribute state to set up or restore.
     const char* const kVertexShader = R"(#version 330 core
+uniform vec2 uFlip;
 out vec2 vUv;
 void main()
 {
     // Two triangles covering the viewport, expressed as a 4-vertex strip.
     vec2 corner = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0, (gl_VertexID & 2) == 0 ? -1.0 : 1.0);
-    vUv = corner * 0.5 + 0.5;
+
+    // uFlip corrects the orientation of Remix's image. Vertical only, confirmed on screen: both
+    // sources put row 0 at the TOP -- a D3D9 surface on the readback path, a Vulkan image on the
+    // imported one -- while OpenGL puts v = 0 at the BOTTOM.
+    //
+    // Worth knowing if this ever looks wrong again: a purely vertical flip reads as "upside down AND
+    // mirrored", because reflecting glyphs about the horizontal axis looks like mirror writing. That
+    // description prompted a horizontal flip as well, which then showed the image genuinely mirrored.
+    // Do not add a horizontal flip on the strength of text looking backwards.
+    //
+    // Applied to the texture coordinate rather than to gl_Position, so the geometry still covers the
+    // viewport the same way and only the sampling orientation changes.
+    vUv = corner * uFlip * 0.5 + 0.5;
     gl_Position = vec4(corner, 0.0, 1.0);
 }
 )";
 
     // The imported texture is GL_RGBA8 over a Vulkan B8G8R8A8 allocation, so red and blue arrive
-    // swapped. GL has no BGRA internal format, so the swap is corrected here rather than at import.
-    const char* const kFragmentShaderSwizzle = R"(#version 330 core
+    // swapped and have to be corrected when sampling -- GL has no BGRA *internal* format.
+    //
+    // The readback path does not need that, because it uploads with GL_BGRA as the transfer format and
+    // the driver reorders on the way in. Which path is active can change at runtime, so the choice is a
+    // uniform rather than two programs: picking a shader once at creation would bake in whichever mode
+    // happened to be active on the first frame.
+    const char* const kFragmentShader = R"(#version 330 core
 uniform sampler2D uImage;
+uniform int uSwizzle;
 in vec2 vUv;
 out vec4 fColour;
 void main()
 {
-    fColour = vec4(texture(uImage, vUv).bgr, 1.0);
-}
-)";
-
-    const char* const kFragmentShaderDirect = R"(#version 330 core
-uniform sampler2D uImage;
-in vec2 vUv;
-out vec4 fColour;
-void main()
-{
-    fColour = vec4(texture(uImage, vUv).rgb, 1.0);
+    vec3 colour = texture(uImage, vUv).rgb;
+    fColour = vec4(uSwizzle != 0 ? colour.bgr : colour, 1.0);
 }
 )";
 
@@ -461,7 +475,14 @@ namespace RemixRT
         GLuint program = 0;
         GLuint vao = 0;
         GLint imageLocation = -1;
+        GLint swizzleLocation = -1;
+        GLint flipLocation = -1;
         Entrypoints fns;
+        // Only used by the readback path: an ordinary texture we own and upload into, as opposed to the
+        // imported one that aliases Remix's memory.
+        GLuint readbackTexture = 0;
+        unsigned int readbackWidth = 0;
+        unsigned int readbackHeight = 0;
     };
 
     CompositeCallback::CompositeCallback(const ImportOperation* import)
@@ -472,15 +493,136 @@ namespace RemixRT
         {
             mSkipTextureBarrier = true;
         }
+        if (const char* value = std::getenv("OPENMW_REMIX_READBACK");
+            value != nullptr && *value != '\0' && *value != '0')
+        {
+            mForceReadback = true;
+            Log(Debug::Info) << "Remix composite: readback path forced by OPENMW_REMIX_READBACK";
+        }
+
+        // Orientation. The default is the confirmed-correct vertical flip; the override exists so a
+        // different source convention costs a relaunch rather than a rebuild.
+        if (const char* value = std::getenv("OPENMW_REMIX_FLIP"); value != nullptr && *value != '\0')
+        {
+            const std::string mode(value);
+            if (mode == "none")
+            {
+                mFlipHorizontal = false;
+                mFlipVertical = false;
+            }
+            else if (mode == "v")
+            {
+                mFlipHorizontal = false;
+                mFlipVertical = true;
+            }
+            else if (mode == "h")
+            {
+                mFlipHorizontal = true;
+                mFlipVertical = false;
+            }
+            else if (mode == "both")
+            {
+                mFlipHorizontal = true;
+                mFlipVertical = true;
+            }
+            else
+            {
+                Log(Debug::Warning) << "Remix composite: ignoring OPENMW_REMIX_FLIP='" << mode
+                                    << "'; expected none, v, h or both";
+            }
+        }
+
+        Log(Debug::Info) << "Remix composite: orientation flip h=" << (mFlipHorizontal ? "yes" : "no")
+                         << " v=" << (mFlipVertical ? "yes" : "no")
+                         << " (override with OPENMW_REMIX_FLIP=none|v|h|both)";
+    }
+
+    void CompositeCallback::setReadbackFrame(
+        const unsigned char* pixels, unsigned int width, unsigned int height)
+    {
+        if (pixels == nullptr || width == 0 || height == 0)
+            return;
+
+        const size_t bytes = static_cast<size_t>(width) * height * 4;
+        const std::lock_guard<std::mutex> lock(mReadbackMutex);
+        mReadbackPixels.assign(pixels, pixels + bytes);
+        mReadbackWidth = width;
+        mReadbackHeight = height;
+        mReadbackFresh = true;
+    }
+
+    unsigned int CompositeCallback::uploadReadbackTexture(osg::GLExtensions*) const
+    {
+        unsigned int width = 0;
+        unsigned int height = 0;
+        bool fresh = false;
+        {
+            // Copied out under the lock rather than uploaded under it: the engine writes this from the
+            // main thread while the draw thread is here, and holding the lock across a multi-megabyte
+            // GL upload would serialise the two threads for no benefit.
+            const std::lock_guard<std::mutex> lock(mReadbackMutex);
+            fresh = mReadbackFresh;
+            width = mReadbackWidth;
+            height = mReadbackHeight;
+            if (fresh)
+            {
+                mReadbackUpload = mReadbackPixels;
+                mReadbackFresh = false;
+            }
+        }
+
+        if (mResources->readbackTexture == 0 || mResources->readbackWidth != width
+            || mResources->readbackHeight != height)
+        {
+            if (width == 0 || height == 0 || mReadbackUpload.empty())
+                return 0;
+
+            if (mResources->readbackTexture == 0)
+                glGenTextures(1, &mResources->readbackTexture);
+            glBindTexture(GL_TEXTURE_2D, mResources->readbackTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width),
+                static_cast<GLsizei>(height), 0, kBgra, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            mResources->readbackWidth = width;
+            mResources->readbackHeight = height;
+            fresh = true;
+            Log(Debug::Info) << "Remix composite: readback path active, " << width << "x" << height
+                             << " uploaded per frame. This is a CPU round trip and costs real frame "
+                             << "time; it exists so the image is visible without the semaphore "
+                                "handshake.";
+        }
+
+        if (mResources->readbackTexture == 0)
+            return 0;
+
+        if (fresh && !mReadbackUpload.empty())
+        {
+            glBindTexture(GL_TEXTURE_2D, mResources->readbackTexture);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(mResources->readbackWidth),
+                static_cast<GLsizei>(mResources->readbackHeight), kBgra, GL_UNSIGNED_BYTE,
+                mReadbackUpload.data());
+            checkGl("glTexSubImage2D(readback)");
+        }
+
+        return mResources->readbackTexture;
     }
 
     void CompositeCallback::operator()(osg::RenderInfo& renderInfo) const
     {
-        if (!mEnabled || mFailed || mImport == nullptr || !mImport->succeeded())
+        if (!mEnabled || mFailed || mImport == nullptr)
             return;
 
-        const GLuint texture = static_cast<GLuint>(mImport->textureName());
-        if (texture == 0)
+        // The readback path does not touch the imported image at all, so it stays available even when
+        // the import failed outright -- which is the situation it exists for.
+        const bool readback = readbackMode();
+        if (!readback && !mImport->succeeded())
+            return;
+
+        const GLuint importedTexture = static_cast<GLuint>(mImport->textureName());
+        if (!readback && importedTexture == 0)
             return;
 
         osg::State* state = renderInfo.getState();
@@ -498,12 +640,8 @@ namespace RemixRT
         {
             auto resources = std::make_unique<Resources>();
 
-            // Whether the swizzle is needed is a property of the imported image, so pick the shader
-            // from what the runtime reported rather than hardcoding a channel order.
-            const bool swizzle = mImport->needsChannelSwap();
             const GLuint vs = compileShader(ext, GL_VERTEX_SHADER, kVertexShader);
-            const GLuint fs = compileShader(
-                ext, GL_FRAGMENT_SHADER, swizzle ? kFragmentShaderSwizzle : kFragmentShaderDirect);
+            const GLuint fs = compileShader(ext, GL_FRAGMENT_SHADER, kFragmentShader);
             if (vs == 0 || fs == 0)
             {
                 mFailed = true;
@@ -531,16 +669,19 @@ namespace RemixRT
             }
 
             resources->imageLocation = ext->glGetUniformLocation(resources->program, "uImage");
+            resources->swizzleLocation = ext->glGetUniformLocation(resources->program, "uSwizzle");
+            resources->flipLocation = ext->glGetUniformLocation(resources->program, "uFlip");
             // A VAO is required in core profile even with no vertex attributes.
             ext->glGenVertexArrays(1, &resources->vao);
             resources->fns = resolveEntrypoints();
 
             mResources = std::move(resources);
-            Log(Debug::Info) << "Remix composite: ready" << (swizzle ? " (BGRA swizzle)" : "")
+            Log(Debug::Info) << "Remix composite: ready"
+                             << (mImport->needsChannelSwap() ? " (BGRA source)" : "")
                              << (mImport->syncAvailable()
                                         ? ", synchronised against Remix"
-                                        : ", WITHOUT synchronisation -- reads of this image are "
-                                          "undefined and will most likely be black");
+                                        : ", WITHOUT synchronisation -- reads of the shared image are "
+                                          "undefined; the readback path is the way to get a picture");
         }
 
         const osg::Viewport* viewport = renderInfo.getCurrentCamera()
@@ -564,8 +705,9 @@ namespace RemixRT
         // Only order against Remix when a synchronised copy was actually issued for this frame.
         // Waiting on a semaphore with no signal submitted since the last wait is undefined behaviour
         // by the spec, not merely ineffective, so this must never be assumed.
-        const bool sync = mImport->syncAvailable() && mSyncArmed.load(std::memory_order_relaxed)
-            && !mSyncFailed.load(std::memory_order_relaxed);
+        // The readback path carries its own pixels, so it neither needs nor may use the handshake.
+        const bool sync = !readback && mImport->syncAvailable()
+            && mSyncArmed.load(std::memory_order_relaxed) && !mSyncFailed.load(std::memory_order_relaxed);
 
         if (sync)
         {
@@ -576,7 +718,7 @@ namespace RemixRT
             // initialises its internal layout tracking. GL_LAYOUT_GENERAL_EXT is correct because DXVK
             // leaves shared images in VK_IMAGE_LAYOUT_GENERAL -- it skips its layout optimisation for
             // anything shared. A wrong layout here corrupts contents rather than raising an error.
-            const GLuint barrierTexture = texture;
+            const GLuint barrierTexture = importedTexture;
             const GLenum barrierLayout = kLayoutGeneralExt;
 
             // Diagnostic bisect for GL_INVALID_OPERATION out of the wait: this call carries both a
@@ -602,11 +744,30 @@ namespace RemixRT
             }
         }
 
+        // Pick the source. The imported texture aliases Remix's memory directly; the readback texture is
+        // ours, filled from a CPU copy the engine handed over this frame.
+        GLuint texture = importedTexture;
+        bool swizzle = mImport->needsChannelSwap();
+        if (readback)
+        {
+            texture = uploadReadbackTexture(ext);
+            // Uploaded with GL_BGRA as the transfer format, so the driver has already put the channels
+            // in order and no shader-side swap is wanted.
+            swizzle = false;
+            if (texture == 0)
+                return;
+        }
+
         ext->glUseProgram(mResources->program);
         state->setActiveTextureUnit(0);
         glBindTexture(GL_TEXTURE_2D, texture);
         if (mResources->imageLocation >= 0)
             ext->glUniform1i(mResources->imageLocation, 0);
+        if (mResources->swizzleLocation >= 0)
+            ext->glUniform1i(mResources->swizzleLocation, swizzle ? 1 : 0);
+        if (mResources->flipLocation >= 0)
+            ext->glUniform2f(mResources->flipLocation, mFlipHorizontal ? -1.0f : 1.0f,
+                mFlipVertical ? -1.0f : 1.0f);
 
         ext->glBindVertexArray(mResources->vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);

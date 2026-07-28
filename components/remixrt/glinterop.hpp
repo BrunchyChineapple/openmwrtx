@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 #include <osg/Camera>
 #include <osg/GraphicsContext>
@@ -115,13 +117,41 @@ namespace RemixRT
         /// the degradation is visible and bounded instead.
         bool syncFailed() const { return mSyncFailed.load(std::memory_order_relaxed); }
 
+        /// True when the callback wants CPU-read pixels rather than the imported image.
+        ///
+        /// Forced by OPENMW_REMIX_READBACK, and entered automatically once the semaphore handshake has
+        /// failed, so a broken handshake degrades to a correct-but-slower picture instead of a black
+        /// one. The engine polls this to decide whether to pay for the read.
+        bool readbackMode() const { return mForceReadback || mSyncFailed.load(std::memory_order_relaxed); }
+
+        /// Hands over one frame of CPU-read pixels, tightly packed B8G8R8A8.
+        ///
+        /// Called from the engine's frame loop on the main thread; consumed on the draw thread.
+        void setReadbackFrame(const unsigned char* pixels, unsigned int width, unsigned int height);
+
     private:
         struct Resources;
+
+        /// Uploads the most recent readback frame and returns the texture to sample. 0 if unavailable.
+        unsigned int uploadReadbackTexture(osg::GLExtensions* ext) const;
 
         const ImportOperation* mImport;
         mutable std::unique_ptr<Resources> mResources;
         mutable bool mFailed = false;
         bool mEnabled = true;
+        bool mForceReadback = false;
+        /// Vertical flip only: Remix's output has row 0 at the top, OpenGL samples v = 0 at the bottom.
+        /// Confirmed on screen, not just derived. Overridable with OPENMW_REMIX_FLIP=none|v|h|both so a
+        /// future source with a different convention does not need a rebuild to diagnose.
+        bool mFlipHorizontal = false;
+        bool mFlipVertical = true;
+        mutable std::mutex mReadbackMutex;
+        mutable std::vector<unsigned char> mReadbackPixels;
+        /// Separate from mReadbackPixels so the GL upload happens outside the lock.
+        mutable std::vector<unsigned char> mReadbackUpload;
+        mutable unsigned int mReadbackWidth = 0;
+        mutable unsigned int mReadbackHeight = 0;
+        mutable bool mReadbackFresh = false;
         std::atomic<bool> mSyncArmed{ false };
         mutable std::atomic<bool> mSignalled{ false };
         mutable std::atomic<bool> mSyncFailed{ false };

@@ -391,6 +391,18 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         if (mRemixComposite != nullptr)
             mRemixComposite->setSyncArmed(copyOk && !syncBroken);
 
+        // When the composite is on the readback path -- either forced, or because the handshake failed
+        // -- it has no way to see Remix's pixels on its own, so read them here and hand them over. This
+        // is a GPU-to-CPU round trip on the main thread and it costs real frame time; it buys a
+        // correct, visible image without depending on the cross-API synchronisation.
+        if (mRemixComposite != nullptr && mRemixComposite->readbackMode())
+        {
+            unsigned int readWidth = 0;
+            unsigned int readHeight = 0;
+            if (mRemix->readOutputPixels(mRemixReadback, readWidth, readHeight))
+                mRemixComposite->setReadbackFrame(mRemixReadback.data(), readWidth, readHeight);
+        }
+
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
         // the difference between "Remix rendered black" and "Remix was never asked to render", and
         // guessing between those wastes far more time than one log line costs.

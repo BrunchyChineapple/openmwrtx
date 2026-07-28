@@ -275,6 +275,9 @@ namespace RemixRT
         ExternalImage mOutputImage;
         bool mHaveOutput = false;
         ExternalSync mOutputSync;
+        // Kept across frames: the readback path runs every frame when it is active, and creating a
+        // system-memory surface per frame would dominate its cost.
+        IDirect3DSurface9* mReadbackSurface = nullptr;
 
         // Built-in test scene, created once on first submit.
         remixapi_MaterialHandle mTestMaterial = nullptr;
@@ -645,6 +648,67 @@ namespace RemixRT
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    bool Runtime::readOutputPixels(
+        std::vector<unsigned char>& out, unsigned int& outWidth, unsigned int& outHeight)
+    {
+        outWidth = 0;
+        outHeight = 0;
+        if (!mImpl->mHaveOutput || mImpl->mDevice == nullptr)
+            return false;
+
+        const UINT width = mImpl->mOutputImage.mWidth;
+        const UINT height = mImpl->mOutputImage.mHeight;
+        if (width == 0 || height == 0)
+            return false;
+
+        // A render target cannot be locked, so it has to be copied into a system-memory plain surface
+        // first. Created once and kept: at these sizes a per-frame allocation would dominate the cost.
+        if (mImpl->mReadbackSurface == nullptr)
+        {
+            const HRESULT createHr = mImpl->mDevice->CreateOffscreenPlainSurface(
+                width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &mImpl->mReadbackSurface, nullptr);
+            if (FAILED(createHr) || mImpl->mReadbackSurface == nullptr)
+            {
+                Log(Debug::Error) << "Remix readback: CreateOffscreenPlainSurface failed, hr 0x"
+                                  << std::hex << createHr << std::dec;
+                return false;
+            }
+        }
+
+        // Either of these can fail on every frame if something is wrong, so report once, not per frame.
+        static bool loggedFailure = false;
+        HRESULT hr = mImpl->mDevice->GetRenderTargetData(mImpl->mOutputSurface, mImpl->mReadbackSurface);
+        if (SUCCEEDED(hr))
+        {
+            D3DLOCKED_RECT locked = {};
+            hr = mImpl->mReadbackSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+            if (SUCCEEDED(hr))
+            {
+                // Row by row: the locked pitch is not necessarily width * 4.
+                const size_t rowBytes = static_cast<size_t>(width) * 4;
+                out.resize(rowBytes * height);
+                const auto* src = static_cast<const unsigned char*>(locked.pBits);
+                for (UINT y = 0; y < height; ++y)
+                {
+                    std::memcpy(
+                        out.data() + rowBytes * y, src + static_cast<size_t>(locked.Pitch) * y, rowBytes);
+                }
+                mImpl->mReadbackSurface->UnlockRect();
+                outWidth = width;
+                outHeight = height;
+                return true;
+            }
+        }
+
+        if (!loggedFailure)
+        {
+            loggedFailure = true;
+            Log(Debug::Error) << "Remix readback: could not read the shared target, hr 0x" << std::hex << hr
+                              << std::dec << " (reported once)";
+        }
+        return false;
+    }
+
     bool Runtime::probeOutputNonBlack()
     {
         if (!mImpl->mHaveOutput || mImpl->mDevice == nullptr)
@@ -871,6 +935,11 @@ namespace RemixRT
     {
         mImpl->mHaveOutput = false;
         mImpl->mOutputImage = {};
+        if (mImpl->mReadbackSurface != nullptr)
+        {
+            mImpl->mReadbackSurface->Release();
+            mImpl->mReadbackSurface = nullptr;
+        }
         if (mImpl->mOutputSurface != nullptr)
         {
             mImpl->mOutputSurface->Release();
@@ -1032,6 +1101,11 @@ namespace RemixRT
     }
 
     bool Runtime::createOutputSync()
+    {
+        return false;
+    }
+
+    bool Runtime::readOutputPixels(std::vector<unsigned char>&, unsigned int&, unsigned int&)
     {
         return false;
     }

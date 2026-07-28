@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 struct SDL_Window;
 
@@ -122,6 +123,17 @@ namespace RemixRT
         /// Drives a Remix frame. Required: the raytracing output that copyOutput() reads is only
         /// produced as part of presenting.
         bool present();
+
+        /// Reads the shared render target into system memory as tightly packed B8G8R8A8.
+        ///
+        /// A GPU-to-CPU round trip, so it stalls the pipeline. It exists because it is a
+        /// defined-behaviour way to get Remix's output on screen that depends on none of the
+        /// cross-API synchronisation: the same mechanism probeOutputNonBlack already proves works.
+        /// Treat it as a diagnostic and tuning path, not the shipping one -- at 4K it moves 33 MB a
+        /// frame. One staging surface is reused across calls.
+        ///
+        /// @param out resized to width * height * 4 on success.
+        bool readOutputPixels(std::vector<unsigned char>& out, unsigned int& outWidth, unsigned int& outHeight);
 
         /// Reads the shared render target back to the CPU and logs whether anything in it is non-black.
         ///

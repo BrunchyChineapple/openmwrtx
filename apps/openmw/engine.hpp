@@ -141,6 +141,9 @@ namespace OMW
         osg::ref_ptr<RemixRT::ImportOperation> mRemixImport;
         // Draws the imported image over OpenMW's frame. Held so compositing can be toggled.
         osg::ref_ptr<RemixRT::CompositeCallback> mRemixComposite;
+        // Scratch for the readback display path. A member so the allocation is reused across frames
+        // rather than churning a multi-megabyte buffer every frame.
+        std::vector<unsigned char> mRemixReadback;
         std::unique_ptr<VFS::Manager> mVFS;
         std::unique_ptr<Resource::ResourceSystem> mResourceSystem;
         osg::ref_ptr<SceneUtil::WorkQueue> mWorkQueue;
