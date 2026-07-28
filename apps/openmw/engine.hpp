@@ -125,6 +125,11 @@ namespace RemixRT
     class CompositeCallback;
 }
 
+namespace MWRender
+{
+    class RemixScene;
+}
+
 struct SDL_Window;
 
 namespace OMW
@@ -141,6 +146,9 @@ namespace OMW
         osg::ref_ptr<RemixRT::ImportOperation> mRemixImport;
         // Draws the imported image over OpenMW's frame. Held so compositing can be toggled.
         osg::ref_ptr<RemixRT::CompositeCallback> mRemixComposite;
+        // Walks OpenMW's scene graph and hands the geometry to Remix. Declared after mRemix so it is
+        // destroyed first: its destructor releases meshes through the runtime.
+        std::unique_ptr<MWRender::RemixScene> mRemixScene;
         // Scratch for the readback display path. A member so the allocation is reused across frames
         // rather than churning a multi-megabyte buffer every frame.
         std::vector<unsigned char> mRemixReadback;

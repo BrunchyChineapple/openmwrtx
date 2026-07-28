@@ -13,9 +13,12 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
+#include <iterator>
 
 #include <SDL_syswm.h>
 #include <SDL_video.h>
@@ -626,6 +629,289 @@ namespace RemixRT
         return mImpl->mApi.SetupCamera(&info) == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    // Runtime::Vertex must be layout-identical to the runtime's only accepted vertex format. CreateMesh
+    // binds the field offsets and the 64-byte stride directly, so a mismatch here would not fail to
+    // compile or to call -- it would read the wrong bytes as positions.
+    static_assert(sizeof(Runtime::Vertex) == sizeof(remixapi_HardcodedVertex), "vertex size drift");
+    static_assert(sizeof(Runtime::Vertex) == 64, "the API fixes the vertex stride at 64 bytes");
+    static_assert(offsetof(Runtime::Vertex, mPosition) == offsetof(remixapi_HardcodedVertex, position),
+        "position offset drift");
+    static_assert(offsetof(Runtime::Vertex, mNormal) == offsetof(remixapi_HardcodedVertex, normal),
+        "normal offset drift");
+    static_assert(offsetof(Runtime::Vertex, mTexcoord) == offsetof(remixapi_HardcodedVertex, texcoord),
+        "texcoord offset drift");
+    static_assert(offsetof(Runtime::Vertex, mColor) == offsetof(remixapi_HardcodedVertex, color),
+        "color offset drift");
+
+    // The mirrored category bits must match the API's, or geometry gets classified as something else
+    // entirely -- terrain submitted as sky, for instance, which changes how Remix lights it.
+    static_assert(static_cast<unsigned int>(Runtime::Category_Sky)
+            == static_cast<unsigned int>(REMIXAPI_INSTANCE_CATEGORY_BIT_SKY),
+        "sky category drift");
+    static_assert(static_cast<unsigned int>(Runtime::Category_Particle)
+            == static_cast<unsigned int>(REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE),
+        "particle category drift");
+    static_assert(static_cast<unsigned int>(Runtime::Category_Terrain)
+            == static_cast<unsigned int>(REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN),
+        "terrain category drift");
+    static_assert(static_cast<unsigned int>(Runtime::Category_AnimatedWater)
+            == static_cast<unsigned int>(REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER),
+        "animated water category drift");
+
+    bool Runtime::setupCameraParameterized(const float* eye, const float* forward, const float* up,
+        const float* right, float fovYDegrees, float aspect, float nearPlane, float farPlane)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.SetupCamera == nullptr || eye == nullptr || forward == nullptr
+            || up == nullptr || right == nullptr)
+            return false;
+
+        remixapi_CameraInfoParameterizedEXT parameterized = {};
+        parameterized.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
+        parameterized.position = { eye[0], eye[1], eye[2] };
+        parameterized.forward = { forward[0], forward[1], forward[2] };
+        parameterized.up = { up[0], up[1], up[2] };
+        parameterized.right = { right[0], right[1], right[2] };
+        parameterized.fovYInDegrees = fovYDegrees;
+        parameterized.aspect = aspect;
+        parameterized.nearPlane = nearPlane;
+        parameterized.farPlane = farPlane;
+
+        remixapi_CameraInfo camera = {};
+        camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        camera.pNext = &parameterized;
+        camera.type = REMIXAPI_CAMERA_TYPE_WORLD;
+        return mImpl->mApi.SetupCamera(&camera) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    unsigned long long Runtime::createFlatMaterial(unsigned long long hash, float red, float green,
+        float blue, float roughness, float metallic, float emissive, const float* emissiveColour)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0)
+            return 0;
+
+        remixapi_MaterialInfoOpaqueEXT opaque = {};
+        opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+        opaque.albedoConstant = { red, green, blue };
+        opaque.opacityConstant = 1.0f;
+        opaque.roughnessConstant = roughness;
+        opaque.metallicConstant = metallic;
+        // Alpha test "always", i.e. never reject a hit. This is NOT a default that can be left alone:
+        // the enum is Vulkan's compare-op ordering, so zero is kNever, and the runtime derives
+        // isFullyOpaque as (blending disabled && alphaTestType == kAlways). Leave it zeroed and every
+        // surface is non-opaque with a test that can never pass, so the path tracer rejects every hit
+        // and rays pass straight through. The geometry is then present in the acceleration structure,
+        // hit-tested, and completely invisible -- you see whatever is behind it, which for a scene with
+        // Remix's own sky enabled means a sky-filled frame indoors.
+        opaque.alphaTestType = 7; // AlphaTestType::kAlways, surface_shared.h
+        opaque.alphaReferenceValue = 0;
+
+        remixapi_MaterialInfo material = {};
+        material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+        material.pNext = &opaque;
+        material.hash = hash;
+        // The runtime keys emission off intensity being positive, so leaving it zero disables emission
+        // whatever the colour says. Defaulting the colour to the albedo keeps a self-lit surface the
+        // same hue as a lit one, which matters when emission is being used to make geometry visible.
+        material.emissiveIntensity = emissive;
+        material.emissiveColorConstant = emissiveColour != nullptr
+            ? remixapi_Float3D{ emissiveColour[0], emissiveColour[1], emissiveColour[2] }
+            : remixapi_Float3D{ red, green, blue };
+
+        remixapi_MaterialHandle handle = nullptr;
+        if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    unsigned long long Runtime::createMesh(unsigned long long hash, const Vertex* vertices,
+        unsigned int vertexCount, const unsigned int* indices, unsigned int indexCount,
+        unsigned long long material)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateMesh == nullptr || hash == 0 || vertices == nullptr
+            || indices == nullptr || vertexCount == 0 || indexCount == 0)
+            return 0;
+
+        remixapi_MeshInfoSurfaceTriangles surface = {};
+        // The reinterpret_cast is safe on the strength of the static_asserts above, and avoids copying
+        // every vertex of every mesh into an identical struct purely to satisfy the type system.
+        surface.vertices_values = reinterpret_cast<const remixapi_HardcodedVertex*>(vertices);
+        surface.vertices_count = vertexCount;
+        surface.indices_values = indices;
+        surface.indices_count = indexCount;
+        surface.skinning_hasvalue = 0;
+        surface.material = reinterpret_cast<remixapi_MaterialHandle>(material);
+
+        remixapi_MeshInfo mesh = {};
+        mesh.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+        mesh.hash = hash;
+        mesh.surfaces_values = &surface;
+        mesh.surfaces_count = 1;
+
+        remixapi_MeshHandle handle = nullptr;
+        if (mImpl->mApi.CreateMesh(&mesh, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    void Runtime::destroyMesh(unsigned long long mesh)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DestroyMesh == nullptr || mesh == 0)
+            return;
+        mImpl->mApi.DestroyMesh(reinterpret_cast<remixapi_MeshHandle>(mesh));
+    }
+
+    static_assert(static_cast<unsigned int>(Runtime::Format_RGBA8) == REMIXAPI_FORMAT_R8G8B8A8_SRGB,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BGRA8) == REMIXAPI_FORMAT_B8G8R8A8_SRGB,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BC1_RGB) == REMIXAPI_FORMAT_BC1_RGB_SRGB,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BC1_RGBA) == REMIXAPI_FORMAT_BC1_RGBA_SRGB,
+        "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC2) == REMIXAPI_FORMAT_BC2_SRGB, "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC3) == REMIXAPI_FORMAT_BC3_SRGB, "texture format drift");
+
+    unsigned long long Runtime::createTexture(unsigned long long hash, unsigned int width,
+        unsigned int height, unsigned int mipLevels, TextureFormat format, const void* data,
+        unsigned long long dataSize)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateTexture == nullptr || hash == 0 || data == nullptr
+            || dataSize == 0 || width == 0 || height == 0)
+            return 0;
+
+        remixapi_TextureInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+        info.hash = hash;
+        info.width = width;
+        info.height = height;
+        info.depth = 1;
+        info.mipLevels = mipLevels > 0 ? mipLevels : 1u;
+        info.format = static_cast<remixapi_Format>(format);
+        info.data = data;
+        info.dataSize = dataSize;
+
+        remixapi_TextureHandle handle = nullptr;
+        if (mImpl->mApi.CreateTexture(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    void Runtime::destroyTexture(unsigned long long texture)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DestroyTexture == nullptr || texture == 0)
+            return;
+        mImpl->mApi.DestroyTexture(reinterpret_cast<remixapi_TextureHandle>(texture));
+    }
+
+    unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
+        unsigned long long textureHash, float roughness, float metallic,
+        unsigned char alphaTestReference)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
+            return 0;
+
+        // The runtime resolves a path of this shape against textures uploaded through CreateTexture
+        // instead of against the filesystem. Lower case hex without leading zeros, because the lookup
+        // parses it with strtoull and compares the parsed value, not the string.
+        wchar_t pseudoPath[32] = {};
+        std::swprintf(pseudoPath, std::size(pseudoPath), L"0x%llx", textureHash);
+
+        remixapi_MaterialInfoOpaqueEXT opaque = {};
+        opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+        // Left at white so the texture is what shows. The runtime multiplies the two, so a tinted
+        // constant here would darken every textured surface for no reason.
+        opaque.albedoConstant = { 1.0f, 1.0f, 1.0f };
+        opaque.opacityConstant = 1.0f;
+        opaque.roughnessConstant = roughness;
+        opaque.metallicConstant = metallic;
+        // See createFlatMaterial: zero is kNever, which rejects every hit and makes the surface
+        // invisible. kAlways when no cutout is wanted, kGreater when one is.
+        opaque.alphaTestType = alphaTestReference != 0 ? 4 /* kGreater */ : 7 /* kAlways */;
+        opaque.alphaReferenceValue = alphaTestReference;
+
+        remixapi_MaterialInfo material = {};
+        material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+        material.pNext = &opaque;
+        material.hash = hash;
+        material.albedoTexture = pseudoPath;
+
+        remixapi_MaterialHandle handle = nullptr;
+        if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    void Runtime::destroyMaterial(unsigned long long material)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DestroyMaterial == nullptr || material == 0)
+            return;
+        mImpl->mApi.DestroyMaterial(reinterpret_cast<remixapi_MaterialHandle>(material));
+    }
+
+    unsigned long long Runtime::createSphereLight(
+        unsigned long long hash, const float* position, const float* radiance, float radius)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateLight == nullptr || hash == 0 || position == nullptr
+            || radiance == nullptr)
+            return 0;
+
+        remixapi_LightInfoSphereEXT sphere = {};
+        sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+        sphere.position = { position[0], position[1], position[2] };
+        sphere.radius = radius;
+        sphere.shaping_hasvalue = 0;
+        // Volumetric contribution left at parity with the surface contribution. Zero here would leave
+        // the light out of the fog entirely, which reads as the light not existing when looking through
+        // any volumetric medium.
+        sphere.volumetricRadianceScale = 1.0f;
+
+        remixapi_LightInfo light = {};
+        light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+        light.pNext = &sphere;
+        light.hash = hash;
+        light.radiance = { radiance[0], radiance[1], radiance[2] };
+        // Dynamic: OpenMW's lights move with the objects carrying them and flicker, so the runtime must
+        // not assume the previous frame's position is still valid for reprojection.
+        light.isDynamic = 1;
+
+        remixapi_LightHandle handle = nullptr;
+        if (mImpl->mApi.CreateLight(&light, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    void Runtime::destroyLight(unsigned long long light)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DestroyLight == nullptr || light == 0)
+            return;
+        mImpl->mApi.DestroyLight(reinterpret_cast<remixapi_LightHandle>(light));
+    }
+
+    bool Runtime::drawLight(unsigned long long light)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DrawLightInstance == nullptr || light == 0)
+            return false;
+        return mImpl->mApi.DrawLightInstance(reinterpret_cast<remixapi_LightHandle>(light))
+            == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    bool Runtime::drawInstance(
+        unsigned long long mesh, const float* transform, unsigned int categoryFlags, bool doubleSided)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.DrawInstance == nullptr || mesh == 0 || transform == nullptr)
+            return false;
+
+        remixapi_InstanceInfo instance = {};
+        instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+        instance.mesh = reinterpret_cast<remixapi_MeshHandle>(mesh);
+        instance.categoryFlags = categoryFlags;
+        instance.doubleSided = doubleSided ? 1 : 0;
+        std::memcpy(instance.transform.matrix, transform, sizeof(instance.transform.matrix));
+        return mImpl->mApi.DrawInstance(&instance) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
     bool Runtime::copyOutput()
     {
         if (!mImpl->mHaveOutput || mImpl->mApi.dxvk_CopyRenderingOutput == nullptr)
@@ -844,6 +1130,11 @@ namespace RemixRT
             opaque.opacityConstant = 1.0f;
             opaque.roughnessConstant = 0.5f;
             opaque.metallicConstant = 0.0f;
+            // See createFlatMaterial: zero is AlphaTestType::kNever, which makes the surface reject
+            // every hit. The test scene got away with it because a single quad against a sky reads as
+            // "dim" rather than "missing", which is precisely the sort of near-miss that makes a test
+            // scene worse than useless.
+            opaque.alphaTestType = 7; // AlphaTestType::kAlways
 
             remixapi_MaterialInfo material = {};
             material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -1105,6 +1396,30 @@ namespace RemixRT
     }
 
     bool Runtime::setupCamera(const float*, const float*)
+    {
+        return false;
+    }
+
+    bool Runtime::setupCameraParameterized(
+        const float*, const float*, const float*, const float*, float, float, float, float)
+    {
+        return false;
+    }
+
+    unsigned long long Runtime::createFlatMaterial(unsigned long long, float, float, float, float, float)
+    {
+        return 0;
+    }
+
+    unsigned long long Runtime::createMesh(
+        unsigned long long, const Vertex*, unsigned int, const unsigned int*, unsigned int, unsigned long long)
+    {
+        return 0;
+    }
+
+    void Runtime::destroyMesh(unsigned long long) {}
+
+    bool Runtime::drawInstance(unsigned long long, const float*, unsigned int, bool)
     {
         return false;
     }

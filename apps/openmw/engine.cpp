@@ -48,6 +48,8 @@
 #include <components/sceneutil/color.hpp>
 #include <components/remixrt/glinterop.hpp>
 #include <components/remixrt/runtime.hpp>
+
+#include "mwrender/remixscene.hpp"
 #include <components/sceneutil/depth.hpp>
 #include <components/sceneutil/screencapture.hpp>
 #include <components/sceneutil/unrefqueue.hpp>
@@ -202,7 +204,15 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update input
         {
             ScopedProfile<UserStatsType::Input> profile(frameStart, frameNumber, *timer, *stats);
-            mInputManager->update(frametime, false);
+            // While Remix's developer menu is up it owns the pointer and the keyboard, so OpenMW has to
+            // stop acting on them: otherwise the camera keeps turning under the menu and keystrokes are
+            // read as bindings as well as by the menu. The existing disableControls/disableEvents pair is
+            // exactly the right mechanism -- SDL is still pumped, so the window stays responsive and
+            // window events are handled, but button presses and mouse motion are dropped.
+            //
+            // The menu's own hotkeys are unaffected because Remix reads them from raw input on its
+            // overlay window, not from SDL, so Alt+X still closes it.
+            mInputManager->update(frametime, mRemixMenuHasMouse, mRemixMenuHasMouse);
         }
 
         // When the window is minimized, pause the game. Currently this *has* to be here to work around a MyGUI bug.
@@ -368,8 +378,17 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
         // The test scene defines its own camera and geometry, so it deliberately bypasses OpenMW's.
         const bool useTestScene = RemixRT::Runtime::testSceneRequested();
-        const bool cameraOk = useTestScene ? mRemix->submitTestScene()
-                                           : mRemix->setupCamera(view.ptr(), projection.ptr());
+        bool cameraOk = false;
+        if (useTestScene)
+        {
+            cameraOk = mRemix->submitTestScene();
+        }
+        else if (mRemixScene != nullptr)
+        {
+            // Submits the camera and the visible scene together, because they have to agree: the camera
+            // goes over as parameters rather than matrices, and geometry in the same units.
+            cameraOk = mRemixScene->submit(mViewer->getSceneData(), *camera) > 0;
+        }
         const bool presentOk = mRemix->present();
 
         // Report whether the composite signalled Remix since the previous copy. Remix may only wait on
@@ -380,16 +399,38 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const bool consumerSignalled
             = mRemixComposite != nullptr && mRemixComposite->takeConsumerSignalled();
 
-        // Once the GL side has reported a semaphore failure, stop using the synchronised copy: it
-        // would keep signalling a binary semaphore that nothing consumes.
-        const bool syncBroken = mRemixComposite != nullptr && mRemixComposite->syncFailed();
+        // Skip the synchronised copy entirely when nothing is going to consume the semaphores: either
+        // the GL side already reported a failure, or the readback path is in use and reads the surface
+        // through D3D9 instead. Signalling a binary semaphore nobody waits on is not free -- it leaves
+        // the pair unbalanced -- and the synced entry point is the more complex path of the two.
+        const bool syncPointless = mRemixComposite == nullptr || mRemixComposite->syncFailed()
+            || mRemixComposite->readbackMode();
         const bool copyOk
-            = syncBroken ? mRemix->copyOutput() : mRemix->copyOutputSynced(consumerSignalled);
+            = syncPointless ? mRemix->copyOutput() : mRemix->copyOutputSynced(consumerSignalled);
 
         // And symmetrically: the composite may only wait if a synchronised copy really was issued for
         // this frame, because waiting on an unsignalled semaphore is undefined in its own right.
         if (mRemixComposite != nullptr)
-            mRemixComposite->setSyncArmed(copyOk && !syncBroken);
+            mRemixComposite->setSyncArmed(copyOk && !syncPointless);
+
+        // Only overwrite OpenMW's frame when Remix actually has something in it.
+        //
+        // The composite is a full-frame overwrite, so with nothing submitted it replaces the entire game
+        // -- picture, UI and all -- with black. That is indistinguishable from a hang: the game is
+        // running and audible, no key does anything visible, and even the Remix menu is gone, because
+        // that is drawn into the same output which is only produced when Remix raytraces. A failure
+        // upstream of the compositor must not take the whole game down with it.
+        if (mRemixComposite != nullptr)
+        {
+            const bool haveContent = copyOk && (useTestScene || cameraOk);
+            if (haveContent != mRemixComposite->enabled())
+            {
+                mRemixComposite->setEnabled(haveContent);
+                Log(Debug::Info) << "Remix: compositing " << (haveContent ? "enabled" : "disabled")
+                                 << (haveContent ? "" : " -- nothing was submitted, so OpenMW's own frame "
+                                                        "is being shown instead of an empty one");
+            }
+        }
 
         // Hand the mouse over while Remix's developer menu is open, and take it back afterwards.
         //
@@ -412,7 +453,14 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // describe reality either side of the menu being up. Transitions only, since
         // updateCursorMode warps the cursor whenever it leaves relative mode.
         {
-            const bool menuWantsMouse = mRemix->uiState() > 0;
+            // Only when the menu can actually be seen. It is drawn into Remix's output image, so if the
+            // composite is not on screen the menu is invisible -- and handing it the pointer then, while
+            // OpenMW also stops acting on input, leaves the game apparently frozen with nothing to
+            // interact with and no visible way back. That is precisely what happened when the composite
+            // was mis-ordered behind OpenMW's scene resolve: pressing Alt+X looked like a hard lock-up.
+            // An overlay that cannot be shown does not get the pointer.
+            const bool menuWantsMouse
+                = mRemix->uiState() > 0 && mRemixComposite != nullptr && mRemixComposite->enabled();
             if (menuWantsMouse != mRemixMenuHasMouse)
             {
                 mRemixMenuHasMouse = menuWantsMouse;
@@ -458,7 +506,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             Log(Debug::Info) << "Remix pump: " << (useTestScene ? "test scene" : "OpenMW scene")
                              << " submit=" << cameraOk << " present=" << presentOk
-                             << " copyOutput=" << copyOk;
+                             << " copyOutput=" << copyOk
+                             << (mRemixScene != nullptr
+                                        ? " instances=" + std::to_string(mRemixScene->lastInstanceCount())
+                                            + " meshes=" + std::to_string(mRemixScene->cachedMeshCount())
+                                        : std::string());
             if (!useTestScene)
             {
                 // Only meaningful when OpenMW's camera is the one being submitted.
@@ -893,9 +945,50 @@ void OMW::Engine::prepareEngine()
                 mRemixImport = new RemixRT::ImportOperation(mRemix->outputImage(), mRemix->outputSync());
                 gc->add(mRemixImport);
 
-                // Final draw callback: runs after OpenMW's frame, before the swap.
+                // The composite goes in as scene content under its own camera, ordered after the world
+                // and before the GUI.
+                //
+                // The order number is the whole point, and both neighbours matter:
+                //
+                //   POST_RENDER 0  MWRender::PostProcessor's HUD camera, which resolves OpenMW's
+                //                  rendered scene to the screen. Always present, whether or not user
+                //                  post-process shaders are enabled.
+                //   POST_RENDER 1  this camera, replacing that image with Remix's.
+                //   POST_RENDER 5  MyGUI's camera, drawing the interface on top.
+                //
+                // Two earlier placements were wrong in instructive ways. As the main camera's *final*
+                // draw callback it ran after that camera's entire render-stage tree, the GUI's nested
+                // camera included, so a full-frame overwrite erased every UI element. Moved to
+                // POST_RENDER -1 it ran before the HUD camera, which then blitted the rasterised scene
+                // straight over it -- the picture went back to looking like plain OpenMW. There is no
+                // callback hook between those two points, which is why this is scene content in its own
+                // camera rather than a callback anywhere.
+                //
+                // MyGUI's camera was moved off the default 0 to make this slot exist at all; see
+                // myguirendermanager.cpp.
                 mRemixComposite = new RemixRT::CompositeCallback(mRemixImport.get());
-                mViewer->getCamera()->setFinalDrawCallback(mRemixComposite);
+
+                osg::ref_ptr<osg::Camera> compositeCamera = new osg::Camera;
+                compositeCamera->setName("RemixComposite");
+                compositeCamera->setRenderOrder(osg::Camera::POST_RENDER, 1);
+                compositeCamera->setReferenceFrame(osg::Camera::ABSOLUTE_RF);
+                compositeCamera->setProjectionMatrix(osg::Matrix::identity());
+                compositeCamera->setViewMatrix(osg::Matrix::identity());
+                // Nothing to clear: this overwrites every pixel it covers, and clearing would throw
+                // away the frame it is about to replace for no gain.
+                compositeCamera->setClearMask(GL_NONE);
+                compositeCamera->setAllowEventFocus(false);
+                // The same viewport object, not a copy, so a window resize is picked up without this
+                // camera needing to be told. The composite reads the viewport off the current camera to
+                // set the GL one, so it has to be present and correct.
+                compositeCamera->setViewport(mViewer->getCamera()->getViewport());
+                compositeCamera->getOrCreateStateSet()->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
+                compositeCamera->addChild(new RemixRT::CompositeDrawable(mRemixComposite));
+                rootNode->addChild(compositeCamera);
+
+                // Feeds OpenMW's scene graph to Remix. Without it the runtime has a camera and nothing
+                // else, never enters its raytracing path, and produces no output at all.
+                mRemixScene = std::make_unique<MWRender::RemixScene>(*mRemix);
             }
             else
             {
@@ -906,6 +999,11 @@ void OMW::Engine::prepareEngine()
             // there is nothing to tell "compositing is broken" apart from "nothing was submitted yet".
             // This also exercises the atmosphere and weather system, which is driven purely through
             // config and game-state values and so is host-agnostic.
+            // OpenMW's world is right-handed with Z up; Remix assumes Y up unless told otherwise. Only
+            // the sky and the free camera read this option -- world geometry and the camera transform are
+            // unaffected -- which is exactly why the symptom was a sky rotated ninety degrees, with a
+            // horizon running vertically down the screen, rather than an inverted world.
+            mRemix->setConfigVariable("rtx.zUp", "1");
             mRemix->setConfigVariable("rtx.skyMode", "1");
             mRemix->setGameValue("__weather.target", "clear");
             mRemix->setGameValue("__weather.blend_seconds", "0");

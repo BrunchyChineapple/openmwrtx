@@ -690,9 +690,9 @@ namespace RemixRT
             ? renderInfo.getCurrentCamera()->getViewport()
             : nullptr;
 
-        // No glPushAttrib/glPopAttrib: they do not exist in a core profile, and this is the final draw
-        // callback so nothing else draws afterwards this frame. Telling OSG its cached mode state is
-        // stale is enough -- it re-applies what it needs at the start of the next frame.
+        // No glPushAttrib/glPopAttrib: they do not exist in a core profile. OpenMW's GUI draws after
+        // this, so the state OSG believes is current has to be invalidated before returning -- see the
+        // dirtyAll* calls at the end, which are load-bearing rather than tidiness.
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
@@ -798,7 +798,29 @@ namespace RemixRT
                 mSyncFailed.store(true, std::memory_order_relaxed);
         }
 
+        // Everything OSG caches about the GL context has to be marked stale, because OpenMW's GUI is
+        // drawn after this and would otherwise inherit modes, attributes and array bindings that OSG
+        // still believes it set. Vertex arrays are included for the VAO bound above: unbinding it is not
+        // enough on its own, since OSG tracks its own idea of what is bound.
         state->dirtyAllModes();
         state->dirtyAllAttributes();
+        state->dirtyAllVertexArrays();
+    }
+
+    CompositeDrawable::CompositeDrawable(CompositeCallback* composite)
+        : mComposite(composite)
+    {
+        // A fullscreen overlay has no meaningful bounds, and letting OSG cull it against the view
+        // frustum would drop it. Display lists and VBO management are OSG's, and this draws through raw
+        // GL, so both are off.
+        setCullingActive(false);
+        setUseDisplayList(false);
+        setUseVertexBufferObjects(false);
+    }
+
+    void CompositeDrawable::drawImplementation(osg::RenderInfo& renderInfo) const
+    {
+        if (mComposite != nullptr)
+            (*mComposite)(renderInfo);
     }
 }

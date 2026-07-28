@@ -100,7 +100,27 @@ namespace RemixRT
         ///
         /// Both matrices are 16 floats in OSG's layout, which is row-major with the row-vector
         /// convention (v * M) -- the same convention D3D9 uses, so they map straight across.
+        ///
+        /// Prefer setupCameraParameterized. This path makes handedness, matrix majorness and OpenMW's
+        /// reversed-Z projection all load-bearing simultaneously, and gives no way to tell which of them
+        /// is wrong when the result looks off.
         bool setupCamera(const float* view, const float* projection);
+
+        /// Hands Remix the camera as explicit parameters rather than matrices.
+        ///
+        /// Preferred, because it removes three separate conventions from the list of things that can be
+        /// silently wrong: row versus column vectors, handedness, and OpenMW's reversed-Z depth range.
+        /// The runtime builds its own matrices from these, so only the values have to be right.
+        ///
+        /// @param eye     camera position in world space
+        /// @param forward viewing direction, need not be normalised
+        /// @param up      up vector
+        /// @param right   right vector
+        /// @param fovYDegrees vertical field of view
+        /// @param aspect  width / height
+        /// @param nearPlane,farPlane in the same units as eye -- OpenMW units, not metres
+        bool setupCameraParameterized(const float* eye, const float* forward, const float* up,
+            const float* right, float fovYDegrees, float aspect, float nearPlane, float farPlane);
 
         /// Blits Remix's final colour into the shared render target. Cheap, GPU-side.
         ///
@@ -142,6 +162,145 @@ namespace RemixRT
         /// answer is independent of the GL side. Slow -- it stalls on a GPU readback -- so call it once,
         /// not per frame.
         bool probeOutputNonBlack();
+
+        /// One vertex in the only layout the Remix API accepts.
+        ///
+        /// Mirrors remixapi_HardcodedVertex exactly, including its 28 bytes of tail padding, because
+        /// CreateMesh hard-binds the field offsets and a 64-byte stride. Redeclared here rather than
+        /// exposing remix_c.h, which would drag <windows.h> into everything that submits geometry.
+        /// The static_asserts in runtime.cpp keep the two definitions honest.
+        ///
+        /// One UV set, one colour set, no tangent channel. Normal mapping therefore has to come from
+        /// the material's normal/tangent textures; tangents cannot ride in on the vertex buffer.
+        struct Vertex
+        {
+            float mPosition[3];
+            float mNormal[3];
+            float mTexcoord[2];
+            unsigned int mColor; ///< packed 8-bit BGRA
+            unsigned int mPad[7];
+        };
+
+        /// Instance category bits, mirroring remixapi_InstanceCategoryBit.
+        ///
+        /// Duplicated here so callers can classify geometry without including remix_c.h, which would
+        /// pull <windows.h> into the rest of OpenMW. The values must match the API's exactly; the
+        /// static_asserts in runtime.cpp enforce that.
+        ///
+        /// Setting these is what makes Remix's usual texture-hash tagging workflow unnecessary: that
+        /// exists so Remix can infer what a D3D9 draw *is*, and submitting through the API means we can
+        /// simply say.
+        enum InstanceCategory : unsigned int
+        {
+            Category_Sky = 1u << 2,
+            Category_Particle = 1u << 9,
+            Category_Terrain = 1u << 16,
+            Category_AnimatedWater = 1u << 17,
+        };
+
+        /// Creates a flat, untextured opaque material. Idempotent for a given hash.
+        ///
+        /// @param hash caller-owned and must be unique; the runtime uses it as the identity.
+        /// @param emissive radiance added regardless of lighting, as a multiplier on \a emissiveColour.
+        ///        Zero means a purely reflective surface. Non-zero is the only way to see geometry at
+        ///        all before lights are submitted, so it doubles as the bring-up diagnostic: a surface
+        ///        that is invisible with emission on is not in the scene, not merely unlit.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createFlatMaterial(unsigned long long hash, float red, float green, float blue,
+            float roughness, float metallic, float emissive = 0.0f,
+            const float* emissiveColour = nullptr);
+
+        /// Creates a triangle mesh with a single surface.
+        ///
+        /// @param hash caller-owned and must be unique across live meshes: the runtime derives the mesh
+        ///        handle from it directly, so a collision silently aliases two different meshes.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createMesh(unsigned long long hash, const Vertex* vertices,
+            unsigned int vertexCount, const unsigned int* indices, unsigned int indexCount,
+            unsigned long long material);
+
+        /// Releases a mesh. Must be called before its hash is reused for different geometry.
+        void destroyMesh(unsigned long long mesh);
+
+        /// Pixel formats accepted by createTexture, mirroring remixapi_Format.
+        ///
+        /// Duplicated here for the same reason as InstanceCategory: so callers need not include
+        /// remix_c.h and drag <windows.h> in with it. The static_asserts in runtime.cpp keep them equal.
+        enum TextureFormat : unsigned int
+        {
+            Format_RGBA8 = 43, ///< 8-bit RGBA, sRGB-encoded
+            Format_BGRA8 = 50, ///< 8-bit BGRA, sRGB-encoded
+            Format_BC1_RGB = 132, ///< DXT1 without alpha
+            Format_BC1_RGBA = 134, ///< DXT1 with a one-bit alpha
+            Format_BC2 = 138, ///< DXT3
+            Format_BC3 = 136, ///< DXT5
+        };
+
+        /// Uploads a texture the runtime can then be told to use by hash.
+        ///
+        /// This is the only workable route for a host whose assets are not loose files. Remix's material
+        /// fields take file paths, and OpenMW reads its textures out of BSA archives through its own VFS,
+        /// so there is no path to give. Uploading the decoded pixels and referencing them by hash avoids
+        /// unpacking the archives to a scratch directory purely to satisfy a path-based API.
+        ///
+        /// @param hash caller-owned identity, and the handle: a collision aliases two textures.
+        /// @param mipLevels number of mip levels present in \a data, packed tightly one after another
+        ///        with no padding, largest first. One means no mips, which is legal but shimmers badly
+        ///        at distance because minification then has nothing to fall back on.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createTexture(unsigned long long hash, unsigned int width,
+            unsigned int height, unsigned int mipLevels, TextureFormat format, const void* data,
+            unsigned long long dataSize);
+
+        /// Releases an uploaded texture.
+        void destroyTexture(unsigned long long texture);
+
+        /// Creates a material that samples an uploaded texture for its albedo.
+        ///
+        /// @param textureHash the hash passed to createTexture. Referenced through the runtime's
+        ///        "0x<hex>" pseudo-path convention, which exists precisely so an uploaded texture can be
+        ///        named where a file path is expected.
+        /// @param alphaTestReference 0 disables alpha testing and makes the surface fully opaque.
+        ///        Non-zero rejects texels whose alpha is not greater than this, which is how cutout
+        ///        foliage and lattices keep their holes.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
+            float roughness, float metallic, unsigned char alphaTestReference);
+
+        /// Releases a material.
+        void destroyMaterial(unsigned long long material);
+
+        /// Creates or replaces a spherical light.
+        ///
+        /// @param hash caller-owned identity, as with meshes: the handle is the hash, so a collision
+        ///        aliases two lights. Recreating with the same hash replaces the previous one.
+        /// @param position world space, in the same units as the camera and geometry -- OpenMW units.
+        /// @param radiance linear RGB, and *not* a 0..1 colour: it is the radiance of the sphere's
+        ///        surface, so it scales with how small the sphere is. A dim value here yields a light
+        ///        that is present in the scene and invisible in the image.
+        /// @param radius of the emitting sphere. Also the softness control -- a larger sphere gives
+        ///        softer shadows for the same total power, which has to be compensated in \a radiance.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createSphereLight(unsigned long long hash, const float* position,
+            const float* radiance, float radius);
+
+        /// Releases a light.
+        void destroyLight(unsigned long long light);
+
+        /// Adds a previously created light to this frame.
+        ///
+        /// Separate from creation for the same reason instances are separate from meshes: creation is
+        /// the expensive half and is cached, while presence in the frame is per-frame state.
+        bool drawLight(unsigned long long light);
+
+        /// Queues one instance of a mesh for this frame.
+        ///
+        /// @param transform 12 floats, three rows of four, rotation in the leading 3x3 and translation
+        ///        in the last column, applied as p' = M * p.
+        /// @param categoryFlags remixapi_InstanceCategoryBit values, taken from OpenMW's VisMask so
+        ///        Remix is told what a thing *is* rather than inferring it from a texture hash.
+        bool drawInstance(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
+            bool doubleSided);
 
         /// True when OPENMW_REMIX_TESTSCENE asks for the built-in test scene instead of OpenMW's.
         static bool testSceneRequested();

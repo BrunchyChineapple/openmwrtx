@@ -882,8 +882,15 @@ extern "C" {
     REMIXAPI_FORMAT_B8G8R8A8_SRGB = 50,    // VK_FORMAT_B8G8R8A8_SRGB
     REMIXAPI_FORMAT_BC1_RGB_UNORM = 131,   // VK_FORMAT_BC1_RGB_UNORM_BLOCK
     REMIXAPI_FORMAT_BC1_RGB_SRGB = 132,    // VK_FORMAT_BC1_RGB_SRGB_BLOCK
+    // BC1 with a one-bit alpha, and BC2 (DXT3) with explicit four-bit alpha. Both added by this fork:
+    // upstream's switch mapped neither, and BC1_RGBA shares BC1_RGB's block layout, so DXT1 data that
+    // carries a cutout was being uploaded as opaque -- foliage and lattices came out as solid squares.
+    REMIXAPI_FORMAT_BC1_RGBA_UNORM = 133,  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+    REMIXAPI_FORMAT_BC1_RGBA_SRGB = 134,   // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
     REMIXAPI_FORMAT_BC3_UNORM = 135,       // VK_FORMAT_BC3_UNORM_BLOCK
     REMIXAPI_FORMAT_BC3_SRGB = 136,        // VK_FORMAT_BC3_SRGB_BLOCK
+    REMIXAPI_FORMAT_BC2_UNORM = 137,       // VK_FORMAT_BC2_UNORM_BLOCK
+    REMIXAPI_FORMAT_BC2_SRGB = 138,        // VK_FORMAT_BC2_SRGB_BLOCK
     REMIXAPI_FORMAT_BC5_UNORM = 139,       // VK_FORMAT_BC5_UNORM_BLOCK (normal maps)
     REMIXAPI_FORMAT_BC7_UNORM = 145,       // VK_FORMAT_BC7_UNORM_BLOCK
     REMIXAPI_FORMAT_BC7_SRGB = 146,        // VK_FORMAT_BC7_SRGB_BLOCK

@@ -389,7 +389,15 @@ namespace MyGUIPlatform
         camera->setProjectionResizePolicy(osg::Camera::FIXED);
         camera->setProjectionMatrix(osg::Matrix::identity());
         camera->setViewMatrix(osg::Matrix::identity());
-        camera->setRenderOrder(osg::Camera::POST_RENDER);
+        // Explicit order number rather than the default 0.
+        //
+        // MWRender::PostProcessor's HUD camera, which resolves the rendered scene to the screen, is also
+        // POST_RENDER 0. Two stages sharing an order number are drawn in cull order, so "the interface
+        // is on top of the scene" was true only by accident of graph layout, and there was no number
+        // between them for anything else to occupy. The RTX Remix compositor needs exactly that slot: it
+        // replaces the scene image, so it has to run after the scene reaches the screen and before the
+        // interface is drawn over it. Leaving a gap below this makes that expressible.
+        camera->setRenderOrder(osg::Camera::POST_RENDER, 5);
         camera->setClearMask(GL_NONE);
         mDrawable->setCullingActive(false);
         camera->addChild(mDrawable.get());

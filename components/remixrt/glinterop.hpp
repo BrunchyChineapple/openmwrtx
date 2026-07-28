@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <osg/Camera>
+#include <osg/Drawable>
 #include <osg/GraphicsContext>
 #include <osg/ref_ptr>
 
@@ -75,10 +76,15 @@ namespace RemixRT
 
     /// Draws the imported Remix image over OpenMW's frame.
     ///
-    /// Installed as the main camera's final draw callback, so it runs on the draw thread after OpenMW
-    /// has finished rendering and before the buffer swap -- exactly where a full-frame replacement
-    /// belongs. Raw GL rather than an OSG subgraph because the source is an externally-owned texture
-    /// name, and going through osg::Texture2D would mean convincing OSG it already owns a GL object.
+    /// Runs on the draw thread, after OpenMW's world rendering and before the GUI. Raw GL rather than an
+    /// OSG subgraph because the source is an externally-owned texture name, and going through
+    /// osg::Texture2D would mean convincing OSG it already owns a GL object.
+    ///
+    /// Driven through CompositeDrawable rather than as a camera draw callback. It began as the main
+    /// camera's *final* draw callback, which is wrong for a reason worth recording: OSG runs that after
+    /// the camera's entire render-stage tree, and OpenMW's GUI is a nested POST_RENDER camera inside that
+    /// tree. So a full-frame overwrite there erases every UI element -- and there is no callback hook
+    /// between "world drawn" and "nested post-render stages drawn" to move it to.
     ///
     /// Deliberately a hard overwrite, not a blend: while the renderer is being brought up, seeing
     /// exactly what Remix produced -- including black -- is more useful than seeing it mixed with
@@ -163,6 +169,27 @@ namespace RemixRT
         /// Diagnostic: drop the texture barrier from the semaphore operations, to tell a rejected
         /// semaphore apart from a rejected texture barrier. Read once at construction.
         bool mSkipTextureBarrier = false;
+    };
+
+    /// Scene-graph node that draws a CompositeCallback where it is placed in the render order.
+    ///
+    /// Exists so the composite can sit between OpenMW's world and OpenMW's GUI. OSG offers camera
+    /// callbacks before the camera's own drawing and after its whole stage tree, but nothing in between,
+    /// and the GUI lives inside that tree as a nested POST_RENDER camera. Content, unlike a callback, can
+    /// be ordered: put this under its own POST_RENDER camera with a negative order and it draws after the
+    /// world and before the GUI.
+    ///
+    /// Making it real content also avoids relying on OSG keeping a render stage for a camera whose
+    /// subgraph produced no drawables.
+    class CompositeDrawable : public osg::Drawable
+    {
+    public:
+        explicit CompositeDrawable(CompositeCallback* composite);
+
+        void drawImplementation(osg::RenderInfo& renderInfo) const override;
+
+    private:
+        osg::ref_ptr<CompositeCallback> mComposite;
     };
 }
 
