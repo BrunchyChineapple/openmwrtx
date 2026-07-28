@@ -13,6 +13,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 
 #include <SDL_syswm.h>
@@ -399,6 +400,20 @@ namespace RemixRT
         return mImpl->mOutputImage;
     }
 
+    bool Runtime::setupCamera(const float* view, const float* projection)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.SetupCamera == nullptr || view == nullptr
+            || projection == nullptr)
+            return false;
+
+        remixapi_CameraInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        info.type = REMIXAPI_CAMERA_TYPE_WORLD;
+        std::memcpy(info.view, view, sizeof(info.view));
+        std::memcpy(info.projection, projection, sizeof(info.projection));
+        return mImpl->mApi.SetupCamera(&info) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
     bool Runtime::copyOutput()
     {
         if (!mImpl->mHaveOutput || mImpl->mApi.dxvk_CopyRenderingOutput == nullptr)
@@ -535,6 +550,11 @@ namespace RemixRT
     }
 
     bool Runtime::createOutputTarget(unsigned int, unsigned int)
+    {
+        return false;
+    }
+
+    bool Runtime::setupCamera(const float*, const float*)
     {
         return false;
     }

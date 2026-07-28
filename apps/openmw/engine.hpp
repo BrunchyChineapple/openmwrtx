@@ -122,6 +122,7 @@ namespace RemixRT
 {
     class Runtime;
     class ImportOperation;
+    class CompositeCallback;
 }
 
 struct SDL_Window;
@@ -138,6 +139,8 @@ namespace OMW
         // Runs once on the GL thread to import Remix's shared image. Held so the result can be read
         // after it has run.
         osg::ref_ptr<RemixRT::ImportOperation> mRemixImport;
+        // Draws the imported image over OpenMW's frame. Held so compositing can be toggled.
+        osg::ref_ptr<RemixRT::CompositeCallback> mRemixComposite;
         std::unique_ptr<VFS::Manager> mVFS;
         std::unique_ptr<Resource::ResourceSystem> mResourceSystem;
         osg::ref_ptr<SceneUtil::WorkQueue> mWorkQueue;

@@ -353,6 +353,23 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // if there is a separate Lua thread, it starts the update now
     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
 
+    // Drive a Remix frame before OpenMW draws.
+    //
+    // Ordering note: the composite happens in the main camera's final draw callback during
+    // renderingTraversals below, so it samples the image produced by *this* call. Present has to come
+    // first because the raytracing output that copyOutput reads only exists as a result of presenting.
+    if (mRemix != nullptr && mRemix->isReady())
+    {
+        const osg::Camera* camera = mViewer->getCamera();
+        // OSG stores these as doubles; the Remix API takes float[4][4]. Named locals so the pointers
+        // outlive the call.
+        const osg::Matrixf view(camera->getViewMatrix());
+        const osg::Matrixf projection(camera->getProjectionMatrix());
+        mRemix->setupCamera(view.ptr(), projection.ptr());
+        mRemix->present();
+        mRemix->copyOutput();
+    }
+
     mViewer->renderingTraversals();
 
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
@@ -759,11 +776,23 @@ void OMW::Engine::prepareEngine()
             {
                 mRemixImport = new RemixRT::ImportOperation(mRemix->outputImage());
                 gc->add(mRemixImport);
+
+                // Final draw callback: runs after OpenMW's frame, before the swap.
+                mRemixComposite = new RemixRT::CompositeCallback(mRemixImport.get());
+                mViewer->getCamera()->setFinalDrawCallback(mRemixComposite);
             }
             else
             {
                 Log(Debug::Error) << "Remix: no graphics context to import the shared image into";
             }
+
+            // Select the fork's own sky/atmosphere. Without it an empty scene path-traces to black and
+            // there is nothing to tell "compositing is broken" apart from "nothing was submitted yet".
+            // This also exercises the atmosphere and weather system, which is driven purely through
+            // config and game-state values and so is host-agnostic.
+            mRemix->setConfigVariable("rtx.skyMode", "1");
+            mRemix->setGameValue("__weather.target", "clear");
+            mRemix->setGameValue("__weather.blend_seconds", "0");
         }
     }
 

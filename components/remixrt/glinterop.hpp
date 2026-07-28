@@ -1,6 +1,9 @@
 #ifndef OPENMW_COMPONENTS_REMIXRT_GLINTEROP_H
 #define OPENMW_COMPONENTS_REMIXRT_GLINTEROP_H
 
+#include <memory>
+
+#include <osg/Camera>
 #include <osg/GraphicsContext>
 #include <osg/ref_ptr>
 
@@ -41,12 +44,48 @@ namespace RemixRT
         /// True once the operation has run, whether or not it worked.
         bool completed() const { return mCompleted; }
 
+        /// True when the source is BGRA and consumers must swap red and blue. GL has no BGRA internal
+        /// format, so the image is imported as RGBA8 and the swap is left to whoever samples it.
+        bool needsChannelSwap() const { return mNeedsChannelSwap; }
+
     private:
         Runtime::ExternalImage mImage;
         unsigned int mMemoryObject = 0;
         unsigned int mTextureName = 0;
         bool mSucceeded = false;
         bool mCompleted = false;
+        bool mNeedsChannelSwap = false;
+    };
+
+    /// Draws the imported Remix image over OpenMW's frame.
+    ///
+    /// Installed as the main camera's final draw callback, so it runs on the draw thread after OpenMW
+    /// has finished rendering and before the buffer swap -- exactly where a full-frame replacement
+    /// belongs. Raw GL rather than an OSG subgraph because the source is an externally-owned texture
+    /// name, and going through osg::Texture2D would mean convincing OSG it already owns a GL object.
+    ///
+    /// Deliberately a hard overwrite, not a blend: while the renderer is being brought up, seeing
+    /// exactly what Remix produced -- including black -- is more useful than seeing it mixed with
+    /// OpenMW's raster output and having to guess which pixels came from where.
+    class CompositeCallback : public osg::Camera::DrawCallback
+    {
+    public:
+        explicit CompositeCallback(const ImportOperation* import);
+
+        void operator()(osg::RenderInfo& renderInfo) const override;
+
+        /// Turns compositing on and off at runtime so the raster frame can be compared against the
+        /// path-traced one without relaunching.
+        void setEnabled(bool enabled) { mEnabled = enabled; }
+        bool enabled() const { return mEnabled; }
+
+    private:
+        struct Resources;
+
+        const ImportOperation* mImport;
+        mutable std::unique_ptr<Resources> mResources;
+        mutable bool mFailed = false;
+        bool mEnabled = true;
     };
 }
 

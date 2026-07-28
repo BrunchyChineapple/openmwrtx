@@ -67,6 +67,12 @@ namespace RemixRT
         /// Valid only after a successful createOutputTarget().
         const ExternalImage& outputImage() const;
 
+        /// Hands Remix the camera for this frame.
+        ///
+        /// Both matrices are 16 floats in OSG's layout, which is row-major with the row-vector
+        /// convention (v * M) -- the same convention D3D9 uses, so they map straight across.
+        bool setupCamera(const float* view, const float* projection);
+
         /// Blits Remix's final colour into the shared render target. Cheap, GPU-side.
         bool copyOutput();
 

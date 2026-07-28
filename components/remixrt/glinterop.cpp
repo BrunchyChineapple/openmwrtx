@@ -3,7 +3,9 @@
 #include <components/debug/debuglog.hpp>
 
 #include <osg/GLExtensions>
+#include <osg/RenderInfo>
 #include <osg/State>
+#include <osg/Viewport>
 
 namespace
 {
@@ -227,6 +229,7 @@ namespace RemixRT
 
         mMemoryObject = memoryObject;
         mTextureName = texture;
+        mNeedsChannelSwap = needsSwizzle;
         mSucceeded = true;
 
         Log(Debug::Info) << "Remix GL interop: imported " << mImage.mWidth << "x" << mImage.mHeight
@@ -235,5 +238,181 @@ namespace RemixRT
                          << (mImage.mOptimalTiling ? "optimal" : "linear") << " tiling"
                          << (needsSwizzle ? ", BGRA source needs a red/blue swap when sampling" : "")
                          << (isSrgb ? ", sRGB" : "");
+    }
+}
+
+namespace
+{
+    // Minimal pass-through. Positions come from gl_VertexID rather than a vertex buffer so there is no
+    // attribute state to set up or restore.
+    const char* const kVertexShader = R"(#version 330 core
+out vec2 vUv;
+void main()
+{
+    // Two triangles covering the viewport, expressed as a 4-vertex strip.
+    vec2 corner = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0, (gl_VertexID & 2) == 0 ? -1.0 : 1.0);
+    vUv = corner * 0.5 + 0.5;
+    gl_Position = vec4(corner, 0.0, 1.0);
+}
+)";
+
+    // The imported texture is GL_RGBA8 over a Vulkan B8G8R8A8 allocation, so red and blue arrive
+    // swapped. GL has no BGRA internal format, so the swap is corrected here rather than at import.
+    const char* const kFragmentShaderSwizzle = R"(#version 330 core
+uniform sampler2D uImage;
+in vec2 vUv;
+out vec4 fColour;
+void main()
+{
+    fColour = vec4(texture(uImage, vUv).bgr, 1.0);
+}
+)";
+
+    const char* const kFragmentShaderDirect = R"(#version 330 core
+uniform sampler2D uImage;
+in vec2 vUv;
+out vec4 fColour;
+void main()
+{
+    fColour = vec4(texture(uImage, vUv).rgb, 1.0);
+}
+)";
+
+    // Everything past GL 1.1 has to be reached through function pointers on Windows, because
+    // <GL/gl.h> from the platform SDK stops there. osg::GLExtensions already resolves the ones we
+    // need, so use it rather than resolving a second copy.
+    GLuint compileShader(osg::GLExtensions* ext, GLenum stage, const char* source)
+    {
+        const GLuint shader = ext->glCreateShader(stage);
+        ext->glShaderSource(shader, 1, &source, nullptr);
+        ext->glCompileShader(shader);
+
+        GLint compiled = GL_FALSE;
+        ext->glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+        if (compiled == GL_FALSE)
+        {
+            char log[1024] = {};
+            GLsizei written = 0;
+            ext->glGetShaderInfoLog(shader, sizeof(log) - 1, &written, log);
+            Log(Debug::Error) << "Remix composite: shader compilation failed: " << log;
+            ext->glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+}
+
+namespace RemixRT
+{
+    struct CompositeCallback::Resources
+    {
+        GLuint program = 0;
+        GLuint vao = 0;
+        GLint imageLocation = -1;
+    };
+
+    CompositeCallback::CompositeCallback(const ImportOperation* import)
+        : mImport(import)
+    {
+    }
+
+    void CompositeCallback::operator()(osg::RenderInfo& renderInfo) const
+    {
+        if (!mEnabled || mFailed || mImport == nullptr || !mImport->succeeded())
+            return;
+
+        const GLuint texture = static_cast<GLuint>(mImport->textureName());
+        if (texture == 0)
+            return;
+
+        osg::State* state = renderInfo.getState();
+        if (state == nullptr)
+            return;
+        osg::GLExtensions* ext = state->get<osg::GLExtensions>();
+        if (ext == nullptr)
+        {
+            Log(Debug::Error) << "Remix composite: no GL extension table on the state";
+            mFailed = true;
+            return;
+        }
+
+        if (mResources == nullptr)
+        {
+            auto resources = std::make_unique<Resources>();
+
+            // Whether the swizzle is needed is a property of the imported image, so pick the shader
+            // from what the runtime reported rather than hardcoding a channel order.
+            const bool swizzle = mImport->needsChannelSwap();
+            const GLuint vs = compileShader(ext, GL_VERTEX_SHADER, kVertexShader);
+            const GLuint fs = compileShader(
+                ext, GL_FRAGMENT_SHADER, swizzle ? kFragmentShaderSwizzle : kFragmentShaderDirect);
+            if (vs == 0 || fs == 0)
+            {
+                mFailed = true;
+                return;
+            }
+
+            resources->program = ext->glCreateProgram();
+            ext->glAttachShader(resources->program, vs);
+            ext->glAttachShader(resources->program, fs);
+            ext->glLinkProgram(resources->program);
+            ext->glDeleteShader(vs);
+            ext->glDeleteShader(fs);
+
+            GLint linked = GL_FALSE;
+            ext->glGetProgramiv(resources->program, GL_LINK_STATUS, &linked);
+            if (linked == GL_FALSE)
+            {
+                char log[1024] = {};
+                GLsizei written = 0;
+                ext->glGetProgramInfoLog(resources->program, sizeof(log) - 1, &written, log);
+                Log(Debug::Error) << "Remix composite: program link failed: " << log;
+                ext->glDeleteProgram(resources->program);
+                mFailed = true;
+                return;
+            }
+
+            resources->imageLocation = ext->glGetUniformLocation(resources->program, "uImage");
+            // A VAO is required in core profile even with no vertex attributes.
+            ext->glGenVertexArrays(1, &resources->vao);
+
+            mResources = std::move(resources);
+            Log(Debug::Info) << "Remix composite: ready" << (swizzle ? " (BGRA swizzle)" : "");
+        }
+
+        const osg::Viewport* viewport = renderInfo.getCurrentCamera()
+            ? renderInfo.getCurrentCamera()->getViewport()
+            : nullptr;
+
+        // No glPushAttrib/glPopAttrib: they do not exist in a core profile, and this is the final draw
+        // callback so nothing else draws afterwards this frame. Telling OSG its cached mode state is
+        // stale is enough -- it re-applies what it needs at the start of the next frame.
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glDepthMask(GL_FALSE);
+        if (viewport != nullptr)
+        {
+            glViewport(static_cast<GLint>(viewport->x()), static_cast<GLint>(viewport->y()),
+                static_cast<GLsizei>(viewport->width()), static_cast<GLsizei>(viewport->height()));
+        }
+
+        ext->glUseProgram(mResources->program);
+        state->setActiveTextureUnit(0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        if (mResources->imageLocation >= 0)
+            ext->glUniform1i(mResources->imageLocation, 0);
+
+        ext->glBindVertexArray(mResources->vao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        ext->glBindVertexArray(0);
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        ext->glUseProgram(0);
+        glDepthMask(GL_TRUE);
+
+        state->dirtyAllModes();
+        state->dirtyAllAttributes();
     }
 }
