@@ -366,7 +366,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const osg::Matrixf view(camera->getViewMatrix());
         const osg::Matrixf projection(camera->getProjectionMatrix());
 
-        const bool cameraOk = mRemix->setupCamera(view.ptr(), projection.ptr());
+        // The test scene defines its own camera and geometry, so it deliberately bypasses OpenMW's.
+        const bool useTestScene = RemixRT::Runtime::testSceneRequested();
+        const bool cameraOk = useTestScene ? mRemix->submitTestScene()
+                                           : mRemix->setupCamera(view.ptr(), projection.ptr());
         const bool presentOk = mRemix->present();
         const bool copyOk = mRemix->copyOutput();
 

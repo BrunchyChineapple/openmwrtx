@@ -191,6 +191,12 @@ namespace RemixRT
         IDirect3DSurface9* mOutputSurface = nullptr;
         ExternalImage mOutputImage;
         bool mHaveOutput = false;
+
+        // Built-in test scene, created once on first submit.
+        remixapi_MaterialHandle mTestMaterial = nullptr;
+        remixapi_MeshHandle mTestMesh = nullptr;
+        remixapi_LightHandle mTestLight = nullptr;
+        bool mTestSceneBuilt = false;
     };
 
     bool Runtime::requested()
@@ -423,6 +429,148 @@ namespace RemixRT
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    bool Runtime::testSceneRequested()
+    {
+        const char* value = std::getenv("OPENMW_REMIX_TESTSCENE");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }
+
+    bool Runtime::submitTestScene()
+    {
+        if (!mImpl->mStarted)
+            return false;
+
+        const remixapi_Interface& api = mImpl->mApi;
+        if (api.CreateMaterial == nullptr || api.CreateMesh == nullptr || api.DrawInstance == nullptr
+            || api.CreateLight == nullptr || api.DrawLightInstance == nullptr
+            || api.SetupCamera == nullptr)
+            return false;
+
+        // Handles are the caller's hashes, so any stable non-zero value works. Fixed constants keep
+        // creation idempotent across frames.
+        constexpr uint64_t kMaterialHash = 0x0BADC0DE01u;
+        constexpr uint64_t kMeshHash = 0x0BADC0DE02u;
+        constexpr uint64_t kLightHash = 0x0BADC0DE03u;
+
+        if (!mImpl->mTestSceneBuilt)
+        {
+            remixapi_MaterialInfoOpaqueEXT opaque = {};
+            opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+            opaque.albedoConstant = { 0.8f, 0.8f, 0.8f };
+            opaque.opacityConstant = 1.0f;
+            opaque.roughnessConstant = 0.5f;
+            opaque.metallicConstant = 0.0f;
+
+            remixapi_MaterialInfo material = {};
+            material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+            material.pNext = &opaque;
+            material.hash = kMaterialHash;
+            // No texture paths: an untextured constant-albedo material keeps the test independent of
+            // asset loading and the texture-hash lookup path.
+            if (api.CreateMaterial(&material, &mImpl->mTestMaterial) != REMIXAPI_ERROR_CODE_SUCCESS)
+            {
+                Log(Debug::Error) << "Remix test scene: CreateMaterial failed";
+                return false;
+            }
+
+            // A 2x2 quad on the XY plane facing +Z. remixapi_HardcodedVertex is the only accepted
+            // layout: position, normal, one UV, one packed colour.
+            remixapi_HardcodedVertex vertices[4] = {};
+            const float positions[4][3]
+                = { { -1.f, -1.f, 0.f }, { 1.f, -1.f, 0.f }, { -1.f, 1.f, 0.f }, { 1.f, 1.f, 0.f } };
+            const float uvs[4][2] = { { 0.f, 1.f }, { 1.f, 1.f }, { 0.f, 0.f }, { 1.f, 0.f } };
+            for (int i = 0; i < 4; ++i)
+            {
+                std::memcpy(vertices[i].position, positions[i], sizeof(positions[i]));
+                vertices[i].normal[0] = 0.f;
+                vertices[i].normal[1] = 0.f;
+                vertices[i].normal[2] = 1.f;
+                std::memcpy(vertices[i].texcoord, uvs[i], sizeof(uvs[i]));
+                vertices[i].color = 0xFFFFFFFFu;
+            }
+            const uint32_t indices[6] = { 0, 1, 2, 2, 1, 3 };
+
+            remixapi_MeshInfoSurfaceTriangles surface = {};
+            surface.vertices_values = vertices;
+            surface.vertices_count = 4;
+            surface.indices_values = indices;
+            surface.indices_count = 6;
+            surface.skinning_hasvalue = 0;
+            surface.material = mImpl->mTestMaterial;
+
+            remixapi_MeshInfo mesh = {};
+            mesh.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+            mesh.hash = kMeshHash;
+            mesh.surfaces_values = &surface;
+            mesh.surfaces_count = 1;
+            if (api.CreateMesh(&mesh, &mImpl->mTestMesh) != REMIXAPI_ERROR_CODE_SUCCESS)
+            {
+                Log(Debug::Error) << "Remix test scene: CreateMesh failed";
+                return false;
+            }
+
+            remixapi_LightInfoSphereEXT sphere = {};
+            sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+            sphere.position = { 2.f, 2.f, 3.f };
+            sphere.radius = 0.2f;
+            sphere.shaping_hasvalue = 0;
+            sphere.volumetricRadianceScale = 1.0f;
+
+            remixapi_LightInfo light = {};
+            light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+            light.pNext = &sphere;
+            light.hash = kLightHash;
+            // Bright: an under-lit test is indistinguishable from a broken one.
+            light.radiance = { 800.f, 800.f, 800.f };
+            light.isDynamic = 0;
+            if (api.CreateLight(&light, &mImpl->mTestLight) != REMIXAPI_ERROR_CODE_SUCCESS)
+            {
+                Log(Debug::Error) << "Remix test scene: CreateLight failed";
+                return false;
+            }
+
+            mImpl->mTestSceneBuilt = true;
+            Log(Debug::Info) << "Remix test scene: built one quad, one sphere light";
+        }
+
+        // Parameterized camera rather than raw matrices, deliberately: it removes row-vs-column major,
+        // handedness and reversed-Z from the list of things that could be wrong here. Those matter for
+        // OpenMW's real camera, but this test exists to isolate the pipeline from them.
+        remixapi_CameraInfoParameterizedEXT parameterized = {};
+        parameterized.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
+        parameterized.position = { 0.f, 0.f, 5.f };
+        parameterized.forward = { 0.f, 0.f, -1.f };
+        parameterized.up = { 0.f, 1.f, 0.f };
+        parameterized.right = { 1.f, 0.f, 0.f };
+        parameterized.fovYInDegrees = 60.f;
+        parameterized.aspect = mImpl->mOutputImage.mHeight > 0
+            ? static_cast<float>(mImpl->mOutputImage.mWidth) / static_cast<float>(mImpl->mOutputImage.mHeight)
+            : 1.777f;
+        parameterized.nearPlane = 0.1f;
+        parameterized.farPlane = 1000.f;
+
+        remixapi_CameraInfo camera = {};
+        camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        camera.pNext = &parameterized;
+        camera.type = REMIXAPI_CAMERA_TYPE_WORLD;
+        if (api.SetupCamera(&camera) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return false;
+
+        remixapi_InstanceInfo instance = {};
+        instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+        instance.mesh = mImpl->mTestMesh;
+        instance.categoryFlags = 0;
+        instance.doubleSided = 1;
+        // Identity 3x4: the quad is already in world space.
+        instance.transform.matrix[0][0] = 1.f;
+        instance.transform.matrix[1][1] = 1.f;
+        instance.transform.matrix[2][2] = 1.f;
+        if (api.DrawInstance(&instance) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return false;
+
+        return api.DrawLightInstance(mImpl->mTestLight) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
     bool Runtime::present()
     {
         if (!mImpl->mStarted || mImpl->mApi.Present == nullptr)
@@ -555,6 +703,16 @@ namespace RemixRT
     }
 
     bool Runtime::setupCamera(const float*, const float*)
+    {
+        return false;
+    }
+
+    bool Runtime::testSceneRequested()
+    {
+        return false;
+    }
+
+    bool Runtime::submitTestScene()
     {
         return false;
     }

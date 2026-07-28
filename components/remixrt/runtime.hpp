@@ -80,6 +80,19 @@ namespace RemixRT
         /// produced as part of presenting.
         bool present();
 
+        /// True when OPENMW_REMIX_TESTSCENE asks for the built-in test scene instead of OpenMW's.
+        static bool testSceneRequested();
+
+        /// Submits a self-contained scene: one lit quad, viewed by a camera this code defines.
+        ///
+        /// Exists to separate "the Remix pipeline works" from "OpenMW is feeding it correctly". It
+        /// depends on nothing from the engine -- not the camera, not the scene graph -- so if this
+        /// renders then init, submission, rendering, the shared-image blit, the GL import and the
+        /// composite are all proven, and any remaining problem is in what OpenMW hands over.
+        ///
+        /// Call instead of setupCamera, before present().
+        bool submitTestScene();
+
         /// Releases the device and unloads the runtime. Idempotent, and called by the destructor.
         /// Must run before the SDL window it was given is destroyed.
         void shutdown();
