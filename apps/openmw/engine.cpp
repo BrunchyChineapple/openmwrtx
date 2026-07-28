@@ -376,17 +376,27 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
         // the difference between "Remix rendered black" and "Remix was never asked to render", and
         // guessing between those wastes far more time than one log line costs.
-        static bool pumpReported = false;
-        if (!pumpReported)
+        static unsigned remixFrames = 0;
+        ++remixFrames;
+        if (remixFrames == 1)
         {
-            pumpReported = true;
-            Log(Debug::Info) << "Remix pump: setupCamera=" << cameraOk << " present=" << presentOk
+            Log(Debug::Info) << "Remix pump: " << (useTestScene ? "test scene" : "OpenMW scene")
+                             << " submit=" << cameraOk << " present=" << presentOk
                              << " copyOutput=" << copyOk;
-            const osg::Vec3d eye = osg::Matrixd::inverse(camera->getViewMatrix()).getTrans();
-            Log(Debug::Info) << "Remix pump: camera eye " << eye.x() << ", " << eye.y() << ", " << eye.z()
-                             << "; proj[10]=" << projection(2, 2) << " proj[14]=" << projection(3, 2)
-                             << " (reversed-Z shows as a positive proj[10] with an inverted near/far)";
+            if (!useTestScene)
+            {
+                // Only meaningful when OpenMW's camera is the one being submitted.
+                const osg::Vec3d eye = osg::Matrixd::inverse(camera->getViewMatrix()).getTrans();
+                Log(Debug::Info) << "Remix pump: camera eye " << eye.x() << ", " << eye.y() << ", "
+                                 << eye.z() << "; proj[10]=" << projection(2, 2)
+                                 << " proj[14]=" << projection(3, 2)
+                                 << " (reversed-Z shows as a positive proj[10] with an inverted near/far)";
+            }
         }
+        // Probe late enough that shader compilation has finished and Remix has had many frames to
+        // converge, but only once -- it stalls on a GPU readback.
+        if (remixFrames == 600)
+            mRemix->probeOutputNonBlack();
     }
 
     mViewer->renderingTraversals();

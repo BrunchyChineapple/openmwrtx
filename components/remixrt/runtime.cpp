@@ -429,6 +429,76 @@ namespace RemixRT
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    bool Runtime::probeOutputNonBlack()
+    {
+        if (!mImpl->mHaveOutput || mImpl->mDevice == nullptr)
+            return false;
+
+        const UINT width = mImpl->mOutputImage.mWidth;
+        const UINT height = mImpl->mOutputImage.mHeight;
+
+        // A render target cannot be locked directly; GetRenderTargetData copies it into a system-memory
+        // plain surface that can be.
+        IDirect3DSurface9* staging = nullptr;
+        HRESULT hr = mImpl->mDevice->CreateOffscreenPlainSurface(
+            width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        if (FAILED(hr) || staging == nullptr)
+        {
+            Log(Debug::Error) << "Remix probe: CreateOffscreenPlainSurface failed, hr 0x" << std::hex << hr;
+            return false;
+        }
+
+        hr = mImpl->mDevice->GetRenderTargetData(mImpl->mOutputSurface, staging);
+        if (FAILED(hr))
+        {
+            Log(Debug::Error) << "Remix probe: GetRenderTargetData failed, hr 0x" << std::hex << hr;
+            staging->Release();
+            return false;
+        }
+
+        D3DLOCKED_RECT locked = {};
+        hr = staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+        if (FAILED(hr))
+        {
+            Log(Debug::Error) << "Remix probe: LockRect failed, hr 0x" << std::hex << hr;
+            staging->Release();
+            return false;
+        }
+
+        // Sparse sample rather than every pixel: enough to answer "is anything lit" at 4K without
+        // walking 33 MB.
+        unsigned int maxChannel = 0;
+        unsigned int nonBlack = 0;
+        unsigned int sampled = 0;
+        const auto* base = static_cast<const unsigned char*>(locked.pBits);
+        for (UINT y = 0; y < height; y += 8)
+        {
+            const auto* row = reinterpret_cast<const unsigned int*>(base + locked.Pitch * y);
+            for (UINT x = 0; x < width; x += 8)
+            {
+                const unsigned int pixel = row[x];
+                ++sampled;
+                for (int shift = 0; shift < 24; shift += 8)
+                {
+                    const unsigned int channel = (pixel >> shift) & 0xFFu;
+                    maxChannel = std::max(maxChannel, channel);
+                }
+                if ((pixel & 0x00FFFFFFu) != 0)
+                    ++nonBlack;
+            }
+        }
+
+        staging->UnlockRect();
+        staging->Release();
+
+        Log(Debug::Info) << "Remix probe: sampled " << sampled << " pixels of the shared target, "
+                         << nonBlack << " non-black, brightest channel " << maxChannel << "/255"
+                         << (nonBlack == 0
+                                    ? " -- Remix produced a black image, so the problem is upstream of the interop"
+                                    : " -- Remix produced an image, so the problem is the GL side (sync or layout)");
+        return nonBlack > 0;
+    }
+
     bool Runtime::testSceneRequested()
     {
         const char* value = std::getenv("OPENMW_REMIX_TESTSCENE");
@@ -713,6 +783,11 @@ namespace RemixRT
     }
 
     bool Runtime::submitTestScene()
+    {
+        return false;
+    }
+
+    bool Runtime::probeOutputNonBlack()
     {
         return false;
     }

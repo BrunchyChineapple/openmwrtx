@@ -80,6 +80,14 @@ namespace RemixRT
         /// produced as part of presenting.
         bool present();
 
+        /// Reads the shared render target back to the CPU and logs whether anything in it is non-black.
+        ///
+        /// This is the only way to tell "Remix rendered nothing" apart from "Remix rendered something and
+        /// OpenGL is not seeing it". It goes entirely through D3D9, touching none of the interop, so its
+        /// answer is independent of the GL side. Slow -- it stalls on a GPU readback -- so call it once,
+        /// not per frame.
+        bool probeOutputNonBlack();
+
         /// True when OPENMW_REMIX_TESTSCENE asks for the built-in test scene instead of OpenMW's.
         static bool testSceneRequested();
 
