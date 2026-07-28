@@ -43,9 +43,36 @@ namespace RemixRT
         /// without throwing, because a missing or mismatched runtime should degrade to normal OpenMW
         /// rendering rather than prevent the game from starting.
         ///
-        /// @param window the SDL window whose native handle Remix should attach to. May be null, in
-        ///        which case Remix comes up without a window association.
+        /// @param window the SDL window used to size Remix's render resolution. Remix does NOT
+        ///        present into it -- see the note on the hidden window in runtime.cpp.
         bool initialize(SDL_Window* window);
+
+        /// Everything OpenGL needs to import Remix's output image as a texture.
+        struct ExternalImage
+        {
+            unsigned long long mHandle = 0; ///< Win32 handle, owned by Remix; do not close it.
+            unsigned long long mMemorySize = 0;
+            unsigned long long mMemoryOffset = 0;
+            unsigned int mHandleType = 0; ///< VkExternalMemoryHandleTypeFlagBits
+            unsigned int mFormat = 0; ///< VkFormat
+            unsigned int mWidth = 0;
+            unsigned int mHeight = 0;
+            bool mOptimalTiling = false;
+        };
+
+        /// Allocates the shared render target that Remix blits its final colour into, and queries the
+        /// exportable memory behind it. Must be called after initialize().
+        bool createOutputTarget(unsigned int width, unsigned int height);
+
+        /// Valid only after a successful createOutputTarget().
+        const ExternalImage& outputImage() const;
+
+        /// Blits Remix's final colour into the shared render target. Cheap, GPU-side.
+        bool copyOutput();
+
+        /// Drives a Remix frame. Required: the raytracing output that copyOutput() reads is only
+        /// produced as part of presenting.
+        bool present();
 
         /// Releases the device and unloads the runtime. Idempotent, and called by the destructor.
         /// Must run before the SDL window it was given is destroyed.
@@ -68,6 +95,9 @@ namespace RemixRT
         const std::string& loadedFrom() const;
 
     private:
+        void releaseOutputTarget();
+        void unloadModule();
+
         struct Impl;
         std::unique_ptr<Impl> mImpl;
     };

@@ -46,6 +46,7 @@
 #include <components/misc/frameratelimiter.hpp>
 
 #include <components/sceneutil/color.hpp>
+#include <components/remixrt/glinterop.hpp>
 #include <components/remixrt/runtime.hpp>
 #include <components/sceneutil/depth.hpp>
 #include <components/sceneutil/screencapture.hpp>
@@ -748,6 +749,21 @@ void OMW::Engine::prepareEngine()
         {
             Log(Debug::Warning) << "Remix: initialisation failed, continuing with normal rendering";
             mRemix.reset();
+        }
+        else
+        {
+            // Importing the shared image into GL has to happen on the thread owning the context, and
+            // the realize operations have already run by now (mViewer->realize() is inside
+            // createWindow()). Queueing on the context runs it there at the next frame instead.
+            if (osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext())
+            {
+                mRemixImport = new RemixRT::ImportOperation(mRemix->outputImage());
+                gc->add(mRemixImport);
+            }
+            else
+            {
+                Log(Debug::Error) << "Remix: no graphics context to import the shared image into";
+            }
         }
     }
 

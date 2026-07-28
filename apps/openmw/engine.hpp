@@ -121,6 +121,7 @@ namespace L10n
 namespace RemixRT
 {
     class Runtime;
+    class ImportOperation;
 }
 
 struct SDL_Window;
@@ -134,6 +135,9 @@ namespace OMW
         // Declared right after mWindow so destruction order releases Remix before the window it is
         // attached to. Only constructed when the backend is requested; null otherwise.
         std::unique_ptr<RemixRT::Runtime> mRemix;
+        // Runs once on the GL thread to import Remix's shared image. Held so the result can be read
+        // after it has run.
+        osg::ref_ptr<RemixRT::ImportOperation> mRemixImport;
         std::unique_ptr<VFS::Manager> mVFS;
         std::unique_ptr<Resource::ResourceSystem> mResourceSystem;
         osg::ref_ptr<SceneUtil::WorkQueue> mWorkQueue;

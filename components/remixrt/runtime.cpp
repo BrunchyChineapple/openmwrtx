@@ -1,3 +1,9 @@
+// Must precede every include: see the note above the d3d9.h include below. windows.h has include
+// guards, so if anything pulls it in while NOGDI is still defined, wingdi.h is skipped for good and
+// d3d9.h will not compile. This file is also excluded from the precompiled header for the same reason
+// (see components/CMakeLists.txt).
+#undef NOGDI
+
 #include "runtime.hpp"
 
 #include <cstdlib>
@@ -6,10 +12,25 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
 #include <filesystem>
 
 #include <SDL_syswm.h>
 #include <SDL_video.h>
+
+// remix_c.h only forward-declares the D3D9 interfaces as opaque types. We call methods on them --
+// CreateDeviceEx, CreateRenderTarget, Release -- so the real declarations have to come first. d3d9.h
+// depends on the Windows types and does not include windows.h itself.
+//
+// The project defines NOGDI globally (root CMakeLists.txt) because wingdi.h's RELATIVE macro collides
+// with osgAnimation::MorphGeometry::RELATIVE. That also removes the GDI types d3d9.h needs -- RGNDATA
+// in IDirect3DDevice9::Present, among others -- so it has to come back for this translation unit.
+// Safe here specifically because nothing in this file touches osgAnimation. Do not move the D3D9
+// includes into a header, or that collision becomes everyone's problem.
+#undef NOGDI
+#include <windows.h>
+
+#include <d3d9.h>
 
 // remix_c.h includes <windows.h> for HWND/HMODULE and provides an inline loader helper that does the
 // LoadLibrary + GetProcAddress + remixapi_InitializeLibrary dance. Keep this include confined to this
@@ -101,6 +122,54 @@ namespace
         }
         return info.info.win.window;
     }
+
+    constexpr const wchar_t* kHiddenWindowClass = L"OpenMWRemixPresentSink";
+
+    /// Creates the offscreen window Remix presents into.
+    ///
+    /// Remix only produces its raytracing output as part of presenting, so a frame has to be driven.
+    /// Presenting onto OpenMW's window would mean two presenters -- a Vulkan swapchain and OpenMW's
+    /// OpenGL context -- fighting over the same surface. Instead Remix gets a window of its own that is
+    /// never shown, and we take the finished image via dxvk_CopyRenderingOutput and composite it into
+    /// OpenMW's frame ourselves.
+    ///
+    /// It is sized to the intended render resolution rather than 1x1, because the swapchain dimensions
+    /// determine what resolution Remix renders at.
+    HWND createHiddenPresentWindow(uint32_t width, uint32_t height)
+    {
+        static bool classRegistered = false;
+        if (!classRegistered)
+        {
+            WNDCLASSEXW wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = kHiddenWindowClass;
+            if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            {
+                Log(Debug::Error) << "Remix: could not register the present-sink window class, error "
+                                  << GetLastError();
+                return nullptr;
+            }
+            classRegistered = true;
+        }
+
+        // Never shown, so there is no ShowWindow call and the compositor never has to present it.
+        // WS_EX_NOREDIRECTIONBITMAP would additionally suppress the redirection surface, but it needs
+        // _WIN32_WINNT >= 0x0602 and OpenMW targets lower; not worth raising the whole project's
+        // Windows version for a window that stays hidden.
+        //
+        // WS_POPUP rather than WS_OVERLAPPED, and this is not cosmetic: CreateWindowExW sizes the whole
+        // window including borders and caption, so WS_OVERLAPPED at 3840x2160 yielded a 3824x2121 client
+        // area and Remix sized its swapchain -- and therefore its render resolution -- to that instead.
+        // WS_POPUP has no non-client area, so client size equals the size requested.
+        const HWND hwnd = CreateWindowExW(0, kHiddenWindowClass, L"OpenMW Remix present sink", WS_POPUP,
+            0, 0, static_cast<int>(width), static_cast<int>(height), nullptr, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (hwnd == nullptr)
+            Log(Debug::Error) << "Remix: could not create the present-sink window, error " << GetLastError();
+        return hwnd;
+    }
 }
 
 namespace RemixRT
@@ -111,6 +180,16 @@ namespace RemixRT
         remixapi_HMODULE mModule = nullptr;
         std::string mLoadedFrom;
         bool mStarted = false;
+
+        // We create the device ourselves rather than calling remixapi_Startup, because Startup does not
+        // hand back the IDirect3DDevice9Ex and we need it to allocate a shared render target.
+        IDirect3D9Ex* mD3D9 = nullptr;
+        IDirect3DDevice9Ex* mDevice = nullptr;
+        HWND mPresentWindow = nullptr;
+
+        IDirect3DSurface9* mOutputSurface = nullptr;
+        ExternalImage mOutputImage;
+        bool mHaveOutput = false;
     };
 
     bool Runtime::requested()
@@ -173,32 +252,77 @@ namespace RemixRT
             return false;
         }
 
-        remixapi_StartupInfo startup = {};
-        startup.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
-        startup.hwnd = nativeHandle(window);
-        startup.disableSrgbConversionForOutput = false;
-        // OpenMW owns the window and presents through its own OpenGL context, so ultimately Remix's
-        // output has to arrive as an image we composite, not as a second presenter on the same HWND.
-        // Requesting no Vulkan swapchain is what makes dxvk_GetExternalSwapchain available, handing back
-        // a raw VkImage for OpenGL interop.
-        //
-        // MEASURED 2026-07-28: this flag does NOT stop a swapchain being created. Startup() calls
-        // CreateDeviceEx with hDeviceWindow set and Windowed true, and the log shows a real
-        // 3840x2160 VK_FORMAT_R8G8B8A8_UNORM swapchain (FIFO, 3 images) on OpenMW's window. It is
-        // harmless today only because nothing ever calls remixapi_Present, so that swapchain stays
-        // idle. Do not assume this flag gives us a headless device -- resolving the presentation path
-        // is its own piece of work, not something this flag already handled.
-        startup.forceNoVkSwapchain = true;
-        startup.editorModeEnabled = false;
+        // Size Remix's render resolution from OpenMW's window, but present into our own.
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (const HWND gameWindow = nativeHandle(window))
+        {
+            RECT client = {};
+            GetClientRect(gameWindow, &client);
+            width = static_cast<uint32_t>(std::max(0l, client.right - client.left));
+            height = static_cast<uint32_t>(std::max(0l, client.bottom - client.top));
+        }
+        if (width == 0 || height == 0)
+        {
+            Log(Debug::Error) << "Remix: could not determine the render resolution from the window";
+            unloadModule();
+            return false;
+        }
 
-        status = mImpl->mApi.Startup(&startup);
+        mImpl->mPresentWindow = createHiddenPresentWindow(width, height);
+        if (mImpl->mPresentWindow == nullptr)
+        {
+            unloadModule();
+            return false;
+        }
+
+        if (mImpl->mApi.dxvk_CreateD3D9 == nullptr || mImpl->mApi.dxvk_RegisterD3D9Device == nullptr)
+        {
+            Log(Debug::Error) << "Remix: the runtime does not expose the DXVK interop entry points";
+            unloadModule();
+            return false;
+        }
+
+        // editorModeEnabled is false. Note the legacy vtable slot reuses that argument to drive
+        // forceNoVkSwapchain, so passing true here would silently switch the device into
+        // external-swapchain mode as well; we want an ordinary swapchain on the hidden window.
+        status = mImpl->mApi.dxvk_CreateD3D9(false, &mImpl->mD3D9);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || mImpl->mD3D9 == nullptr)
+        {
+            Log(Debug::Error) << "Remix: dxvk_CreateD3D9 failed: " << describe(status);
+            unloadModule();
+            return false;
+        }
+
+        D3DPRESENT_PARAMETERS present = {};
+        present.BackBufferWidth = width;
+        present.BackBufferHeight = height;
+        present.BackBufferFormat = D3DFMT_UNKNOWN;
+        present.BackBufferCount = 0;
+        present.MultiSampleType = D3DMULTISAMPLE_NONE;
+        present.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        present.hDeviceWindow = mImpl->mPresentWindow;
+        present.Windowed = TRUE;
+        present.EnableAutoDepthStencil = FALSE;
+        present.AutoDepthStencilFormat = D3DFMT_UNKNOWN;
+
+        HRESULT hr = mImpl->mD3D9->CreateDeviceEx(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
+            mImpl->mPresentWindow, D3DCREATE_HARDWARE_VERTEXPROCESSING, &present, nullptr, &mImpl->mDevice);
+        if (FAILED(hr) || mImpl->mDevice == nullptr)
+        {
+            // Remix aliases its GPU-capability failures into HRESULT space, so a raw HRESULT here is
+            // often really one of the REMIXAPI_ERROR_CODE_HRESULT_* values.
+            Log(Debug::Error) << "Remix: CreateDeviceEx failed, hr 0x" << std::hex << hr << std::dec << " ("
+                              << describe(static_cast<remixapi_ErrorCode>(hr)) << ")";
+            unloadModule();
+            return false;
+        }
+
+        status = mImpl->mApi.dxvk_RegisterD3D9Device(mImpl->mDevice);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS)
         {
-            Log(Debug::Error) << "Remix: Startup failed: " << describe(status) << " ("
-                              << static_cast<unsigned>(status) << ")";
-            FreeLibrary(mImpl->mModule);
-            mImpl->mModule = nullptr;
-            mImpl->mApi = {};
+            Log(Debug::Error) << "Remix: dxvk_RegisterD3D9Device failed: " << describe(status);
+            unloadModule();
             return false;
         }
 
@@ -207,27 +331,151 @@ namespace RemixRT
 
         Log(Debug::Info) << "Remix: runtime initialised from " << runtimePath << " (API "
                          << REMIXAPI_VERSION_MAJOR << "." << REMIXAPI_VERSION_MINOR << "."
-                         << REMIXAPI_VERSION_PATCH << ", hwnd " << (startup.hwnd ? "attached" : "none") << ")";
+                         << REMIXAPI_VERSION_PATCH << ", " << width << "x" << height
+                         << ", presenting to an offscreen window)";
+
+        return createOutputTarget(width, height);
+    }
+
+    bool Runtime::createOutputTarget(unsigned int width, unsigned int height)
+    {
+        if (!mImpl->mStarted)
+            return false;
+
+        releaseOutputTarget();
+
+        // A non-null pSharedHandle is what makes DXVK allocate the image with
+        // VkExportMemoryAllocateInfo plus a dedicated allocation, which is the whole point: without it
+        // there is no Win32 handle to hand to OpenGL. It must start as null to request export mode
+        // rather than import.
+        HANDLE sharedHandle = nullptr;
+        HRESULT hr = mImpl->mDevice->CreateRenderTarget(width, height, D3DFMT_A8R8G8B8,
+            D3DMULTISAMPLE_NONE, 0, FALSE, &mImpl->mOutputSurface, &sharedHandle);
+        if (FAILED(hr) || mImpl->mOutputSurface == nullptr)
+        {
+            Log(Debug::Error) << "Remix: could not create the shared output render target, hr 0x" << std::hex
+                              << hr << std::dec;
+            return false;
+        }
+
+        if (mImpl->mApi.dxvk_GetSurfaceExternalMemory == nullptr)
+        {
+            Log(Debug::Error) << "Remix: this runtime predates dxvk_GetSurfaceExternalMemory. Rebuild the "
+                                 "Remix runtime from the matching branch.";
+            releaseOutputTarget();
+            return false;
+        }
+
+        remixapi_dxvk_ExternalMemoryInfo info = {};
+        const remixapi_ErrorCode status
+            = mImpl->mApi.dxvk_GetSurfaceExternalMemory(mImpl->mOutputSurface, &info);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+        {
+            Log(Debug::Error) << "Remix: dxvk_GetSurfaceExternalMemory failed: " << describe(status)
+                              << " -- the surface was not created shareable";
+            releaseOutputTarget();
+            return false;
+        }
+
+        mImpl->mOutputImage.mHandle = info.handle;
+        mImpl->mOutputImage.mMemorySize = info.memorySize;
+        mImpl->mOutputImage.mMemoryOffset = info.memoryOffset;
+        mImpl->mOutputImage.mHandleType = info.handleType;
+        mImpl->mOutputImage.mFormat = info.format;
+        mImpl->mOutputImage.mWidth = info.width;
+        mImpl->mOutputImage.mHeight = info.height;
+        mImpl->mOutputImage.mOptimalTiling = info.optimalTiling != 0;
+        mImpl->mHaveOutput = true;
+
+        Log(Debug::Info) << "Remix: shared output target " << info.width << "x" << info.height
+                         << ", VkFormat " << info.format << ", " << info.memorySize << " bytes at offset "
+                         << info.memoryOffset << ", handle type 0x" << std::hex << info.handleType << std::dec
+                         << ", " << (info.optimalTiling ? "optimal" : "linear") << " tiling";
         return true;
     }
 
-    void Runtime::shutdown()
+    const Runtime::ExternalImage& Runtime::outputImage() const
     {
-        if (mImpl->mStarted)
-        {
-            const remixapi_ErrorCode status = mImpl->mApi.Shutdown();
-            if (status != REMIXAPI_ERROR_CODE_SUCCESS)
-                Log(Debug::Warning) << "Remix: Shutdown reported " << describe(status);
-            mImpl->mStarted = false;
-        }
+        return mImpl->mOutputImage;
+    }
 
+    bool Runtime::copyOutput()
+    {
+        if (!mImpl->mHaveOutput || mImpl->mApi.dxvk_CopyRenderingOutput == nullptr)
+            return false;
+        return mImpl->mApi.dxvk_CopyRenderingOutput(
+                   mImpl->mOutputSurface, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR)
+            == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    bool Runtime::present()
+    {
+        if (!mImpl->mStarted || mImpl->mApi.Present == nullptr)
+            return false;
+        remixapi_PresentInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
+        info.hwndOverride = nullptr;
+        return mImpl->mApi.Present(&info) == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    void Runtime::releaseOutputTarget()
+    {
+        mImpl->mHaveOutput = false;
+        mImpl->mOutputImage = {};
+        if (mImpl->mOutputSurface != nullptr)
+        {
+            mImpl->mOutputSurface->Release();
+            mImpl->mOutputSurface = nullptr;
+        }
+    }
+
+    void Runtime::unloadModule()
+    {
+        releaseOutputTarget();
+        if (mImpl->mDevice != nullptr)
+        {
+            mImpl->mDevice->Release();
+            mImpl->mDevice = nullptr;
+        }
+        if (mImpl->mD3D9 != nullptr)
+        {
+            mImpl->mD3D9->Release();
+            mImpl->mD3D9 = nullptr;
+        }
+        if (mImpl->mPresentWindow != nullptr)
+        {
+            DestroyWindow(mImpl->mPresentWindow);
+            mImpl->mPresentWindow = nullptr;
+        }
         if (mImpl->mModule != nullptr)
         {
             FreeLibrary(mImpl->mModule);
             mImpl->mModule = nullptr;
         }
-
         mImpl->mApi = {};
+        mImpl->mStarted = false;
+    }
+
+    void Runtime::shutdown()
+    {
+        // Shutdown() releases the device and D3D9 objects Remix knows about, so it has to run before we
+        // drop our own references to them. Release the shared render target first: it was allocated from
+        // that device.
+        releaseOutputTarget();
+
+        if (mImpl->mStarted && mImpl->mApi.Shutdown != nullptr)
+        {
+            const remixapi_ErrorCode status = mImpl->mApi.Shutdown();
+            if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+                Log(Debug::Warning) << "Remix: Shutdown reported " << describe(status);
+            mImpl->mStarted = false;
+            // Shutdown() releases the registered device and factory itself, repeatedly, until their
+            // refcounts hit zero. Ours are now dangling, so forget them rather than release again.
+            mImpl->mDevice = nullptr;
+            mImpl->mD3D9 = nullptr;
+        }
+
+        unloadModule();
         mImpl->mLoadedFrom.clear();
     }
 
@@ -257,6 +505,7 @@ namespace RemixRT
     struct Runtime::Impl
     {
         std::string mLoadedFrom;
+        ExternalImage mOutputImage;
     };
 
     bool Runtime::requested()
@@ -284,6 +533,30 @@ namespace RemixRT
     {
         return false;
     }
+
+    bool Runtime::createOutputTarget(unsigned int, unsigned int)
+    {
+        return false;
+    }
+
+    const Runtime::ExternalImage& Runtime::outputImage() const
+    {
+        return mImpl->mOutputImage;
+    }
+
+    bool Runtime::copyOutput()
+    {
+        return false;
+    }
+
+    bool Runtime::present()
+    {
+        return false;
+    }
+
+    void Runtime::releaseOutputTarget() {}
+
+    void Runtime::unloadModule() {}
 
     bool Runtime::setConfigVariable(const char*, const char*)
     {

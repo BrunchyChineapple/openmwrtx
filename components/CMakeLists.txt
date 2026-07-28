@@ -139,7 +139,7 @@ add_component_dir (shader
 # RTX Remix backend. Builds on every platform; the runtime itself is Windows x64 only, so the
 # non-Windows path compiles to stubs that report the backend as unavailable.
 add_component_dir (remixrt
-    runtime
+    runtime glinterop
     )
 
 add_component_dir (sceneutil
@@ -751,4 +751,11 @@ if (MSVC AND PRECOMPILE_HEADERS_WITH_MSVC)
 
         <boost/program_options/options_description.hpp>
     )
+
+    # remixrt/runtime.cpp includes d3d9.h, which needs the GDI types that this project's global NOGDI
+    # removes (NOGDI is set to avoid wingdi.h's RELATIVE macro colliding with
+    # osgAnimation::MorphGeometry::RELATIVE). That file undefines NOGDI before including windows.h, but
+    # a force-included precompiled header is parsed first and would already have pulled windows.h in
+    # without wingdi.h, leaving the include guards set. So this one file opts out of the PCH.
+    set_source_files_properties(remixrt/runtime.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
