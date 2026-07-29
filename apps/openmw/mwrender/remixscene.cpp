@@ -20,6 +20,8 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
+#include <components/sceneutil/morphgeometry.hpp>
+#include <components/sceneutil/riggeometry.hpp>
 #include <components/settings/values.hpp>
 // terraindrawable.hpp holds an osg::ref_ptr to a forward-declared CompositeMapRenderer, and ref_ptr's
 // destructor needs the complete type. Included for that reason alone; nothing here uses it.
@@ -151,10 +153,58 @@ namespace
     constexpr unsigned int kGlBgr = 0x80E0;
     constexpr unsigned int kGlBgra = 0x80E1;
     constexpr unsigned int kGlUnsignedByte = 0x1401;
-    constexpr unsigned int kGlDxt1Rgb = 0x83F0;
-    constexpr unsigned int kGlDxt1Rgba = 0x83F1;
-    constexpr unsigned int kGlDxt3 = 0x83F2;
-    constexpr unsigned int kGlDxt5 = 0x83F3;
+
+    /// One entry per block-compressed layout the runtime can take.
+    ///
+    /// A table rather than a switch because three separate things have to stay in step for each format --
+    /// the Remix enumerant, the bytes per 4x4 block, and the name used in diagnostics -- and a switch
+    /// spreads them across three places that can drift apart. Adding a format is one line here.
+    ///
+    /// Both the plain and the sRGB GL spellings appear for each layout, and both map to the same entry.
+    /// The GL enum says how the *source* was tagged; it does not say what the data means. A DDS file is
+    /// almost always tagged with the plain variant whether or not its contents are colour, so trusting the
+    /// tag would leave most albedo textures uncorrected. The choice of the sRGB Remix format is made per
+    /// layout on what the layout is used for, which for everything except BC5 is colour.
+    struct CompressedFormat
+    {
+        unsigned int mGlInternalFormat;
+        RemixRT::Runtime::TextureFormat mFormat;
+        unsigned int mBlockBytes;
+        const char* mName;
+    };
+
+    constexpr CompressedFormat kCompressedFormats[] = {
+        // S3TC / DXT, GL_EXT_texture_compression_s3tc plus its sRGB counterpart.
+        { 0x83F0, RemixRT::Runtime::Format_BC1_RGB, 8, "BC1_RGB" }, // GL_COMPRESSED_RGB_S3TC_DXT1
+        { 0x8C4C, RemixRT::Runtime::Format_BC1_RGB, 8, "BC1_RGB(srgb)" },
+        { 0x83F1, RemixRT::Runtime::Format_BC1_RGBA, 8, "BC1_RGBA" }, // DXT1 with a one-bit alpha
+        { 0x8C4D, RemixRT::Runtime::Format_BC1_RGBA, 8, "BC1_RGBA(srgb)" },
+        { 0x83F2, RemixRT::Runtime::Format_BC2, 16, "BC2" }, // DXT3, explicit four-bit alpha
+        { 0x8C4E, RemixRT::Runtime::Format_BC2, 16, "BC2(srgb)" },
+        { 0x83F3, RemixRT::Runtime::Format_BC3, 16, "BC3" }, // DXT5, interpolated alpha
+        { 0x8C4F, RemixRT::Runtime::Format_BC3, 16, "BC3(srgb)" },
+        // RGTC, GL_ARB_texture_compression_rgtc. Two-channel and linear: normal maps, never colour, so
+        // these take the UNORM Remix format. The signed spelling is listed because the loader can produce
+        // it, not because a signed normal map would be interpreted correctly here.
+        { 0x8DBD, RemixRT::Runtime::Format_BC5, 16, "BC5" }, // GL_COMPRESSED_RG_RGTC2
+        { 0x8DBE, RemixRT::Runtime::Format_BC5, 16, "BC5(signed)" },
+        // BPTC, GL_ARB_texture_compression_bptc. What modern high-resolution replacement packs use.
+        { 0x8E8C, RemixRT::Runtime::Format_BC7, 16, "BC7" }, // GL_COMPRESSED_RGBA_BPTC_UNORM
+        { 0x8E8D, RemixRT::Runtime::Format_BC7, 16, "BC7(srgb)" },
+    };
+
+    /// Looks up \a glInternalFormat, or null if the runtime has no format for it.
+    ///
+    /// Deliberately not a fallback to something plausible. Uploading data as the wrong block layout does
+    /// not produce a slightly wrong image, it produces garbage of the right size, which is far harder to
+    /// recognise than an untextured surface.
+    const CompressedFormat* compressedFormatFor(unsigned int glInternalFormat)
+    {
+        for (const CompressedFormat& candidate : kCompressedFormats)
+            if (candidate.mGlInternalFormat == glInternalFormat)
+                return &candidate;
+        return nullptr;
+    }
 
     /// Alpha threshold used when OpenMW asks for a cutout but its own reference value is unusable.
     ///
@@ -398,6 +448,26 @@ namespace
         void apply(osg::Drawable& drawable) override
         {
             osg::Geometry* geometry = drawable.asGeometry();
+
+            // Skinned geometry arrives as a RigGeometry, which is a Drawable and not a Geometry, so
+            // asGeometry() returns null and the drawable was simply dropped -- that is why actors were
+            // missing every part of themselves that moves. What it does hold is the bind pose plus the
+            // influence data needed to deform it, which is exactly what a path tracer wants: the mesh
+            // goes over once and only the bone transforms are resubmitted per frame.
+            auto* rig = dynamic_cast<SceneUtil::RigGeometry*>(&drawable);
+            if (rig != nullptr)
+                geometry = rig->getSourceGeometry().get();
+
+            // Morph geometry, the other Drawable that hides a Geometry, is submitted in its base pose.
+            //
+            // Unlike skinning, there is nothing to hand the runtime here: the Remix API has no concept of
+            // morph targets, so the alternative to the base pose is either an invisible mesh or a mesh
+            // rebuilt from CPU-blended vertices every frame -- which is the churn the skinning path exists
+            // to avoid, and for a much smaller payoff. Morrowind uses vertex morphs sparingly, so the
+            // visible cost is a handful of meshes that do not animate rather than a handful missing.
+            if (const auto* morph = dynamic_cast<const SceneUtil::MorphGeometry*>(&drawable))
+                geometry = morph->getSourceGeometry().get();
+
             if (geometry == nullptr)
                 return;
 
@@ -424,6 +494,13 @@ namespace
 
             MWRender::RemixScene::SurfaceState surface = currentSurface();
             surface.mIsWater = (categories & RemixRT::Runtime::Category_AnimatedWater) != 0;
+
+            // A source geometry is a detached template rather than a node in the graph, so its state set
+            // is not on the path and has to be folded in explicitly. Merged before the drawable's own so
+            // that the one actually in the graph still wins.
+            if (geometry != &drawable && geometry->getStateSet() != nullptr)
+                mergeState(*geometry->getStateSet(), surface);
+
             if (const osg::StateSet* stateSet = drawable.getStateSet())
                 mergeState(*stateSet, surface);
 
@@ -467,7 +544,7 @@ namespace
                 surface.mAlphaBlend = false;
             }
 
-            const unsigned long long mesh = mScene.submitGeometry(*geometry, surface);
+            const unsigned long long mesh = mScene.submitGeometry(*geometry, surface, rig);
             if (mesh == 0)
                 return;
 
@@ -486,7 +563,18 @@ namespace
             // has not been verified against what Remix expects, and a wrong answer there makes geometry
             // vanish rather than look wrong -- which is much harder to diagnose than the cost of
             // disabling backface culling.
-            mScene.drawSubmitted(mesh, transform, categories, true);
+            //
+            // The instance transform is the same for a skinned mesh as for a static one. The bone
+            // matrices take a bind-pose vertex to the drawable's local space and the accumulated path
+            // matrix takes it from there to the world, which is the same division of labour OSG uses --
+            // RigGeometry's own skin-to-skeleton matrix exists precisely to cancel the transforms the
+            // path already accounts for.
+            //
+            // The rig is passed on only if the mesh actually carries skinning. A rig whose skin this code
+            // refused still produced a perfectly good static mesh from its bind pose, and sending bone
+            // transforms for it would be asking the runtime to deform vertices that have no weights.
+            mScene.drawSubmitted(
+                mesh, transform, categories, true, mScene.lastMeshIsSkinned() ? rig : nullptr);
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
         }
@@ -872,6 +960,8 @@ namespace MWRender
     {
         mLastInstanceCount = 0;
         mLastLightCount = 0;
+        mSkinnedInstances = 0;
+        mSkinnedDropped = 0;
         mHaveExtent = false;
         if (sceneRoot == nullptr || mDefaultMaterial == 0)
             return 0;
@@ -964,7 +1054,9 @@ namespace MWRender
             mWasPopulated = populated;
             Log(Debug::Info) << "Remix scene: handed over " << mLastInstanceCount << " instances from "
                              << mMeshes.size() << " meshes, " << mLastLightCount << " lights and "
-                             << mTexturesUploaded << " textures"
+                             << mTexturesUploaded << " textures; " << mSkinnedInstances
+                             << " instances were skinned and " << mSkinnedDropped
+                             << " skins were not ready"
                              << "; camera eye " << eye.x() << ", " << eye.y()
                              << ", " << eye.z() << " looking " << forward.x() << ", " << forward.y()
                              << ", " << forward.z() << " up " << up.x() << ", " << up.y() << ", "
@@ -984,9 +1076,11 @@ namespace MWRender
         return mLastInstanceCount;
     }
 
-    unsigned long long RemixScene::submitGeometry(osg::Geometry& geometry, const SurfaceState& surface)
+    unsigned long long RemixScene::submitGeometry(
+        osg::Geometry& geometry, const SurfaceState& surface, const SceneUtil::RigGeometry* rig)
     {
-        return meshFor(geometry, materialFor(surface), surface);
+        mLastMeshBonesPerVertex = 0;
+        return meshFor(geometry, materialFor(surface), surface, rig);
     }
 
     unsigned long long RemixScene::textureFor(const osg::Image& image)
@@ -1029,45 +1123,30 @@ namespace MWRender
             // as well: OSG stores them contiguously, largest first, which is exactly what the upload
             // expects -- and mips matter more here than usual, since without them minification has
             // nothing to fall back on and textured surfaces shimmer at distance.
-            switch (internalFormat)
+            const CompressedFormat* compressed = compressedFormatFor(internalFormat);
+            if (compressed == nullptr)
             {
-                case kGlDxt1Rgb:
-                    format = RemixRT::Runtime::Format_BC1_RGB;
-                    cached.mFormat = "BC1_RGB";
-                    break;
-                case kGlDxt1Rgba:
-                    format = RemixRT::Runtime::Format_BC1_RGBA;
-                    cached.mFormat = "BC1_RGBA";
-                    break;
-                case kGlDxt3:
-                    format = RemixRT::Runtime::Format_BC2;
-                    cached.mFormat = "BC2";
-                    break;
-                case kGlDxt5:
-                    format = RemixRT::Runtime::Format_BC3;
-                    cached.mFormat = "BC3";
-                    break;
-                default:
-                    Log(Debug::Verbose) << "Remix scene: unsupported compressed texture format 0x"
-                                        << std::hex << internalFormat << std::dec
-                                        << "; using the untextured material for it";
-                    mTextures.emplace(key, cached);
-                    return 0;
+                Log(Debug::Warning) << "Remix scene: no Remix format for compressed GL internal format 0x"
+                                    << std::hex << internalFormat << std::dec
+                                    << "; using the untextured material for it. Add it to "
+                                       "kCompressedFormats if the runtime has a format for it.";
+                mTextures.emplace(key, cached);
+                return 0;
             }
+            format = compressed->mFormat;
+            cached.mFormat = compressed->mName;
 
-            // The byte count is derived here rather than taken from OSG, and cross-checked against it.
+            // Every byte count below is derived from the format and the extent, never taken from OSG, and
+            // this is a correctness requirement rather than a preference.
             //
-            // Passing osg::Image::getTotalSizeInBytesIncludingMipmaps() straight through crashed the
-            // runtime: CreateTexture memcpys exactly the size it is given into a staging buffer sized
-            // from that same number, and a value larger than the real mip chain walks the copy off the
-            // end of the mapping. The size a texture upload declares has to be one the caller computed,
-            // not one it inherited, because nothing downstream can check it.
-            //
-            // Block-compressed formats are 4x4 blocks, eight bytes for BC1 and sixteen for BC2 and BC3.
-            const unsigned long long blockBytes
-                = (format == RemixRT::Runtime::Format_BC1_RGB || format == RemixRT::Runtime::Format_BC1_RGBA)
-                ? 8ull
-                : 16ull;
+            // CreateTexture memcpys exactly the size it is given into a staging buffer sized from that
+            // same number, so an overstated value walks the copy off the end of the source mapping and
+            // takes the runtime down inside memcpy, with nothing on the stack to say which texture did
+            // it. And OSG's own size accessors cannot be used for the check: for a compressed image with
+            // no mip chain, getTotalSizeInBytesIncludingMipmaps() reports the *uncompressed* size, which
+            // for a 256x256 BC3 texture is 262144 bytes against a real 65536. That 4:1 overstatement is
+            // what was pushing textures onto the base-level-only path for no reason.
+            const unsigned long long blockBytes = compressed->mBlockBytes;
             const auto levelBytes = [&](unsigned int level) -> unsigned long long {
                 const unsigned long long levelWidth = std::max(1, width >> level);
                 const unsigned long long levelHeight = std::max(1, height >> level);
@@ -1076,30 +1155,30 @@ namespace MWRender
 
             const unsigned int osgLevels
                 = std::max(1u, static_cast<unsigned int>(image.getNumMipmapLevels()));
-            unsigned long long chainBytes = 0;
-            for (unsigned int level = 0; level < osgLevels; ++level)
+
+            // OSG's mipmap *offsets* are trustworthy where its sizes are not: they come from the loader
+            // walking the file, not from a pixel-size calculation. Checking the computed layout against
+            // them catches a chain that is not contiguous-largest-first, which is the one assumption the
+            // upload makes about the memory it is handed.
+            unsigned long long chainBytes = levelBytes(0);
+            unsigned int usableLevels = 1;
+            for (unsigned int level = 1; level < osgLevels; ++level)
+            {
+                if (static_cast<unsigned long long>(image.getMipmapOffset(level)) != chainBytes)
+                {
+                    Log(Debug::Verbose)
+                        << "Remix scene: mip level " << level << " of a " << width << "x" << height << " "
+                        << compressed->mName << " texture starts at " << image.getMipmapOffset(level)
+                        << " where the format implies " << chainBytes
+                        << "; uploading the levels up to that point only";
+                    break;
+                }
                 chainBytes += levelBytes(level);
-
-            const unsigned long long osgTotal
-                = static_cast<unsigned long long>(image.getTotalSizeInBytesIncludingMipmaps());
-
-            if (chainBytes == osgTotal)
-            {
-                mipLevels = osgLevels;
-                uploadSize = chainBytes;
+                ++usableLevels;
             }
-            else
-            {
-                // The two disagree, so the mip chain is not laid out the way the format implies and only
-                // the base level can be trusted. Sharpness at distance suffers; a read off the end of the
-                // image does not.
-                Log(Debug::Verbose) << "Remix scene: texture mip chain is " << osgTotal
-                                    << " bytes but the format implies " << chainBytes << " over "
-                                    << osgLevels << " levels; uploading the base level only";
-                mipLevels = 1;
-                uploadSize = std::min<unsigned long long>(
-                    levelBytes(0), static_cast<unsigned long long>(image.getImageSizeInBytes()));
-            }
+
+            mipLevels = usableLevels;
+            uploadSize = chainBytes;
             uploadData = data;
         }
         else if (dataType == kGlUnsignedByte)
@@ -1271,18 +1350,140 @@ namespace MWRender
         return handle;
     }
 
-    void RemixScene::drawSubmitted(
-        unsigned long long mesh, const float* transform, unsigned int categoryFlags, bool doubleSided)
+    void RemixScene::drawSubmitted(unsigned long long mesh, const float* transform,
+        unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig)
     {
-        mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided);
+        if (rig == nullptr)
+        {
+            mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided);
+            return;
+        }
+
+        // Bone matrices are read every frame rather than cached, because that is the entire per-frame
+        // cost of a skinned instance and the whole reason this path exists. They are current at this
+        // point in the frame: the Remix submit runs after osgViewer's update traversal, which is what
+        // drives RigGeometry::updateBounds and through it Skeleton::updateBoneMatrices.
+        if (!rig->getBoneMatrices(mBoneMatrixScratch))
+        {
+            // The skin has no resolved skeleton yet, which happens for a frame or two after a cell loads.
+            // Submitting the bind pose instead would put a T-posed actor in the scene, which is a worse
+            // answer than nothing.
+            ++mSkinnedDropped;
+            return;
+        }
+
+        // The identity bone buildSkinning reserved. It has to be here and it has to be last, because the
+        // index buildSkinning wrote for unweighted vertices is the bone count it saw.
+        mBoneMatrixScratch.emplace_back(osg::Matrixf::identity());
+
+        const unsigned int boneCount = static_cast<unsigned int>(
+            std::min<std::size_t>(mBoneMatrixScratch.size(), RemixRT::Runtime::kMaxBones));
+
+        mBoneTransformScratch.resize(static_cast<std::size_t>(boneCount) * 12);
+        for (unsigned int bone = 0; bone < boneCount; ++bone)
+        {
+            const osg::Matrixf& matrix = mBoneMatrixScratch[bone];
+            float* out = mBoneTransformScratch.data() + static_cast<std::size_t>(bone) * 12;
+            // Same row-vector to column-vector conversion as the instance transform: OSG applies p * M
+            // with translation in the fourth row, Remix applies M * p with translation in the fourth
+            // column, so the 3x3 is transposed and the translation moves.
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int col = 0; col < 3; ++col)
+                    out[row * 4 + col] = matrix(col, row);
+                out[row * 4 + 3] = matrix(3, row);
+            }
+        }
+
+        if (mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided,
+                mBoneTransformScratch.data(), boneCount))
+            ++mSkinnedInstances;
     }
 
-    unsigned long long RemixScene::meshFor(
-        osg::Geometry& geometry, unsigned long long material, const SurfaceState& surface)
+    unsigned int RemixScene::buildSkinning(const SceneUtil::RigGeometry& rig, unsigned int vertexCount)
+    {
+        const auto* influences = rig.getInfluences();
+        if (influences == nullptr || influences->empty() || vertexCount == 0)
+            return 0;
+
+        // One slot past the real bones, holding an identity transform.
+        //
+        // RigGeometry::setInfluences drops the empty weight set, so a vertex with no influences at all is
+        // absent from the grouping -- and the CPU path leaves those vertices at their bind-pose position,
+        // because it writes only the vertices it finds in the groups. There is no way to express "not
+        // skinned" on the GPU, where every vertex is the weighted sum of some bones, so the identity has
+        // to be a bone. Without it those vertices would collapse to the origin and drag a triangle fan
+        // across the model with them.
+        const std::size_t realBones = rig.getBoneCount();
+        if (realBones == 0 || realBones + 1 > RemixRT::Runtime::kMaxBones)
+        {
+            Log(Debug::Warning) << "Remix scene: a skin references " << realBones
+                                << " bones, over the runtime's limit of " << RemixRT::Runtime::kMaxBones
+                                << "; it will not be skinned";
+            return 0;
+        }
+        const unsigned int identityBone = static_cast<unsigned int>(realBones);
+
+        unsigned int bonesPerVertex = 1;
+        for (const auto& [weights, vertices] : *influences)
+            bonesPerVertex
+                = std::max(bonesPerVertex, static_cast<unsigned int>(weights.size()));
+
+        const std::size_t slots = static_cast<std::size_t>(bonesPerVertex) * vertexCount;
+        // Every vertex starts fully weighted onto the identity bone, so a vertex the grouping never
+        // mentions is already correct and needs no separate pass to find.
+        mWeightScratch.assign(slots, 0.0f);
+        mBoneIndexScratch.assign(slots, identityBone);
+        for (unsigned int vertex = 0; vertex < vertexCount; ++vertex)
+            mWeightScratch[static_cast<std::size_t>(vertex) * bonesPerVertex] = 1.0f;
+
+        for (const auto& [weights, vertices] : *influences)
+        {
+            // Normalised, because the runtime derives the last weight of each tuple as one minus the
+            // others rather than reading it. A tuple summing to 0.99 does not produce a slightly dimmer
+            // vertex, it hands 0.01 to whichever bone sits in the last slot -- which for a vertex with
+            // fewer influences than bonesPerVertex is a padding entry.
+            float total = 0.0f;
+            for (const auto& [bone, weight] : weights)
+                total += weight;
+            if (!(total > 0.0f))
+                continue;
+
+            for (unsigned short vertex : vertices)
+            {
+                if (vertex >= vertexCount)
+                    continue;
+                const std::size_t base = static_cast<std::size_t>(vertex) * bonesPerVertex;
+                std::size_t slot = 0;
+                for (const auto& [bone, weight] : weights)
+                {
+                    if (bone >= realBones)
+                        continue;
+                    mWeightScratch[base + slot] = weight / total;
+                    mBoneIndexScratch[base + slot] = static_cast<unsigned int>(bone);
+                    ++slot;
+                }
+                // Any remaining slots keep the identity bone at weight zero. Pointing them at a bone that
+                // already influences this vertex would do as well; what matters is that the index is
+                // valid, since the runtime multiplies by it before checking the weight.
+                for (; slot < bonesPerVertex; ++slot)
+                    mWeightScratch[base + slot] = 0.0f;
+            }
+        }
+
+        return bonesPerVertex;
+    }
+
+    unsigned long long RemixScene::meshFor(osg::Geometry& geometry, unsigned long long material,
+        const SurfaceState& surface, const SceneUtil::RigGeometry* rig)
     {
         if (material == 0)
             return 0;
 
+        // Keyed on the bind pose for a skinned mesh, which is deliberate and is where the efficiency of
+        // this whole approach comes from. RigGeometry's copy constructor shares mSourceGeometry, so every
+        // actor wearing the same body part or armour piece resolves to one Remix mesh, submitted once and
+        // instanced with different bone transforms.
         const void* key = &geometry;
 
         const auto* positions = dynamic_cast<const osg::Vec3Array*>(geometry.getVertexArray());
@@ -1303,6 +1504,7 @@ namespace MWRender
                     std::begin(surface.mTexMat)))
             {
                 found->second.mLastUsedFrame = mFrame;
+                mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
                 return found->second.mHandle;
             }
             mRuntime.destroyMesh(found->second.mHandle);
@@ -1381,8 +1583,17 @@ namespace MWRender
         const unsigned long long hash
             = (reinterpret_cast<unsigned long long>(key) * 0x9E3779B97F4A7C15ull) | 1ull;
 
+        RemixRT::Runtime::Skinning skinning;
+        if (rig != nullptr)
+        {
+            skinning.mBonesPerVertex = buildSkinning(*rig, vertexCount);
+            skinning.mWeights = mWeightScratch.data();
+            skinning.mBoneIndices = mBoneIndexScratch.data();
+        }
+
         const unsigned long long handle = mRuntime.createMesh(hash, mVertexScratch.data(), vertexCount,
-            mIndexScratch.data(), static_cast<unsigned int>(mIndexScratch.size()), material);
+            mIndexScratch.data(), static_cast<unsigned int>(mIndexScratch.size()), material,
+            skinning.mBonesPerVertex > 0 ? &skinning : nullptr);
         if (handle == 0)
             return 0;
 
@@ -1392,8 +1603,10 @@ namespace MWRender
         cached.mVertexCount = vertexCount;
         cached.mIndexCount = static_cast<unsigned int>(mIndexScratch.size());
         cached.mMaterial = material;
+        cached.mBonesPerVertex = skinning.mBonesPerVertex;
         std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(cached.mTexMat));
         mMeshes.emplace(key, cached);
+        mLastMeshBonesPerVertex = skinning.mBonesPerVertex;
         return handle;
     }
 

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
@@ -750,7 +751,7 @@ namespace RemixRT
 
     unsigned long long Runtime::createMesh(unsigned long long hash, const Vertex* vertices,
         unsigned int vertexCount, const unsigned int* indices, unsigned int indexCount,
-        unsigned long long material)
+        unsigned long long material, const Skinning* skinning)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMesh == nullptr || hash == 0 || vertices == nullptr
             || indices == nullptr || vertexCount == 0 || indexCount == 0)
@@ -763,8 +764,27 @@ namespace RemixRT
         surface.vertices_count = vertexCount;
         surface.indices_values = indices;
         surface.indices_count = indexCount;
-        surface.skinning_hasvalue = 0;
         surface.material = reinterpret_cast<remixapi_MaterialHandle>(material);
+
+        surface.skinning_hasvalue = 0;
+        if (skinning != nullptr && skinning->mBonesPerVertex > 0 && skinning->mWeights != nullptr
+            && skinning->mBoneIndices != nullptr)
+        {
+            // Rejected rather than clamped. The runtime sizes its buffers from these counts and strides
+            // them by bonesPerVertex, so a count that disagrees with the vertex count does not produce a
+            // partly-skinned mesh, it reads the wrong tuple for every vertex past the discrepancy.
+            const unsigned long long expected
+                = static_cast<unsigned long long>(skinning->mBonesPerVertex) * vertexCount;
+            if (expected > std::numeric_limits<unsigned int>::max())
+                return 0;
+
+            surface.skinning_hasvalue = 1;
+            surface.skinning_value.bonesPerVertex = skinning->mBonesPerVertex;
+            surface.skinning_value.blendWeights_values = skinning->mWeights;
+            surface.skinning_value.blendWeights_count = static_cast<unsigned int>(expected);
+            surface.skinning_value.blendIndices_values = skinning->mBoneIndices;
+            surface.skinning_value.blendIndices_count = static_cast<unsigned int>(expected);
+        }
 
         remixapi_MeshInfo mesh = {};
         mesh.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -797,6 +817,12 @@ namespace RemixRT
         static_cast<unsigned int>(Runtime::Format_BC2) == REMIXAPI_FORMAT_BC2_SRGB, "texture format drift");
     static_assert(
         static_cast<unsigned int>(Runtime::Format_BC3) == REMIXAPI_FORMAT_BC3_SRGB, "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC5) == REMIXAPI_FORMAT_BC5_UNORM, "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC7) == REMIXAPI_FORMAT_BC7_SRGB, "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BC7_Linear) == REMIXAPI_FORMAT_BC7_UNORM,
+        "texture format drift");
 
     unsigned long long Runtime::createTexture(unsigned long long hash, unsigned int width,
         unsigned int height, unsigned int mipLevels, TextureFormat format, const void* data,
@@ -952,8 +978,12 @@ namespace RemixRT
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
-    bool Runtime::drawInstance(
-        unsigned long long mesh, const float* transform, unsigned int categoryFlags, bool doubleSided)
+    static_assert(Runtime::kMaxBones == REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT, "bone limit drift");
+    // Justifies pointing the API at the caller's flat float array instead of copying it per bone.
+    static_assert(sizeof(remixapi_Transform) == 12 * sizeof(float), "transform layout drift");
+
+    bool Runtime::drawInstance(unsigned long long mesh, const float* transform,
+        unsigned int categoryFlags, bool doubleSided, const float* boneTransforms, unsigned int boneCount)
     {
         if (!mImpl->mStarted || mImpl->mApi.DrawInstance == nullptr || mesh == 0 || transform == nullptr)
             return false;
@@ -964,6 +994,19 @@ namespace RemixRT
         instance.categoryFlags = categoryFlags;
         instance.doubleSided = doubleSided ? 1 : 0;
         std::memcpy(instance.transform.matrix, transform, sizeof(instance.transform.matrix));
+
+        // Chained rather than copied: remixapi_Transform is three rows of four floats, which is the
+        // layout the caller already hands over, so the array can be pointed at directly. The struct only
+        // has to outlive the call, and the runtime deep-copies what it keeps.
+        remixapi_InstanceInfoBoneTransformsEXT bones = {};
+        if (boneTransforms != nullptr && boneCount > 0)
+        {
+            bones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+            bones.boneTransforms_values = reinterpret_cast<const remixapi_Transform*>(boneTransforms);
+            bones.boneTransforms_count = std::min(boneCount, kMaxBones);
+            instance.pNext = &bones;
+        }
+
         return mImpl->mApi.DrawInstance(&instance) == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 

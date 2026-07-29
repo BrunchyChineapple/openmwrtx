@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <osg/Matrixf>
 #include <osg/Node>
 #include <osg/ref_ptr>
 
@@ -20,6 +21,7 @@ namespace osg
 namespace SceneUtil
 {
     class LightSource;
+    class RigGeometry;
 }
 
 namespace MWRender
@@ -68,6 +70,9 @@ namespace MWRender
         /// Instances submitted on the last call to submit().
         unsigned int lastInstanceCount() const { return mLastInstanceCount; }
 
+        /// Whether the mesh the last submitGeometry() returned needs bone transforms per instance.
+        bool lastMeshIsSkinned() const { return mLastMeshBonesPerVertex > 0; }
+
         /// Lights submitted on the last call to submit().
         unsigned int lastLightCount() const { return mLastLightCount; }
 
@@ -108,11 +113,18 @@ namespace MWRender
 
         /// Converts and caches one drawable, returning its Remix mesh handle, or 0 if unusable.
         /// Public only because the traversal visitor lives in the .cpp and calls back into here.
-        unsigned long long submitGeometry(osg::Geometry& geometry, const SurfaceState& surface);
+        ///
+        /// @param rig when non-null, \a geometry is that rig's bind pose and the mesh is created with
+        ///        skinning data derived from the rig's influences.
+        unsigned long long submitGeometry(osg::Geometry& geometry, const SurfaceState& surface,
+            const SceneUtil::RigGeometry* rig = nullptr);
 
         /// Queues one instance. Companion to submitGeometry, same reason for being public.
-        void drawSubmitted(
-            unsigned long long mesh, const float* transform, unsigned int categoryFlags, bool doubleSided);
+        ///
+        /// @param rig when non-null, its current bone matrices are submitted with the instance. Must be
+        ///        the same rig the mesh was created from.
+        void drawSubmitted(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
+            bool doubleSided, const SceneUtil::RigGeometry* rig = nullptr);
 
         /// Records a submitted instance's world-space origin, for the diagnostic extent log.
         void noteInstancePosition(double x, double y, double z);
@@ -149,6 +161,10 @@ namespace MWRender
             /// The texture matrix the cached texcoords were built with. Baked in for the same reason as
             /// the material: it lives in the vertex data, so a change means a rebuild.
             float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+            /// Non-zero when the mesh was created with skinning, in which case instances of it have to
+            /// supply bone transforms. Zero for static geometry, and also for a skin the runtime or this
+            /// code refused, so it answers "does this instance need bones" rather than "is this a rig".
+            unsigned int mBonesPerVertex = 0;
         };
 
         struct CachedTexture
@@ -183,8 +199,14 @@ namespace MWRender
         void releaseStaleLights();
 
         /// Converts and caches \a geometry against \a material, returning its mesh handle, or 0.
-        unsigned long long meshFor(
-            osg::Geometry& geometry, unsigned long long material, const SurfaceState& surface);
+        unsigned long long meshFor(osg::Geometry& geometry, unsigned long long material,
+            const SurfaceState& surface, const SceneUtil::RigGeometry* rig);
+
+        /// Expands \a rig's grouped influences into the flat per-vertex arrays the runtime wants.
+        ///
+        /// Fills mWeightScratch and mBoneIndexScratch and returns the bones-per-vertex count, or 0 if the
+        /// rig cannot be skinned. The returned count is what both arrays are strided by.
+        unsigned int buildSkinning(const SceneUtil::RigGeometry& rig, unsigned int vertexCount);
 
         /// Resolves \a surface to a material handle, uploading its texture on first use.
         /// Falls back to the untextured default material rather than dropping the drawable.
@@ -239,6 +261,23 @@ namespace MWRender
         /// Scratch, reused across meshes so conversion does not allocate per geometry per frame.
         std::vector<RemixRT::Runtime::Vertex> mVertexScratch;
         std::vector<unsigned int> mIndexScratch;
+        /// Skinning scratch. The weights and indices are only needed while a mesh is being created, but
+        /// the bone matrices are rebuilt for every skinned instance every frame, which is the one place
+        /// in this file where a per-frame allocation would actually show up in a profile.
+        std::vector<float> mWeightScratch;
+        std::vector<unsigned int> mBoneIndexScratch;
+        std::vector<osg::Matrixf> mBoneMatrixScratch;
+        std::vector<float> mBoneTransformScratch;
+        /// Skinned instances submitted on the last call to submit(), and how many were dropped because
+        /// their skin was not usable. Reported together: skinned actors going missing is otherwise
+        /// indistinguishable from the traversal not reaching them.
+        unsigned int mSkinnedInstances = 0;
+        unsigned int mSkinnedDropped = 0;
+        /// Bones per vertex of the mesh the last submitGeometry resolved to, so the caller can tell
+        /// whether the instance it is about to queue needs bone transforms. Carried on the object rather
+        /// than returned because a mesh that failed its skinning is still a usable static mesh, and the
+        /// two answers -- handle, and whether it is skinned -- come from the same lookup.
+        unsigned int mLastMeshBonesPerVertex = 0;
         bool mLoggedFirstSubmit = false;
         bool mLoggedClamp = false;
         /// Whether the last submission found anything, so the transition can be reported rather than

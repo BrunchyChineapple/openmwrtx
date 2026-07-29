@@ -210,14 +210,40 @@ namespace RemixRT
             float roughness, float metallic, float emissive = 0.0f,
             const float* emissiveColour = nullptr);
 
+        /// Per-vertex bone influences for a skinned mesh.
+        ///
+        /// The vertices of a skinned mesh are the bind pose and never change, so the mesh is created once
+        /// and only the bone transforms are submitted per frame. That is the whole point of going through
+        /// this rather than rebuilding a deformed mesh every frame: the runtime rebuilds acceleration
+        /// structures from bone transforms far more cheaply than from new geometry, and a mesh whose
+        /// handle changes every frame also defeats the temporal accumulation a path tracer depends on.
+        struct Skinning
+        {
+            /// Influences per vertex. Every vertex has exactly this many slots; unused ones take a weight
+            /// of zero. Any value is legal, though four is what NIF skins use.
+            unsigned int mBonesPerVertex = 0;
+            /// mBonesPerVertex * vertexCount weights, vertex-major.
+            ///
+            /// These must sum to one per vertex, and not approximately: the runtime reads only the first
+            /// mBonesPerVertex-1 of each tuple and derives the last as the remainder. Weights that sum to
+            /// less than one therefore do not dim the vertex, they hand the shortfall to whichever bone
+            /// happens to occupy the last slot.
+            const float* mWeights = nullptr;
+            /// mBonesPerVertex * vertexCount bone indices, vertex-major, each below kMaxBones. Indices
+            /// are packed one per byte downstream, so a larger value is silently truncated.
+            const unsigned int* mBoneIndices = nullptr;
+        };
+
         /// Creates a triangle mesh with a single surface.
         ///
         /// @param hash caller-owned and must be unique across live meshes: the runtime derives the mesh
         ///        handle from it directly, so a collision silently aliases two different meshes.
+        /// @param skinning optional. When given, \a vertices are the bind pose and each instance has to
+        ///        supply bone transforms; see drawInstance.
         /// @return an opaque handle, or 0 on failure.
         unsigned long long createMesh(unsigned long long hash, const Vertex* vertices,
             unsigned int vertexCount, const unsigned int* indices, unsigned int indexCount,
-            unsigned long long material);
+            unsigned long long material, const Skinning* skinning = nullptr);
 
         /// Releases a mesh. Must be called before its hash is reused for different geometry.
         void destroyMesh(unsigned long long mesh);
@@ -226,14 +252,21 @@ namespace RemixRT
         ///
         /// Duplicated here for the same reason as InstanceCategory: so callers need not include
         /// remix_c.h and drag <windows.h> in with it. The static_asserts in runtime.cpp keep them equal.
+        /// The sRGB variants are the ones to use for colour, and the choice is not cosmetic: the runtime
+        /// linearises on sample for an _SRGB format and does not for a _UNORM one, so naming the wrong
+        /// variant leaves the albedo off by a gamma curve. Textures that are not colour -- normal maps
+        /// above all -- have to use the UNORM variants for exactly the same reason.
         enum TextureFormat : unsigned int
         {
             Format_RGBA8 = 43, ///< 8-bit RGBA, sRGB-encoded
             Format_BGRA8 = 50, ///< 8-bit BGRA, sRGB-encoded
-            Format_BC1_RGB = 132, ///< DXT1 without alpha
-            Format_BC1_RGBA = 134, ///< DXT1 with a one-bit alpha
-            Format_BC2 = 138, ///< DXT3
-            Format_BC3 = 136, ///< DXT5
+            Format_BC1_RGB = 132, ///< DXT1 without alpha, sRGB-encoded
+            Format_BC1_RGBA = 134, ///< DXT1 with a one-bit alpha, sRGB-encoded
+            Format_BC2 = 138, ///< DXT3, explicit four-bit alpha, sRGB-encoded
+            Format_BC3 = 136, ///< DXT5, interpolated alpha, sRGB-encoded
+            Format_BC5 = 139, ///< Two-channel, linear. Normal maps; never colour.
+            Format_BC7 = 146, ///< High-quality RGBA, sRGB-encoded
+            Format_BC7_Linear = 145, ///< BC7 holding non-colour data
         };
 
         /// Uploads a texture the runtime can then be told to use by hash.
@@ -311,8 +344,16 @@ namespace RemixRT
         ///        in the last column, applied as p' = M * p.
         /// @param categoryFlags remixapi_InstanceCategoryBit values, taken from OpenMW's VisMask so
         ///        Remix is told what a thing *is* rather than inferring it from a texture hash.
+        /// @param boneTransforms optional, 12 floats per bone in the same layout as \a transform, one
+        ///        entry per bone the mesh's skinning indices refer to. Required for a mesh created with
+        ///        skinning and meaningless without one. At most kMaxBones.
+        /// @param boneCount number of entries in \a boneTransforms.
         bool drawInstance(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
-            bool doubleSided);
+            bool doubleSided, const float* boneTransforms = nullptr, unsigned int boneCount = 0);
+
+        /// Most bones one skinned instance can have. The runtime packs bone indices one per byte, so
+        /// this is a hard limit rather than a tuning value.
+        static constexpr unsigned int kMaxBones = 256;
 
         /// True when OPENMW_REMIX_TESTSCENE asks for the built-in test scene instead of OpenMW's.
         static bool testSceneRequested();
