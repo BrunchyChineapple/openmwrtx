@@ -1354,14 +1354,16 @@ namespace RemixRT
             width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &staging, nullptr);
         if (FAILED(hr) || staging == nullptr)
         {
-            Log(Debug::Error) << "Remix probe: CreateOffscreenPlainSurface failed, hr 0x" << std::hex << hr;
+            Log(Debug::Error) << "Remix probe: CreateOffscreenPlainSurface failed, hr 0x" << std::hex << hr
+                              << std::dec;
             return false;
         }
 
         hr = mImpl->mDevice->GetRenderTargetData(mImpl->mOutputSurface, staging);
         if (FAILED(hr))
         {
-            Log(Debug::Error) << "Remix probe: GetRenderTargetData failed, hr 0x" << std::hex << hr;
+            Log(Debug::Error) << "Remix probe: GetRenderTargetData failed, hr 0x" << std::hex << hr
+                              << std::dec;
             staging->Release();
             return false;
         }
@@ -1370,7 +1372,7 @@ namespace RemixRT
         hr = staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
         if (FAILED(hr))
         {
-            Log(Debug::Error) << "Remix probe: LockRect failed, hr 0x" << std::hex << hr;
+            Log(Debug::Error) << "Remix probe: LockRect failed, hr 0x" << std::hex << hr << std::dec;
             staging->Release();
             return false;
         }
