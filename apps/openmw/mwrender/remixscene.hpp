@@ -407,7 +407,9 @@ namespace MWRender
         /// hash seen in Remix's texture list, so covering only the first few textures of a session would
         /// miss most of what anyone would want to ask about.
         unsigned int mTexturesLogged = 0;
-        static constexpr unsigned int kTextureLogLimit = 512;
+        static constexpr unsigned int kTextureLogLimit = 4096;
+
+
         /// Same idea for lights, and a smaller sample: the interesting question is whether the derivation
         /// produces sane radiance for a real attenuation curve, and a dozen answers that in one glance.
         unsigned int mLightsLogged = 0;

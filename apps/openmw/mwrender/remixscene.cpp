@@ -104,6 +104,12 @@ namespace
     /// the line has appeared by the time anyone goes looking for it.
     constexpr std::uint64_t kLightTuningSettleFrames = 30;
 
+    /// How often the scene handover summary is repeated, in frames.
+    ///
+    /// Slow enough not to fill the log over a session, often enough that a walk between two areas produces
+    /// several samples to compare.
+    constexpr std::uint64_t kSceneLogInterval = 600;
+
     /// Game-state store keys the runtime publishes live light tuning on.
     ///
     /// Must match kExternalLightRadiusKey and kExternalLightIntensityKey in the runtime's
@@ -1484,8 +1490,11 @@ namespace MWRender
         // back. A one-shot on frame 1 was actively misleading: the first frame happens before the world
         // is up, so it reported zero instances and then never spoke again, which read as "the traversal
         // never works" when it only meant "there was nothing there yet".
+        // Also on a slow interval, not only on the populated/unpopulated edge. The edge alone meant this
+        // reported the main menu -- one instance, one mesh -- and then never again for the whole session,
+        // so the counts that actually matter were never visible.
         const bool populated = mLastInstanceCount > 0;
-        if (!mLoggedFirstSubmit || populated != mWasPopulated)
+        if (!mLoggedFirstSubmit || populated != mWasPopulated || mFrame % kSceneLogInterval == 0)
         {
             mLoggedFirstSubmit = true;
             mWasPopulated = populated;
@@ -1550,6 +1559,10 @@ namespace MWRender
         std::vector<unsigned char> converted;
         const void* uploadData = nullptr;
         unsigned long long uploadSize = 0;
+        // Bytes of mip level 0 alone. Tracked only to test whether Remix's own D3D9 texture hash can be
+        // reproduced here: that hash is XXH3 over the staging buffer of subresource 0, which is mip 0 and
+        // nothing else -- no dimensions, no format, no mip chain. Zero when the branch taken cannot say.
+        unsigned long long mip0Size = 0;
         unsigned int mipLevels = 1;
         RemixRT::Runtime::TextureFormat format = RemixRT::Runtime::Format_RGBA8;
 
@@ -1621,6 +1634,8 @@ namespace MWRender
             mipLevels = usableLevels;
             uploadSize = chainBytes;
             uploadData = data;
+            // Largest-first and contiguous, verified just above, so mip 0 is the leading levelBytes(0).
+            mip0Size = levelBytes(0);
         }
         else if (dataType == kGlUnsignedByte)
         {
@@ -1721,11 +1736,32 @@ namespace MWRender
         // Dimensions and the colour interpretation fold in afterwards because identical bytes can be two
         // legitimately different textures: one image bound as sRGB albedo and as a linear normal map must
         // not collapse to a single entry, which is the distinction the old cache key spent its low bit on.
-        unsigned long long hash = RemixRT::AssetHash::bytes(uploadData, uploadSize);
-        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(width), hash);
-        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(height), hash);
-        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(format), hash);
-        hash = RemixRT::AssetHash::combine(colour ? 1ull : 0ull, hash);
+        unsigned long long hash = 0;
+        if (colour && mip0Size != 0)
+        {
+            // Exactly what Remix computes for a game texture: XXH3 over mip 0 alone, nothing folded in.
+            // See D3D9CommonTexture::SetupForRtxFrom, which hashes the staging buffer of subresource 0.
+            //
+            // Reproducing it bit for bit is the whole point. Measured over a Seyda Neen walk, 249 of 804
+            // textures came out equal to a mat_<hex> key in the NVIDIA demo pack authored from an MGE-XE
+            // capture -- so an existing pack's materials bind instead of having to be re-authored. Folding
+            // in dimensions or a colour flag, as an earlier revision did, moves every value off that.
+            hash = RemixRT::AssetHash::bytes(uploadData, mip0Size);
+        }
+        else
+        {
+            // Not a candidate for matching, so identity only has to be stable and distinct.
+            //
+            // The linear uploads are normal maps, which a mat_ key does not address anyway, and the colour
+            // flag is folded in deliberately: without it the same file uploaded as both sRGB albedo and a
+            // linear normal map would collapse onto one texture, and whichever arrived second would win.
+            // Nothing in Morrowind's art does that today, but the guarantee is cheap.
+            hash = RemixRT::AssetHash::bytes(uploadData, uploadSize);
+            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(width), hash);
+            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(height), hash);
+            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(format), hash);
+            hash = RemixRT::AssetHash::combine(colour ? 1ull : 0ull, hash);
+        }
         hash = RemixRT::AssetHash::avoidZero(hash);
 
         if (mRuntime.createTexture(hash, static_cast<unsigned int>(width),
@@ -1752,8 +1788,8 @@ namespace MWRender
             Log(Debug::Info) << "Remix texture " << mTexturesLogged << ": " << std::hex << std::uppercase
                              << hash << std::nouppercase << std::dec << " " << image.getFileName() << " "
                              << width << "x" << height << " " << cached.mFormat << " "
-                             << (colour ? "sRGB" : "linear") << ", " << mipLevels << " mip"
-                             << (mipLevels == 1 ? "" : "s")
+                             << (colour ? "sRGB" : "linear") << ", " << mipLevels
+                             << " mip" << (mipLevels == 1 ? "" : "s")
                              << (mTexturesLogged == kTextureLogLimit ? " (last of these)" : "");
         }
 
@@ -2293,6 +2329,18 @@ namespace MWRender
         contentHash = RemixRT::AssetHash::bytesSeeded(
             mIndexScratch.data(), mIndexScratch.size() * sizeof(unsigned int), contentHash);
         unsigned long long hash = RemixRT::AssetHash::avoidZero(contentHash);
+
+        // Note on matching mesh replacements authored elsewhere: reproducing Remix's own geometry hash here
+        // was tried and does not work. A faithful implementation of the runtime's formulation -- positions
+        // over the sorted unique index set, a flat hash of the index block, and the geometry descriptor,
+        // combined the way GeometryHashes does -- matched none of the 562 mesh_<hex> keys in a pack captured
+        // from Morrowind through MGE-XE, over 8192 meshes. (Removed afterwards rather than left unused; it is
+        // in the history if the premise ever changes.) The reason looks structural rather than arithmetic:
+        // the runtime
+        // hashes the index buffer's raw bytes and takes vertexCount straight from the draw call, so a game
+        // drawing from shared buffers with a base-vertex offset describes a sub-range of a batch, where this
+        // submits standalone meshes with 0-based indices. Materials are a different story -- see the texture
+        // hash above, which does match.
 
         // Identical content already submitted? Then share it -- one Remix mesh, one BLAS, however many
         // instances reference it.

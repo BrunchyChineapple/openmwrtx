@@ -1,5 +1,9 @@
 #include "assethash.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
 // The only place this header is included. It is ~200KB of macro-heavy single-header library, and
 // XXH_INLINE_ALL puts every definition in this translation unit so no separate xxhash.c has to be built.
 #define XXH_INLINE_ALL
