@@ -152,6 +152,29 @@ namespace OMW
         // Scratch for the readback display path. A member so the allocation is reused across frames
         // rather than churning a multi-megabyte buffer every frame.
         std::vector<unsigned char> mRemixReadback;
+        /// Accumulated cost of each stage of the Remix frame, in milliseconds, over the current reporting
+        /// window. Reset whenever the window is reported.
+        struct RemixTiming
+        {
+            unsigned int mFrames = 0;
+            double mFrameMs = 0.0;
+            double mSubmitMs = 0.0;
+            double mPresentMs = 0.0;
+            double mCopyMs = 0.0;
+            double mReadbackQueueMs = 0.0;
+            double mReadbackLockMs = 0.0;
+            double mReadbackCopyMs = 0.0;
+            double mWorstReadbackMs = 0.0;
+            double mOsgUpdateMs = 0.0;
+            double mOsgRenderMs = 0.0;
+        };
+        RemixTiming mRemixTiming;
+        /// Last frame's cost of OpenMW's own update and rendering traversals. Both are measured after the
+        /// Remix pump has already reported, so the accumulator picks them up one frame late -- irrelevant
+        /// over a 300-frame window, and the alternative is moving the report to the end of the frame where
+        /// it is further from the thing it describes.
+        double mRemixOsgUpdateMs = 0.0;
+        double mRemixRenderMs = 0.0;
         // Whether the Remix developer menu currently owns the mouse. Tracked so the pointer is released
         // on transitions only; doing it every frame re-warps the cursor and pins it again.
         bool mRemixMenuHasMouse = false;

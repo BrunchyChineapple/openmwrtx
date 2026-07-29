@@ -1,5 +1,6 @@
 #include "glinterop.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
 
@@ -602,11 +603,27 @@ namespace RemixRT
 
         if (fresh && !mReadbackUpload.empty())
         {
+            // Timed because this is the half of the readback cost nothing was accounting for. The
+            // GPU-to-CPU side is on the frame loop where it is at least visible; this one is on the draw
+            // thread, so it does not show up in the frame loop's own timings at all and can only be seen
+            // by measuring it here.
+            const auto start = std::chrono::steady_clock::now();
             glBindTexture(GL_TEXTURE_2D, mResources->readbackTexture);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(mResources->readbackWidth),
                 static_cast<GLsizei>(mResources->readbackHeight), kBgra, GL_UNSIGNED_BYTE,
                 mReadbackUpload.data());
             checkGl("glTexSubImage2D(readback)");
+            const auto end = std::chrono::steady_clock::now();
+
+            // Note this measures the driver call returning, not the transfer completing: glTexSubImage2D
+            // from client memory may copy into a staging buffer and return, leaving the upload to happen
+            // later. So this is a lower bound on the cost, and a large value here is conclusive while a
+            // small one is not.
+            mUploadNanoseconds.fetch_add(
+                static_cast<unsigned long long>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()),
+                std::memory_order_relaxed);
+            mUploadCount.fetch_add(1, std::memory_order_relaxed);
         }
 
         return mResources->readbackTexture;

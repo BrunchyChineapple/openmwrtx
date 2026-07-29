@@ -155,6 +155,21 @@ namespace RemixRT
         /// @param out resized to width * height * 4 on success.
         bool readOutputPixels(std::vector<unsigned char>& out, unsigned int& outWidth, unsigned int& outHeight);
 
+        /// Nanoseconds the last readOutputPixels spent in each of its three stages.
+        ///
+        /// Split three ways because the first measurement of this lumped them and drew the wrong
+        /// conclusion from it. \a queueNanoseconds is GetRenderTargetData, which merely queues the
+        /// transfer and returns almost immediately. \a lockNanoseconds is LockRect, which blocks until the
+        /// GPU has finished both the rendering being read and the transfer itself -- so it is a
+        /// synchronisation stall, and it was measured at over sixty milliseconds a frame at 4K.
+        /// \a copyNanoseconds is the row-by-row copy out of the mapped surface, pure host bandwidth, about
+        /// three milliseconds for a 4K frame.
+        ///
+        /// Keeping them apart is what distinguishes "stop copying so much" from "stop waiting", and only
+        /// the second one was ever worth real effort.
+        void lastReadbackSplit(unsigned long long& queueNanoseconds, unsigned long long& lockNanoseconds,
+            unsigned long long& copyNanoseconds) const;
+
         /// Reads the shared render target back to the CPU and logs whether anything in it is non-black.
         ///
         /// This is the only way to tell "Remix rendered nothing" apart from "Remix rendered something and

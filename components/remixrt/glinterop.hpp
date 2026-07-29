@@ -140,6 +140,16 @@ namespace RemixRT
         /// Called from the engine's frame loop on the main thread; consumed on the draw thread.
         void takeReadbackFrame(std::vector<unsigned char>& pixels, unsigned int width, unsigned int height);
 
+        /// Reads and clears the accumulated cost of uploading readback frames.
+        ///
+        /// Exists because this work happens on the draw thread and so is invisible to any timing the frame
+        /// loop does of itself. Written on the draw thread, read from the main thread.
+        void takeUploadCost(unsigned long long& nanoseconds, unsigned int& uploads) const
+        {
+            nanoseconds = mUploadNanoseconds.exchange(0, std::memory_order_acq_rel);
+            uploads = mUploadCount.exchange(0, std::memory_order_acq_rel);
+        }
+
     private:
         struct Resources;
 
@@ -166,6 +176,11 @@ namespace RemixRT
         std::atomic<bool> mSyncArmed{ false };
         mutable std::atomic<bool> mSignalled{ false };
         mutable std::atomic<bool> mSyncFailed{ false };
+        /// Nanoseconds accumulated in glTexSubImage2D, and how many uploads that covers. Integer
+        /// nanoseconds rather than a floating-point millisecond count because atomic<double> arithmetic is
+        /// a C++20 addition and this has to build wherever the rest of the engine does.
+        mutable std::atomic<unsigned long long> mUploadNanoseconds{ 0 };
+        mutable std::atomic<unsigned int> mUploadCount{ 0 };
         /// Diagnostic: drop the texture barrier from the semaphore operations, to tell a rejected
         /// semaphore apart from a rejected texture barrier. Read once at construction.
         bool mSkipTextureBarrier = false;

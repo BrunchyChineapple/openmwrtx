@@ -351,8 +351,12 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
     mStereoManager->updateSettings(Settings::camera().mNearClip, Settings::camera().mViewingDistance);
 
+    const auto beforeOsgUpdate = std::chrono::steady_clock::now();
     mViewer->eventTraversal();
     mViewer->updateTraversal();
+    mRemixOsgUpdateMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - beforeOsgUpdate)
+                            .count();
 
     // update focus object for GUI
     {
@@ -370,6 +374,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // first because the raytracing output that copyOutput reads only exists as a result of presenting.
     if (mRemix != nullptr && mRemix->isReady())
     {
+        const auto beforeSubmit = std::chrono::steady_clock::now();
         const osg::Camera* camera = mViewer->getCamera();
         // OSG stores these as doubles; the Remix API takes float[4][4]. Named locals so the pointers
         // outlive the call.
@@ -389,7 +394,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             // goes over as parameters rather than matrices, and geometry in the same units.
             cameraOk = mRemixScene->submit(mViewer->getSceneData(), *camera) > 0;
         }
+        const auto afterSubmit = std::chrono::steady_clock::now();
         const bool presentOk = mRemix->present();
+        const auto afterPresent = std::chrono::steady_clock::now();
 
         // Report whether the composite signalled Remix since the previous copy. Remix may only wait on
         // that semaphore when a matching signal genuinely happened: the pair is binary, so an unmatched
@@ -407,6 +414,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             || mRemixComposite->readbackMode();
         const bool copyOk
             = syncPointless ? mRemix->copyOutput() : mRemix->copyOutputSynced(consumerSignalled);
+        const auto afterCopy = std::chrono::steady_clock::now();
 
         // And symmetrically: the composite may only wait if a synchronised copy really was issued for
         // this frame, because waiting on an unsignalled semaphore is undefined in its own right.
@@ -548,6 +556,81 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             }
         }
 
+        // Where the frame actually goes.
+        //
+        // Averaged over a window and reported periodically rather than per frame, because a single frame
+        // says nothing: shader compilation, cell loading and the first few frames of any path-traced scene
+        // are all outliers, and one sample cannot be told apart from them. The maximum is carried
+        // alongside the mean for the same reason in reverse -- a mean that looks fine with a maximum ten
+        // times larger is a stutter, not a steady cost, and the two want different fixes.
+        //
+        // Everything here is wall time on the frame loop except the upload, which is charged to the draw
+        // thread. That distinction matters: work on the draw thread overlaps the next frame's simulation
+        // and only costs frame time once the draw thread is the critical path, so it cannot simply be
+        // added to the rest.
+        {
+            const auto ms = [](auto duration) {
+                return std::chrono::duration<double, std::milli>(duration).count();
+            };
+
+            mRemixTiming.mFrames += 1;
+            mRemixTiming.mSubmitMs += ms(afterSubmit - beforeSubmit);
+            mRemixTiming.mPresentMs += ms(afterPresent - afterSubmit);
+            mRemixTiming.mCopyMs += ms(afterCopy - afterPresent);
+            mRemixTiming.mFrameMs += frametime * 1000.0;
+            mRemixTiming.mOsgUpdateMs += mRemixOsgUpdateMs;
+            mRemixTiming.mOsgRenderMs += mRemixRenderMs;
+
+            unsigned long long queueNs = 0;
+            unsigned long long lockNs = 0;
+            unsigned long long copyNs = 0;
+            mRemix->lastReadbackSplit(queueNs, lockNs, copyNs);
+            const double readbackMs = static_cast<double>(queueNs + lockNs + copyNs) / 1.0e6;
+            mRemixTiming.mReadbackQueueMs += static_cast<double>(queueNs) / 1.0e6;
+            mRemixTiming.mReadbackLockMs += static_cast<double>(lockNs) / 1.0e6;
+            mRemixTiming.mReadbackCopyMs += static_cast<double>(copyNs) / 1.0e6;
+            mRemixTiming.mWorstReadbackMs = std::max(mRemixTiming.mWorstReadbackMs, readbackMs);
+
+            constexpr unsigned kTimingWindowFrames = 300;
+            if (mRemixTiming.mFrames >= kTimingWindowFrames)
+            {
+                const double frames = static_cast<double>(mRemixTiming.mFrames);
+                unsigned long long uploadNs = 0;
+                unsigned int uploads = 0;
+                if (mRemixComposite != nullptr)
+                    mRemixComposite->takeUploadCost(uploadNs, uploads);
+                const double uploadMs
+                    = uploads > 0 ? static_cast<double>(uploadNs) / 1.0e6 / uploads : 0.0;
+
+                const double submit = mRemixTiming.mSubmitMs / frames;
+                const double present = mRemixTiming.mPresentMs / frames;
+                const double readbackQueue = mRemixTiming.mReadbackQueueMs / frames;
+                const double readbackLock = mRemixTiming.mReadbackLockMs / frames;
+                const double readbackCopy = mRemixTiming.mReadbackCopyMs / frames;
+                const double osgUpdate = mRemixTiming.mOsgUpdateMs / frames;
+                const double osgRender = mRemixTiming.mOsgRenderMs / frames;
+                const double frame = mRemixTiming.mFrameMs / frames;
+                // What is left after everything measured. A large remainder means the budget is wrong and
+                // the next thing to do is measure, not optimise -- which is exactly the mistake the first
+                // pass at this made by assuming the readback dominated.
+                const double accounted = submit + present + (mRemixTiming.mCopyMs / frames) + readbackQueue
+                    + readbackLock + readbackCopy + osgUpdate + osgRender;
+
+                Log(Debug::Info) << "Remix frame cost over " << mRemixTiming.mFrames
+                                 << " frames, mean ms: frame " << frame << " | OpenMW update " << osgUpdate
+                                 << " | OpenMW render " << osgRender << " | scene submit " << submit
+                                 << " | present " << present << " | copy to shared "
+                                 << (mRemixTiming.mCopyMs / frames) << " | readback queue " << readbackQueue
+                                 << " | readback lock (GPU wait) " << readbackLock << " | readback copy "
+                                 << readbackCopy << " | upload CPU->GPU " << uploadMs << " (draw thread, "
+                                 << uploads << " uploads); worst single readback "
+                                 << mRemixTiming.mWorstReadbackMs
+                                 << "; accounted " << accounted << " of " << frame << " ("
+                                 << (frame > 0.0 ? 100.0 * accounted / frame : 0.0) << "%)";
+                mRemixTiming = RemixTiming{};
+            }
+        }
+
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
         // the difference between "Remix rendered black" and "Remix was never asked to render", and
         // guessing between those wastes far more time than one log line costs.
@@ -589,7 +672,19 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             mRemix->probeOutputNonBlack();
     }
 
+    // The suspected bulk of the frame, and the reason it is worth measuring separately: OpenMW still
+    // renders the whole world in OpenGL here, at the window resolution, with its own shadow maps and
+    // view distance -- and the composite then overwrites the result with Remix's image. If that is where
+    // the time is going, the scene is being paid for twice and one copy is discarded.
+    //
+    // Note this includes the draw dispatch but not necessarily the GPU finishing: with a separate draw
+    // thread, work can still be in flight when this returns. So a large number here is conclusive and a
+    // small one is not, same caveat as the texture upload.
+    const auto beforeRender = std::chrono::steady_clock::now();
     mViewer->renderingTraversals();
+    mRemixRenderMs
+        = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeRender)
+              .count();
 
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
 
