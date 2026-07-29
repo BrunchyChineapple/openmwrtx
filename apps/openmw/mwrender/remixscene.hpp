@@ -101,13 +101,20 @@ namespace MWRender
             /// blending and no test at all, and a path tracer has to be told to make a cutout out of it
             /// -- see materialFor. Without this, alpha-blended leaves come through as solid polygons.
             bool mAlphaBlend = false;
-        /// Whether the surface blends ADDITIVELY, i.e. its blend function has a destination factor of
-        /// GL_ONE and so can only ever brighten what is behind it.
-        ///
-        /// This is the difference between a flame and a smoke plume, and it cannot be inferred from
-        /// mAlphaBlend -- both are blended, and Morrowind uses the same particle machinery for both. An
-        /// additive surface is emissive by construction; an alpha-blended one occludes and must be lit.
-        bool mAdditive = false;
+            /// Whether the surface blends ADDITIVELY, i.e. its blend function has a destination factor of
+            /// GL_ONE and so can only ever brighten what is behind it.
+            ///
+            /// This is the difference between a flame and a smoke plume, and it cannot be inferred from
+            /// mAlphaBlend -- both are blended, and Morrowind uses the same particle machinery for both. An
+            /// additive surface is emissive by construction; an alpha-blended one occludes and must be lit.
+            bool mAdditive = false;
+            /// Whether this surface wants real order-independent transparency instead of the cutout that
+            /// materialFor otherwise substitutes for alpha blending.
+            ///
+            /// The substitution is right for foliage and wrong for particles, and nothing about the state
+            /// set distinguishes the two -- both arrive as "blend on, no alpha test". So the caller that
+            /// knows which it is has to say so, which in practice means the particle path sets this.
+            bool mPreferBlend = false;
             /// The 2D affine part of unit 0's texture matrix, as
             /// { m00, m01, m10, m11, m30, m31 }, applied to texcoords as a row vector.
             ///

@@ -925,7 +925,8 @@ namespace RemixRT
 
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
-        unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive)
+        unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
+        int blendType)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -952,6 +953,17 @@ namespace RemixRT
         // invisible. kAlways when no cutout is wanted, kGreater when one is.
         opaque.alphaTestType = alphaTestReference != 0 ? 4 /* kGreater */ : 7 /* kAlways */;
         opaque.alphaReferenceValue = alphaTestReference;
+        if (blendType >= 0)
+        {
+            // blendType_hasvalue is what actually enables blending, not merely a presence flag: the runtime
+            // feeds it straight into the opaque material's BlendEnabled and takes BlendType from the value
+            // beside it. Left false, the value is ignored entirely.
+            opaque.blendType_hasvalue = 1;
+            opaque.blendType_value = blendType;
+            // Not inverted. The inverted forms are for draw calls with the factors the other way round
+            // (ONE_MINUS_SRC_ALPHA as the source), which nothing here produces.
+            opaque.invertedBlend = 0;
+        }
 
         remixapi_MaterialInfo material = {};
         material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;

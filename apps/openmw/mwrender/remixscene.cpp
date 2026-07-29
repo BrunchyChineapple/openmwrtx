@@ -165,18 +165,18 @@ namespace
     /// rather than merely looking too bright.
     constexpr float kParticleEmissive = 6.0f;
 
-    /// Cutout threshold for particles, far below the one used for foliage.
+    /// Remix BlendType values, from BlendType in the runtime's surface_shared.h.
     ///
-    /// The blend-to-cutout substitution in materialFor exists for foliage, where the alpha channel is
-    /// effectively binary -- a leaf texel is either leaf or gap -- and half way is the right place to split
-    /// it. Particles are the opposite: smoke, fog and dust are soft all the way through, with most of the
-    /// puff sitting well below half alpha. Cutting those at 128 discards nearly the whole effect, which is
-    /// why flames appeared as soon as particles were submitted while smoke did not -- a flame is bright and
-    /// mostly opaque, so it survived the same threshold that erased the smoke around it.
-    ///
-    /// Low rather than zero, because a threshold of zero keeps the fully transparent border of every
-    /// particle quad and hands the path tracer a scene full of invisible squares to intersect.
-    constexpr unsigned char kParticleAlphaTestReference = 8;
+    /// Passed as plain ints because the enum lives in a shader-shared header the API does not export. The
+    /// two used here are the ones the runtime itself derives from the D3D9 blend factors Morrowind's
+    /// particles amount to: kAlpha for SRC_ALPHA/ONE_MINUS_SRC_ALPHA, kAlphaEmissive for SRC_ALPHA/ONE.
+    /// Naming them after that derivation rather than after the effect keeps the mapping checkable against
+    /// InstanceManager::calculateAlphaState, which is the only place the meaning is actually defined.
+    constexpr int kBlendTypeAlpha = 0;
+    constexpr int kBlendTypeAlphaEmissive = 1;
+
+    /// Sentinel for createTexturedMaterial's blend type meaning "do not blend at all".
+    constexpr int kBlendTypeNone = -1;
 
     /// Distance at which \a light has faded to imperceptibility, by the runtime's own derivation.
     ///
@@ -709,10 +709,20 @@ namespace
                 MWRender::RemixScene::SurfaceState particleSurface = currentSurface();
                 if (const osg::StateSet* stateSet = drawable.getStateSet())
                     mergeState(*stateSet, particleSurface);
-                // Stated explicitly so it wins over the blend-to-cutout substitution, which is calibrated
-                // for foliage and erases soft particles outright. See kParticleAlphaTestReference.
-                particleSurface.mAlphaTestReference = kParticleAlphaTestReference;
-                particleSurface.mAlphaBlend = false;
+                // Particles get real transparency rather than the cutout materialFor substitutes for
+                // blending. That substitution is calibrated for foliage, whose alpha is effectively binary,
+                // and particles are the opposite case: smoke, fog and dust are soft the whole way through,
+                // with most of the puff below half alpha. Any threshold either erases the effect or leaves
+                // it as discrete blobs with visibly hard edges.
+                //
+                // It also cost more than the edges. The runtime only sets its own isParticle flag inside
+                // the branch where blending is enabled -- see InstanceManager::calculateAlphaState -- so a
+                // cutout particle was never treated as a particle at all, whatever category it was tagged
+                // with, and never reached the unordered TLAS where transparency accumulates.
+                //
+                // mAlphaBlend and mAdditive are deliberately left to mergeState, which reads the actual
+                // BlendFunc. A particle system that genuinely is not blended should stay opaque.
+                particleSurface.mPreferBlend = true;
                 mScene.submitParticles(*particles, particleSurface, mMatrix, mRight, mUp,
                     currentCategories() | categoriesFor(drawable.getNodeMask()));
                 return;
@@ -1744,9 +1754,27 @@ namespace MWRender
         // cannot see API-submitted geometry, so the choice has to be made here.
         //
         // An explicit test always wins: a mesh that asked for a threshold gets the one it asked for.
+        //
+        // Unless the caller asked for real transparency instead, which is what mPreferBlend means. Then the
+        // substitution is skipped and the blend mode is handed to the runtime as the material's own blend
+        // state. Blending has to come from the material rather than from a per-instance
+        // InstanceInfoBlendEXT, because that extension is only consulted when the material sets
+        // useDrawCallAlphaState, and turning that on would route alpha testing through the legacy
+        // draw-call path too -- where an API host has no legacy draw call to supply it.
         unsigned char alphaTestReference = surface.mAlphaTestReference;
-        if (alphaTestReference == 0 && surface.mAlphaBlend)
+        int blendType = kBlendTypeNone;
+        if (surface.mPreferBlend && surface.mAlphaBlend)
+        {
+            // Additive gets the emissive blend type, which is the same translation the runtime applies to a
+            // legacy SRC_ALPHA/ONE draw call. Note this stacks with the emissive term materialFor is handed
+            // for additive particles: if flames come out blown, that term is the one to drop, since the
+            // blend type now carries the "this glows" half of it.
+            blendType = surface.mAdditive ? kBlendTypeAlphaEmissive : kBlendTypeAlpha;
+        }
+        else if (alphaTestReference == 0 && surface.mAlphaBlend)
+        {
             alphaTestReference = mBlendCutout;
+        }
 
         // Surface response, classified from the texture's own path. See kSurfaceRules for why the name is
         // the only source available and what that costs in confidence.
@@ -1769,6 +1797,10 @@ namespace MWRender
             key = (key ^ value) * 0x100000001B3ull;
         };
         mix(alphaTestReference);
+        // Offset so kBlendTypeNone does not mix in as the same value as kBlendTypeAlpha would after being
+        // widened to unsigned. Without it a blended and a non-blended material sharing everything else
+        // would collide on one cache entry, and whichever was built first would win for both.
+        mix(static_cast<unsigned long long>(blendType + 1));
         mix(normalHash);
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
@@ -1784,6 +1816,11 @@ namespace MWRender
         if (mMaterialsLogged < kMaterialLogLimit)
         {
             ++mMaterialsLogged;
+            const std::string transparencyDescription = blendType == kBlendTypeAlphaEmissive
+                ? std::string("blend additive")
+                : (blendType == kBlendTypeAlpha
+                        ? std::string("blend alpha")
+                        : "cutout " + std::to_string(static_cast<unsigned int>(alphaTestReference)));
             const unsigned long long cacheKey
                 = (reinterpret_cast<unsigned long long>(image) << 1) | 1ull;
             const auto found = mTextures.find(cacheKey);
@@ -1791,16 +1828,16 @@ namespace MWRender
                              << " " << image->s() << "x" << image->t() << " "
                              << (found != mTextures.end() ? found->second.mFormat : "?") << "; alphaTest "
                              << static_cast<unsigned int>(surface.mAlphaTestReference) << " blend "
-                             << (surface.mAlphaBlend ? "yes" : "no") << " -> cutout "
-                             << static_cast<unsigned int>(alphaTestReference) << "; rule "
+                             << (surface.mAlphaBlend ? "yes" : "no") << " -> " << transparencyDescription
+                             << "; rule "
                              << (rule != nullptr ? rule->mPattern : "(none, default)") << " roughness "
                              << roughness << " metallic " << metallic << "; normal map "
                              << (normalHash != 0 ? "yes" : "no")
                              << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
         }
 
-        const unsigned long long handle = mRuntime.createTexturedMaterial(
-            key | 1ull, textureHash, roughness, metallic, alphaTestReference, normalHash, emissive);
+        const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
+            metallic, alphaTestReference, normalHash, emissive, blendType);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.

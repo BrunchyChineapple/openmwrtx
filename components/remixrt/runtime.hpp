@@ -342,9 +342,17 @@ namespace RemixRT
         /// @param emissive radiance multiplier for self-lit surfaces, taking the albedo texture as the
         ///        emissive colour. Zero for an ordinary surface. Needed for particles: a flame is a
         ///        light source, and a path tracer given a non-emissive flame quad renders grey cardboard.
+        /// @param blendType Remix BlendType to give the surface real order-independent transparency, or a
+        ///        negative value to leave it unblended. Zero is kAlpha and one is kAlphaEmissive; the full
+        ///        list is BlendType in the runtime's surface_shared.h, which the API does not export, hence
+        ///        an int. Blending has to be set on the material because the per-instance
+        ///        InstanceInfoBlendEXT alternative is only read when the material sets useDrawCallAlphaState,
+        ///        which also diverts alpha testing to the legacy draw call an API host does not have.
+        ///        Needed for particles: a cutout leaves smoke as hard-edged blobs, and the runtime only
+        ///        treats an instance as a particle at all when its blending is enabled.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
-            unsigned long long normalTextureHash = 0, float emissive = 0.0f);
+            unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///
