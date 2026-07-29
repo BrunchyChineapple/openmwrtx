@@ -24,6 +24,11 @@ namespace SceneUtil
     class RigGeometry;
 }
 
+namespace osgParticle
+{
+    class ParticleSystem;
+}
+
 namespace MWRender
 {
     /// Feeds OpenMW's scene graph to the Remix runtime, one frame at a time.
@@ -138,6 +143,20 @@ namespace MWRender
         /// Public for the same reason as submitGeometry: the traversal lives in the .cpp.
         void submitLight(const SceneUtil::LightSource& source, double x, double y, double z);
 
+        /// Turns one particle system into camera-facing quads and submits them.
+        ///
+        /// Separate from submitGeometry because a particle system has no geometry to cache: osgParticle
+        /// builds its quads during drawing and they differ every frame, so the mesh is rebuilt rather
+        /// than reused.
+        ///
+        /// @param localToWorld the accumulated transform at the drawable, applied only when the system's
+        ///        particles are in local coordinates. Some are already in world space.
+        /// @param cameraRight world-space camera right, for orienting the quads.
+        /// @param cameraUp world-space camera up.
+        void submitParticles(const osgParticle::ParticleSystem& particles, const SurfaceState& surface,
+            const osg::Matrixd& localToWorld, const osg::Vec3f& cameraRight, const osg::Vec3f& cameraUp,
+            unsigned int categoryFlags);
+
     private:
         /// Submits a self-lit quad a fixed distance in front of the camera.
         ///
@@ -202,6 +221,23 @@ namespace MWRender
         /// Releases lights not submitted this frame.
         void releaseStaleLights();
 
+        /// Releases particle meshes whose system was not submitted this frame.
+        void releaseStaleParticleMeshes();
+
+        /// One particle system's mesh, rebuilt every frame it is visible.
+        struct ParticleMesh
+        {
+            unsigned long long mHandle = 0;
+            unsigned long long mMaterial = 0;
+            std::uint64_t mLastUsedFrame = 0;
+        };
+        /// Keyed by particle system address. Unlike mMeshes this is never a cache hit -- the contents
+        /// change every frame -- so the entry exists only to hold the handle that has to be destroyed
+        /// before the replacement is created, and to notice when a system stops being submitted.
+        std::unordered_map<const void*, ParticleMesh> mParticleMeshes;
+        /// Particles submitted on the last call to submit(), for the report line.
+        unsigned int mLastParticleCount = 0;
+
         /// Converts and caches \a geometry against \a material, returning its mesh handle, or 0.
         unsigned long long meshFor(osg::Geometry& geometry, unsigned long long material,
             const SurfaceState& surface, const SceneUtil::RigGeometry* rig);
@@ -214,7 +250,9 @@ namespace MWRender
 
         /// Resolves \a surface to a material handle, uploading its texture on first use.
         /// Falls back to the untextured default material rather than dropping the drawable.
-        unsigned long long materialFor(const SurfaceState& surface);
+        ///
+        /// @param emissive radiance scale for a self-lit surface. Non-zero only for particles.
+        unsigned long long materialFor(const SurfaceState& surface, float emissive = 0.0f);
 
         /// Uploads \a image, returning the texture hash to reference it by, or 0 if unusable.
         ///
@@ -251,7 +289,10 @@ namespace MWRender
         /// environment once at construction so they can be tuned without a rebuild; Remix's own light
         /// options act on its legacy conversion path and cannot reach lights created through the API.
         float mLightRadius = 0.0f;
-        float mLightPower = 0.0f;
+        /// Mirrors rtx.lightConversionIntensityFactor, which the runtime applies to the lights it converts
+        /// itself. Applied here for the same reason and with the same default, so API lights and legacy
+        /// ones respond to tuning the same way.
+        float mLightIntensityFactor = 0.0f;
         /// Threshold an alpha-blended surface is cut out at when it asks for no explicit test.
         /// Environment-tunable so foliage can be dialled in without a rebuild; 0 disables the
         /// substitution and leaves blended surfaces solid.
@@ -261,6 +302,10 @@ namespace MWRender
         /// dozen the player walks into.
         unsigned int mMaterialsLogged = 0;
         static constexpr unsigned int kMaterialLogLimit = 48;
+        /// Same idea for lights, and a smaller sample: the interesting question is whether the derivation
+        /// produces sane radiance for a real attenuation curve, and a dozen answers that in one glance.
+        unsigned int mLightsLogged = 0;
+        static constexpr unsigned int kLightLogLimit = 12;
         /// World-space extent of the instance origins submitted this frame. Logged next to the camera
         /// position, because "geometry is nowhere near the camera" and "geometry is right there but not
         /// being rendered" are different problems and the instance count alone cannot tell them apart.

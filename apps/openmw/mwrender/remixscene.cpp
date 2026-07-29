@@ -23,6 +23,9 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
+#include <osgParticle/Particle>
+#include <osgParticle/ParticleSystem>
+
 #include <components/sceneutil/morphgeometry.hpp>
 #include <components/sceneutil/riggeometry.hpp>
 #include <components/sceneutil/texturetype.hpp>
@@ -96,7 +99,96 @@ namespace
     /// attenuation curve evaluated per vertex with no defined relationship to radiometric units. It is
     /// chosen to preserve the brightness the previous radius produced, so this change alters shadow
     /// sharpness and light leakage without altering exposure.
-    constexpr float kLightPowerDefault = 160000.0f;
+    /// Radiance a converted light is expected to have fallen to at the far end of its reach.
+    ///
+    /// Matches kNewLightEndValue in the runtime's rtx_lights.h. It is the threshold the conversion solves
+    /// against, so it has to be the same number on both sides or lights submitted through the API land in
+    /// a different range from lights the runtime converts itself.
+    constexpr float kLightEndValue = 0.01f;
+
+    /// Default for OPENMW_REMIX_LIGHT_INTENSITY, mirroring rtx.lightConversionIntensityFactor.
+    ///
+    /// Duplicated rather than read back from the runtime because the API exposes no getter for an option,
+    /// which means the two can drift. Kept at the same default so they agree until someone changes one.
+    constexpr float kLightIntensityFactorDefault = 0.65f;
+
+    /// The attenuation value a legacy light is considered to have faded out at, 1/255.
+    ///
+    /// Matches kLegacyLightEndValue in the runtime. One part in 255 is where an eight-bit framebuffer can
+    /// no longer represent the contribution, which is what makes it the point the original game's lighting
+    /// effectively stopped.
+    constexpr float kLegacyLightEndValue = 1.0f / 255.0f;
+
+    /// Emissive radiance scale for particle quads.
+    ///
+    /// Particles are self-lit rather than shaded. Morrowind's are overwhelmingly flames, glows, sparks and
+    /// magic, all of which emit; the exceptions -- smoke, fog, dust -- are the minority, and a smoke puff
+    /// that glows faintly is a far smaller error than a flame rendered as grey cardboard, which is what a
+    /// path tracer produces from a non-emissive quad. Distinguishing the two properly means reading the
+    /// blend equation and deciding additive from alpha, which is worth doing once particles are on screen
+    /// and can be judged.
+    constexpr float kParticleEmissive = 6.0f;
+
+    /// Cutout threshold for particles, far below the one used for foliage.
+    ///
+    /// The blend-to-cutout substitution in materialFor exists for foliage, where the alpha channel is
+    /// effectively binary -- a leaf texel is either leaf or gap -- and half way is the right place to split
+    /// it. Particles are the opposite: smoke, fog and dust are soft all the way through, with most of the
+    /// puff sitting well below half alpha. Cutting those at 128 discards nearly the whole effect, which is
+    /// why flames appeared as soon as particles were submitted while smoke did not -- a flame is bright and
+    /// mostly opaque, so it survived the same threshold that erased the smoke around it.
+    ///
+    /// Low rather than zero, because a threshold of zero keeps the fully transparent border of every
+    /// particle quad and hands the path tracer a scene full of invisible squares to intersect.
+    constexpr unsigned char kParticleAlphaTestReference = 8;
+
+    /// Distance at which \a light has faded to imperceptibility, by the runtime's own derivation.
+    ///
+    /// This is the number the radiance conversion needs, and it is emphatically not the light's radius.
+    /// OpenMW's radius is the cutoff for which objects are lit; the attenuation curve keeps going well past
+    /// it. Remix says as much in LightUtils::calculateIntensity -- "the calculated max distance may be
+    /// greater than the Light's original Range value" -- because older games used a small range with a
+    /// deliberately bright colour and a slow curve as a culling optimisation, and the physical light has to
+    /// reflect the curve rather than the cull distance. Using the radius directly made every light roughly
+    /// thirty times too dim, and worse, too dim by a radius-dependent amount.
+    ///
+    /// The five-sample least-squares fit is Remix's leastSquareIntensity rather than its closed-form
+    /// solver, and that choice matters for Morrowind specifically. Solving `brightness / (a d^2 + b d + c)
+    /// = 1/255` exactly is fine for an inverse-square curve, but Morrowind's default falloff is *linear*,
+    /// and a linear curve reaches 1/255 only at an absurd distance -- of the order of twenty thousand units
+    /// for a lantern, which then squares into a radiance in the millions. Fitting an inverse-square curve
+    /// over the light's actual range instead gives a distance that reflects where the light really stops
+    /// mattering.
+    float lightEndDistance(const osg::Light& light, float range, float brightness)
+    {
+        const double a = light.getQuadraticAttenuation();
+        const double b = light.getLinearAttenuation();
+        const double c = light.getConstantAttenuation();
+
+        // Fit intensity/d^2 to brightness/(a*d^2 + b*d + c) over five samples across the range, choosing
+        // the intensity that minimises the squared error. Double precision because the 1/d^4 term spans
+        // several orders of magnitude across the samples and loses badly in single.
+        constexpr int kSamples = 5;
+        double numerator = 0.0;
+        double denominator = 0.0;
+        for (int i = 1; i <= kSamples; ++i)
+        {
+            const double distance = static_cast<double>(i) / kSamples * range;
+            const double distanceSq = distance * distance;
+            const double attenuation = a * distanceSq + b * distance + c;
+            if (!(attenuation > 0.0) || !(distanceSq > 0.0))
+                continue;
+            numerator += (brightness / attenuation) / distanceSq;
+            denominator += 1.0 / (distanceSq * distanceSq);
+        }
+
+        // No usable samples means the attenuation is degenerate -- all zero, which is a light that never
+        // falls off. The range is the only defensible answer left.
+        if (!(denominator > 0.0) || !(numerator > 0.0))
+            return range;
+
+        return static_cast<float>(std::sqrt((numerator / denominator) / kLegacyLightEndValue));
+    }
 
     /// Smallest change in a light's position that justifies recreating it, in OpenMW units.
     ///
@@ -437,10 +529,13 @@ namespace
     class SubmitVisitor : public osg::NodeVisitor
     {
     public:
-        SubmitVisitor(MWRender::RemixScene& scene, unsigned int skipMask, const osg::Vec3f& eye)
+        SubmitVisitor(MWRender::RemixScene& scene, unsigned int skipMask, const osg::Vec3f& eye,
+            const osg::Vec3f& right, const osg::Vec3f& up)
             : osg::NodeVisitor(osg::NodeVisitor::TRAVERSE_ACTIVE_CHILDREN)
             , mScene(scene)
             , mEye(eye)
+            , mRight(right)
+            , mUp(up)
         {
             // The traversal mask is the whole mask mechanism as far as this visitor is concerned. OSG
             // tests traversalMask & nodeMask in Node::accept, so a subgraph masked exclusively as GUI or
@@ -563,6 +658,29 @@ namespace
             auto* rig = dynamic_cast<SceneUtil::RigGeometry*>(&drawable);
             if (rig != nullptr)
                 geometry = rig->getSourceGeometry().get();
+
+            // Particles, the third Drawable that is not a Geometry, and the last of the invisible ones.
+            //
+            // osgParticle::ParticleSystem derives from osg::Drawable and builds its quads on the fly in
+            // drawImplementation, so there is no geometry to find and the traversal dropped it -- the same
+            // way it dropped RigGeometry. Every flame, smoke plume, fog effect and spell effect in the game
+            // went missing this way, which is why candles had no flame and chimneys no smoke.
+            //
+            // Handled separately rather than through the geometry path because a particle system has to be
+            // turned into geometry first, and that geometry is different every frame.
+            if (auto* particles = dynamic_cast<osgParticle::ParticleSystem*>(&drawable))
+            {
+                MWRender::RemixScene::SurfaceState particleSurface = currentSurface();
+                if (const osg::StateSet* stateSet = drawable.getStateSet())
+                    mergeState(*stateSet, particleSurface);
+                // Stated explicitly so it wins over the blend-to-cutout substitution, which is calibrated
+                // for foliage and erases soft particles outright. See kParticleAlphaTestReference.
+                particleSurface.mAlphaTestReference = kParticleAlphaTestReference;
+                particleSurface.mAlphaBlend = false;
+                mScene.submitParticles(*particles, particleSurface, mMatrix, mRight, mUp,
+                    currentCategories() | categoriesFor(drawable.getNodeMask()));
+                return;
+            }
 
             // Morph geometry, the other Drawable that hides a Geometry, is submitted in its base pose.
             //
@@ -811,6 +929,11 @@ namespace
 
         MWRender::RemixScene& mScene;
         osg::Vec3f mEye;
+        /// Camera right and up in world space, for building camera-facing particle quads. A particle has a
+        /// position and a size but no orientation, so the quad has to be oriented against the viewer, and
+        /// that cannot be derived from the scene graph.
+        osg::Vec3f mRight;
+        osg::Vec3f mUp;
         osg::Matrix mMatrix;
         std::vector<unsigned int> mCategoryStack;
         std::vector<MWRender::RemixScene::SurfaceState> mSurfaceStack;
@@ -854,12 +977,13 @@ namespace MWRender
                          << "/255 (OPENMW_REMIX_BLEND_CUTOUT=0 leaves them solid)";
 
         mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", kLightRadiusDefault);
-        mLightPower = envFloat("OPENMW_REMIX_LIGHT_POWER", kLightPowerDefault);
+        mLightIntensityFactor
+            = envFloat("OPENMW_REMIX_LIGHT_INTENSITY", kLightIntensityFactorDefault);
         Log(Debug::Info) << "Remix scene: light emitter radius " << mLightRadius
-                         << " units, radiance at that radius "
-                         << (mLightPower / (mLightRadius * mLightRadius))
-                         << " per unit of OpenMW light colour (OPENMW_REMIX_LIGHT_RADIUS and "
-                            "OPENMW_REMIX_LIGHT_POWER override both)";
+                         << " units, intensity factor " << mLightIntensityFactor
+                         << " (OPENMW_REMIX_LIGHT_RADIUS and OPENMW_REMIX_LIGHT_INTENSITY override both; "
+                            "the latter mirrors rtx.lightConversionIntensityFactor). Radiance is derived "
+                            "per light from where its attenuation curve fades out, not from its radius";
 
         // Water. The transmittance distance is in OpenMW units, which is why it looks large: one metre
         // is about seventy of them, so this absorbs over roughly four metres of depth. Morrowind's water
@@ -944,20 +1068,63 @@ namespace MWRender
 
         const osg::Vec4f& diffuse = light->getDiffuse();
 
+        // Radiance derived from the light's own reach, using the runtime's conversion rather than a
+        // constant.
+        //
+        // The previous version multiplied a fixed power by the light's colour, which is wrong in two
+        // separate ways and produced sphere lights of around 30000 intensity where a candle wants tens.
+        //
+        // First, brightness has to come from how far the light reaches, not from a global constant. Remix
+        // derives it in LightUtils::calculateIntensity by asking what radiance a sphere emitter of a given
+        // size needs in order to fall to a just-perceptible threshold at the original light's end
+        // distance:
+        //
+        //   radiance = endValue * endDistance^2 * intensityFactor / (pi * emitterRadius^2)
+        //
+        // A candle and a bonfire then differ by the square of their reach, which is the whole point --
+        // with a constant they came out identical.
+        //
+        // Second, the colour is normalised to its largest component and the brightness carried entirely by
+        // the intensity, which is what LightUtils::calculateRadiance does. Multiplying radiance by the raw
+        // colour instead makes a deep red light dimmer than a white one of the same reach, when what the
+        // colour is meant to describe is hue.
+        //
+        // Following the same formula matters beyond just being less wrong: it is what the legacy D3D9 path
+        // does, so lights here land in the same range as the ones RTXremixMW's MGE-XE setup produces, and
+        // rtx.lightConversionIntensityFactor tunes both the same way.
+        const float range = source.getRadius();
+        const float brightest = std::max({ diffuse.r(), diffuse.g(), diffuse.b() });
+        if (!(range > 0.0f) || !(brightest > 0.0f))
+            return;
+
+        const float endDistance = lightEndDistance(*light, range, brightest);
+
         // Actor fade is OpenMW's way of dimming a carried light as its owner fades out. Ignoring it
         // leaves lights at full strength on invisible actors.
         const float fade = source.getActorFade();
-        // Power divided by radius squared, so the emitter size and the brightness stay independent.
-        const float scale
-            = (mLightPower / (mLightRadius * mLightRadius)) * (fade > 0.0f ? fade : 1.0f);
-
-        const float radiance[3]
-            = { diffuse.r() * scale, diffuse.g() * scale, diffuse.b() * scale };
-        if (radiance[0] <= 0.0f && radiance[1] <= 0.0f && radiance[2] <= 0.0f)
+        const float intensity = kLightEndValue * endDistance * endDistance * mLightIntensityFactor
+            / (osg::PI * mLightRadius * mLightRadius) * (fade > 0.0f ? fade : 1.0f);
+        if (!(intensity > 0.0f))
             return;
+
+        const float radiance[3] = { diffuse.r() / brightest * intensity,
+            diffuse.g() / brightest * intensity, diffuse.b() / brightest * intensity };
 
         const float position[3]
             = { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
+
+        // A handful of real lights, described once. The conversion depends on the attenuation curve as much
+        // as on the radius, so a formula in the log says very little about whether the numbers are sane --
+        // and "the Toolkit says 30000, is that a lot" was the question that found the last two bugs here.
+        if (mLightsLogged < kLightLogLimit)
+        {
+            ++mLightsLogged;
+            Log(Debug::Info) << "Remix light " << mLightsLogged << ": radius " << range
+                             << " units, attenuation " << light->getConstantAttenuation() << " + "
+                             << light->getLinearAttenuation() << "d + " << light->getQuadraticAttenuation()
+                             << "d^2 -> fades out at " << endDistance << " units -> radiance " << intensity
+                             << (mLightsLogged == kLightLogLimit ? " (last of these)" : "");
+        }
 
         const int key = source.getId();
         auto found = mLights.find(key);
@@ -1093,6 +1260,7 @@ namespace MWRender
         mLastLightCount = 0;
         mSkinnedInstances = 0;
         mSkinnedDropped = 0;
+        mLastParticleCount = 0;
         mHaveExtent = false;
         if (sceneRoot == nullptr || mDefaultMaterial == 0)
             return 0;
@@ -1158,7 +1326,10 @@ namespace MWRender
 
         SubmitVisitor visitor(*this, skipMask,
             osg::Vec3f(static_cast<float>(eye.x()), static_cast<float>(eye.y()),
-                static_cast<float>(eye.z())));
+                static_cast<float>(eye.z())),
+            osg::Vec3f(static_cast<float>(right.x()), static_cast<float>(right.y()),
+                static_cast<float>(right.z())),
+            osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())));
         sceneRoot->accept(visitor);
         mLastInstanceCount = visitor.instances();
 
@@ -1173,6 +1344,7 @@ namespace MWRender
 
         evictStaleMeshes();
         releaseStaleLights();
+        releaseStaleParticleMeshes();
 
         // Log the first submission, and then again whenever the scene goes from empty to populated or
         // back. A one-shot on frame 1 was actively misleading: the first frame happens before the world
@@ -1187,7 +1359,8 @@ namespace MWRender
                              << mMeshes.size() << " meshes, " << mLastLightCount << " lights and "
                              << mTexturesUploaded << " textures; " << mSkinnedInstances
                              << " instances were skinned and " << mSkinnedDropped
-                             << " skins were not ready"
+                             << " skins were not ready; " << mLastParticleCount << " particles from "
+                             << mParticleMeshes.size() << " systems"
                              << "; camera eye " << eye.x() << ", " << eye.y()
                              << ", " << eye.z() << " looking " << forward.x() << ", " << forward.y()
                              << ", " << forward.z() << " up " << up.x() << ", " << up.y() << ", "
@@ -1417,7 +1590,7 @@ namespace MWRender
         return hash;
     }
 
-    unsigned long long RemixScene::materialFor(const SurfaceState& surface)
+    unsigned long long RemixScene::materialFor(const SurfaceState& surface, float emissive)
     {
         // Water before any texture consideration. OpenMW's water is a shader effect -- its texture units
         // hold a normal map and render targets, none of which is an albedo -- so whatever is bound there
@@ -1476,6 +1649,7 @@ namespace MWRender
         mix(normalHash);
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
+        mix(static_cast<unsigned long long>(emissive * 16.0f + 0.5f));
 
         if (auto found = mMaterials.find(key); found != mMaterials.end())
             return found->second;
@@ -1503,7 +1677,7 @@ namespace MWRender
         }
 
         const unsigned long long handle = mRuntime.createTexturedMaterial(
-            key | 1ull, textureHash, roughness, metallic, alphaTestReference, normalHash);
+            key | 1ull, textureHash, roughness, metallic, alphaTestReference, normalHash, emissive);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
@@ -1563,6 +1737,129 @@ namespace MWRender
         if (mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided,
                 mBoneTransformScratch.data(), boneCount))
             ++mSkinnedInstances;
+    }
+
+    void RemixScene::submitParticles(const osgParticle::ParticleSystem& particles,
+        const SurfaceState& surface, const osg::Matrixd& localToWorld, const osg::Vec3f& cameraRight,
+        const osg::Vec3f& cameraUp, unsigned int categoryFlags)
+    {
+        const int count = particles.numParticles();
+        if (count <= 0)
+            return;
+
+        // Whether the particles are already in world space, by the same test OpenMW itself uses.
+        //
+        // osgParticle::ParticleSystem has no getReferenceFrame(), so NifOsg::Loader records the answer by
+        // pushing the string "worldspace" onto the drawable's user data container when the NIF asked for
+        // absolute placement, and Resource::SceneManager reads it back the same way. Duplicated here rather
+        // than shared because that helper is file-local, but it has to agree: applying the node transform to
+        // particles that are already in world coordinates transforms them twice, which throws every effect
+        // across the cell and does it worse the further the emitter is from the origin.
+        const osg::UserDataContainer* userData = particles.getUserDataContainer();
+        const bool worldSpace = userData != nullptr && userData->getNumDescriptions() > 0
+            && userData->getDescriptions()[0] == "worldspace";
+
+        const unsigned long long material = materialFor(surface, kParticleEmissive);
+        if (material == 0)
+            return;
+
+        // Rebuilt whole rather than updated. The API has no mesh-update entry point, and unlike a skinned
+        // mesh there is nothing static to keep: a particle's position, size and colour all change every
+        // frame, and particles are born and die. The saving grace is scale -- a candle flame is a handful of
+        // quads, where a character is thousands of vertices -- so the churn this would be unacceptable for
+        // in submitGeometry is affordable here.
+        const void* key = &particles;
+        if (auto found = mParticleMeshes.find(key); found != mParticleMeshes.end())
+        {
+            mRuntime.destroyMesh(found->second.mHandle);
+            mParticleMeshes.erase(found);
+        }
+
+        mVertexScratch.clear();
+        mIndexScratch.clear();
+
+        for (int i = 0; i < count; ++i)
+        {
+            const osgParticle::Particle* particle = particles.getParticle(i);
+            if (particle == nullptr || !particle->isAlive())
+                continue;
+
+            osg::Vec3f centre = particle->getPosition();
+            if (!worldSpace)
+                centre = osg::Vec3f(osg::Vec3d(centre) * localToWorld);
+
+            // Half extent, because the quad spans the size in each direction from the centre.
+            const float half = particle->getCurrentSize() * 0.5f;
+            if (!(half > 0.0f))
+                continue;
+
+            const osg::Vec3f across = cameraRight * half;
+            const osg::Vec3f down = cameraUp * half;
+            // Facing the camera, which for a billboard is the direction the quad is built against.
+            const osg::Vec3f normal = (cameraRight ^ cameraUp);
+
+            const unsigned int base = static_cast<unsigned int>(mVertexScratch.size());
+            const osg::Vec3f corners[4] = { centre - across - down, centre + across - down,
+                centre + across + down, centre - across + down };
+            constexpr float texcoords[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
+
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                RemixRT::Runtime::Vertex vertex = {};
+                vertex.mPosition[0] = corners[corner].x();
+                vertex.mPosition[1] = corners[corner].y();
+                vertex.mPosition[2] = corners[corner].z();
+                vertex.mNormal[0] = normal.x();
+                vertex.mNormal[1] = normal.y();
+                vertex.mNormal[2] = normal.z();
+                vertex.mTexcoord[0] = texcoords[corner][0];
+                vertex.mTexcoord[1] = texcoords[corner][1];
+                mVertexScratch.push_back(vertex);
+            }
+
+            mIndexScratch.insert(mIndexScratch.end(),
+                { base, base + 1u, base + 2u, base, base + 2u, base + 3u });
+        }
+
+        if (mVertexScratch.empty() || mIndexScratch.empty())
+            return;
+
+        // Hashed from the address and the frame, because the handle *is* the hash: reusing one while the
+        // previous mesh is still queued for destruction would alias the two.
+        const unsigned long long hash
+            = ((reinterpret_cast<unsigned long long>(key) * 0x9E3779B97F4A7C15ull) ^ (mFrame << 1)) | 1ull;
+        const unsigned long long mesh = mRuntime.createMesh(hash, mVertexScratch.data(),
+            static_cast<unsigned int>(mVertexScratch.size()), mIndexScratch.data(),
+            static_cast<unsigned int>(mIndexScratch.size()), material);
+        if (mesh == 0)
+            return;
+
+        ParticleMesh entry;
+        entry.mHandle = mesh;
+        entry.mMaterial = material;
+        entry.mLastUsedFrame = mFrame;
+        mParticleMeshes.emplace(key, entry);
+
+        // Identity transform: the quads were built in world space, both so that the camera basis could be
+        // used directly and because world-space particle systems have no node transform to apply anyway.
+        constexpr float identity[12]
+            = { 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f };
+        mRuntime.drawInstance(mesh, identity, categoryFlags, true);
+        mLastParticleCount += static_cast<unsigned int>(mVertexScratch.size() / 4);
+    }
+
+    void RemixScene::releaseStaleParticleMeshes()
+    {
+        for (auto it = mParticleMeshes.begin(); it != mParticleMeshes.end();)
+        {
+            if (it->second.mLastUsedFrame == mFrame)
+            {
+                ++it;
+                continue;
+            }
+            mRuntime.destroyMesh(it->second.mHandle);
+            it = mParticleMeshes.erase(it);
+        }
     }
 
     unsigned int RemixScene::buildSkinning(const SceneUtil::RigGeometry& rig, unsigned int vertexCount)
