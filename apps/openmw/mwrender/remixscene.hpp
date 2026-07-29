@@ -240,6 +240,13 @@ namespace MWRender
         /// Releases lights not submitted this frame.
         void releaseStaleLights();
 
+        /// Picks up live edits to the light emitter radius and intensity factor from Remix's developer
+        /// menu, so lighting can be tuned while looking at it instead of over a restart.
+        ///
+        /// A poll rather than a callback because the values cross a process-internal boundary as strings
+        /// in Remix's game-state store; there is no notification channel coming back the other way.
+        void pollLightTuning();
+
         /// Releases particle meshes whose system was not submitted this frame.
         void releaseStaleParticleMeshes();
 
@@ -315,6 +322,11 @@ namespace MWRender
         /// itself. Applied here for the same reason and with the same default, so API lights and legacy
         /// ones respond to tuning the same way.
         float mLightIntensityFactor = 0.0f;
+
+        /// Frame the light tuning last changed, and whether that change is still waiting to be logged.
+        /// Only used to hold the log back until a drag stops, so the record is of the value settled on.
+        std::uint64_t mLightTuningChangedFrame = 0;
+        bool mLightTuningPendingLog = false;
         /// Threshold an alpha-blended surface is cut out at when it asks for no explicit test.
         /// Environment-tunable so foliage can be dialled in without a rebuild; 0 disables the
         /// substitution and leaves blended surfaces solid.

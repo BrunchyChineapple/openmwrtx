@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <cstring>
@@ -1649,6 +1651,32 @@ namespace RemixRT
             return false;
         return mImpl->mApi.SetGameValue(key, value) == REMIXAPI_ERROR_CODE_SUCCESS;
     }
+
+    bool Runtime::getGameValueFloat(const char* key, float& out) const
+    {
+        if (!mImpl->mStarted || mImpl->mApi.GetGameValue == nullptr)
+            return false;
+
+        char buffer[64] = {};
+        std::uint32_t actualSize = 0;
+        if (mImpl->mApi.GetGameValue(key, buffer, static_cast<std::uint32_t>(sizeof(buffer)), &actualSize)
+            != REMIXAPI_ERROR_CODE_SUCCESS)
+            return false;
+
+        // A missing key is reported as success with a zero size, and an oversized value leaves the
+        // buffer untouched rather than truncating it -- reading either would be reading uninitialised
+        // memory or a stale value, so both count as "no answer".
+        if (actualSize == 0 || actualSize > sizeof(buffer))
+            return false;
+
+        char* end = nullptr;
+        const float parsed = std::strtof(buffer, &end);
+        if (end == buffer || !std::isfinite(parsed))
+            return false;
+
+        out = parsed;
+        return true;
+    }
 }
 
 #else // !_WIN32
@@ -1798,6 +1826,11 @@ namespace RemixRT
     }
 
     bool Runtime::setGameValue(const char*, const char*)
+    {
+        return false;
+    }
+
+    bool Runtime::getGameValueFloat(const char*, float&) const
     {
         return false;
     }

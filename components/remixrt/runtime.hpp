@@ -435,6 +435,18 @@ namespace RemixRT
         /// "__weather.target" and "__weather.blend_seconds" from here.
         bool setGameValue(const char* key, const char* value);
 
+        /// Reads a float back out of Remix's game-state store.
+        ///
+        /// The store is the return path for values the developer menu owns. It is used instead of a
+        /// dedicated config getter because the runtime has no API for reading an rtx.* option back,
+        /// and adding one would mean a new vtable slot and an ABI bump for two floats.
+        ///
+        /// Leaves `out` untouched and returns false whenever the answer is not trustworthy -- runtime
+        /// down, key never written, value unparseable -- so a caller can simply keep whatever it had.
+        /// Note the runtime reports success for a *missing* key too, signalling absence through a zero
+        /// size, so the return code alone is not enough to tell whether anything was read.
+        bool getGameValueFloat(const char* key, float& out) const;
+
         /// Which developer-menu state the runtime is in: 0 none, 1 basic, 2 advanced.
         ///
         /// Worth reading rather than assuming. Setting the state is deferred to the end of the frame

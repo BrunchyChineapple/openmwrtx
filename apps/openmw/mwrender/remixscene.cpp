@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -90,6 +91,35 @@ namespace
     /// light pours through solid geometry into the next room.
     constexpr float kLightRadiusDefault = 0.6435f;
 
+    /// Floor for the emitter radius, whatever the menu or environment asks for.
+    ///
+    /// The radiance derivation divides by the square of this, so zero is not a small light, it is a
+    /// division by zero that propagates into every light in the scene at once.
+    constexpr float kLightRadiusMinimum = 0.001f;
+
+    /// Frames of no further change before live light tuning is written to the log.
+    ///
+    /// Long enough that dragging a slider produces one line instead of one per frame, short enough that
+    /// the line has appeared by the time anyone goes looking for it.
+    constexpr std::uint64_t kLightTuningSettleFrames = 30;
+
+    /// Game-state store keys the runtime publishes live light tuning on.
+    ///
+    /// Must match kExternalLightRadiusKey and kExternalLightIntensityKey in the runtime's
+    /// rtx_light_manager.h. They are the return path for the two sliders under "External (API) Light
+    /// settings": the menu writes an rtx.externalLight.* option, its change callback mirrors the value
+    /// here, and this side polls. The store is used rather than a config getter because reading an option
+    /// back would need a new API entry point, and a new vtable slot plus an ABI bump is a lot to spend on
+    /// two floats.
+    constexpr const char* kExternalLightRadiusKey = "__externalLight.radius";
+    constexpr const char* kExternalLightIntensityKey = "__externalLight.intensityFactor";
+
+    /// The rtx.* options behind those keys, written once at startup so the menu opens showing the values
+    /// actually in use rather than its own defaults. Both are NoSave in the runtime, so writing them does
+    /// not leave anything behind in the user's configuration.
+    constexpr const char* kExternalLightRadiusOption = "rtx.externalLight.radius";
+    constexpr const char* kExternalLightIntensityOption = "rtx.externalLight.intensityFactor";
+
     /// Radiance multiplier at a radius of one unit, i.e. radiance * radius^2.
     ///
     /// Expressed this way so the radius above can be changed without re-tuning brightness. Radiance for
@@ -109,8 +139,10 @@ namespace
 
     /// Default for OPENMW_REMIX_LIGHT_INTENSITY, mirroring rtx.lightConversionIntensityFactor.
     ///
-    /// Duplicated rather than read back from the runtime because the API exposes no getter for an option,
-    /// which means the two can drift. Kept at the same default so they agree until someone changes one.
+    /// Duplicated rather than read back from the runtime because the API still exposes no getter for an
+    /// option, which means the two can drift. Kept at the same default so they agree until someone changes
+    /// one. Note this is not the same knob as rtx.externalLight.intensityFactor below: that one tunes these
+    /// lights and is live, this one only records what the runtime's own conversion path defaults to.
     constexpr float kLightIntensityFactorDefault = 0.65f;
 
     /// The attenuation value a legacy light is considered to have faded out at, 1/255.
@@ -1019,6 +1051,17 @@ namespace MWRender
                             "the latter mirrors rtx.lightConversionIntensityFactor). Radiance is derived "
                             "per light from where its attenuation curve fades out, not from its radius";
 
+        // Publish the starting values so the developer menu's "External (API) Light settings" sliders open
+        // on what is actually in use. Without this an environment override would leave the menu showing the
+        // runtime's compiled-in defaults, and the first touch of a slider would jump the lighting.
+        {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%.5f", mLightRadius);
+            mRuntime.setConfigVariable(kExternalLightRadiusOption, buffer);
+            snprintf(buffer, sizeof(buffer), "%.5f", mLightIntensityFactor);
+            mRuntime.setConfigVariable(kExternalLightIntensityOption, buffer);
+        }
+
         // Water. The transmittance distance is in OpenMW units, which is why it looks large: one metre
         // is about seventy of them, so this absorbs over roughly four metres of depth. Morrowind's water
         // is a murky green-brown, so red is absorbed hardest.
@@ -1177,8 +1220,12 @@ namespace MWRender
             const bool recoloured = changedBy(cached.mRadiance[0], radiance[0])
                 || changedBy(cached.mRadiance[1], radiance[1])
                 || changedBy(cached.mRadiance[2], radiance[2]);
+            // Radius is compared as well as radiance even though the two move together today -- radiance
+            // is derived from the radius, so retuning one shows up in the other. Leaving it out would make
+            // the cache silently wrong the moment that stops being true, for no saving worth having.
+            const bool resized = cached.mRadius != mLightRadius;
 
-            if (!moved && !recoloured)
+            if (!moved && !recoloured && !resized)
             {
                 found->second.mLastUsedFrame = mFrame;
                 if (mRuntime.drawLight(cached.mHandle))
@@ -1219,6 +1266,44 @@ namespace MWRender
 
         if (mRuntime.drawLight(handle))
             ++mLastLightCount;
+    }
+
+    void RemixScene::pollLightTuning()
+    {
+        // Seeded with the current values so a key the menu has never written leaves them alone. That is
+        // the normal case for a whole session in which nobody opens the light panel.
+        float radius = mLightRadius;
+        float intensity = mLightIntensityFactor;
+        mRuntime.getGameValueFloat(kExternalLightRadiusKey, radius);
+        mRuntime.getGameValueFloat(kExternalLightIntensityKey, intensity);
+
+        // Clamped here as well as in the menu. The menu's minimum constrains its own slider, but these
+        // arrive as text from a UI on the far side of an API boundary, and a zero radius divides by zero
+        // in the radiance derivation below -- one bad value would black out or blow out every light.
+        radius = std::max(radius, kLightRadiusMinimum);
+        intensity = std::max(intensity, 0.0f);
+
+        if (radius != mLightRadius || intensity != mLightIntensityFactor)
+        {
+            mLightRadius = radius;
+            mLightIntensityFactor = intensity;
+
+            // No explicit cache invalidation. Both values feed every light's radiance, and submitLight
+            // compares cached radiance and radius against what it just derived, so each light rebuilds
+            // itself as it comes back round this frame.
+            mLightTuningChangedFrame = mFrame;
+            mLightTuningPendingLog = true;
+        }
+
+        // Logged once the value settles rather than on every change. A slider being dragged changes it
+        // every frame, and the only number worth recording is the one that was settled on -- it is the one
+        // to carry back into OPENMW_REMIX_LIGHT_RADIUS, since these options are deliberately not saved.
+        if (mLightTuningPendingLog && mFrame - mLightTuningChangedFrame >= kLightTuningSettleFrames)
+        {
+            mLightTuningPendingLog = false;
+            Log(Debug::Info) << "Remix scene: light tuning set live to emitter radius " << mLightRadius
+                             << " units, intensity factor " << mLightIntensityFactor;
+        }
     }
 
     void RemixScene::releaseStaleLights()
@@ -1301,6 +1386,9 @@ namespace MWRender
             return 0;
 
         ++mFrame;
+
+        // Before any light is submitted, so a slider moved this frame takes effect this frame.
+        pollLightTuning();
 
         // Camera first, as parameters rather than matrices. Deriving eye and basis from the inverse view
         // matrix, and the frustum from OpenMW's own settings, keeps handedness, matrix majorness and
