@@ -47,6 +47,9 @@ constexpr GLenum kHalfFloat = 0x140B;
     constexpr unsigned int kVkFormatR8G8B8A8Srgb = 43;
     constexpr unsigned int kVkFormatB8G8R8A8Unorm = 44;
     constexpr unsigned int kVkFormatB8G8R8A8Srgb = 50;
+    /// VK_FORMAT_R16G16B16A16_SFLOAT. This is what Remix actually reports for its shared output target,
+    /// so leaving it unmapped is what forced the CPU readback path and its per-frame round trip.
+    constexpr unsigned int kVkFormatR16G16B16A16Sfloat = 97;
 
     using PFN_glCreateMemoryObjectsEXT = void(GL_APIENTRY*)(GLsizei, GLuint*);
     using PFN_glDeleteMemoryObjectsEXT = void(GL_APIENTRY*)(GLsizei, const GLuint*);
@@ -109,6 +112,17 @@ constexpr GLenum kHalfFloat = 0x140B;
         return fns;
     }
 
+    /// Whether OPENMW_REMIX_READBACK asks for the CPU round trip.
+    ///
+    /// Read in two places -- here and in CompositeCallback -- because the import and the composite are
+    /// separate objects with no shared state at construction, and the import has to know: holding a GL
+    /// handle to Remix's memory is only safe if the semaphore handshake is going to guard it.
+    bool readbackForced()
+    {
+        const char* value = std::getenv("OPENMW_REMIX_READBACK");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }
+
     /// Maps the Vulkan format Remix reports to a GL sized internal format.
     ///
     /// The internal format has to describe the same bytes-per-pixel and component layout as the Vulkan
@@ -134,6 +148,11 @@ constexpr GLenum kHalfFloat = 0x140B;
                 outNeedsSwizzle = true;
                 outIsSrgb = true;
                 return GL_SRGB8_ALPHA8;
+            case kVkFormatR16G16B16A16Sfloat:
+                // Neither swizzled nor sRGB: the component order already matches, and a float format
+                // carries linear values with no transfer function to undo. The readback path already
+                // treats these bytes as four halves per pixel, which is the same interpretation.
+                return kRgba16f;
             default:
                 return 0;
         }
@@ -260,6 +279,24 @@ namespace RemixRT
     void ImportOperation::operator()(osg::GraphicsContext* context)
     {
         mCompleted = true;
+
+        // Do not import at all when the readback path is forced.
+        //
+        // The import used to fail on its own for an unrelated reason -- VK_FORMAT_R16G16B16A16_SFLOAT had
+        // no mapping -- which quietly meant the readback configuration never held a GL handle to Remix's
+        // memory. Mapping the format made the import succeed everywhere, including here, and that turned
+        // out to be actively dangerous rather than merely useless: the result is a GL texture aliasing
+        // memory Remix writes every frame, in optimal tiling, with no semaphore handshake and no layout
+        // transition. That is undefined, and it presented as a GPU fault (LiveKernelEvent 0x1a8) taking the
+        // whole process down rather than anything catchable.
+        //
+        // Nothing samples it in this mode anyway: the composite uploads its own texture from the CPU copy.
+        if (readbackForced())
+        {
+            Log(Debug::Info) << "Remix GL interop: import skipped, readback path is forced. Importing would "
+                                "alias memory Remix writes with no synchronisation available to guard it.";
+            return;
+        }
 
         if (context == nullptr || context->getState() == nullptr)
         {
