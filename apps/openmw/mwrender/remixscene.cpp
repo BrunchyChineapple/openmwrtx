@@ -686,15 +686,28 @@ namespace
                 return;
             }
 
-            // Morph geometry, the other Drawable that hides a Geometry, is submitted in its base pose.
+            // Morph geometry, the other Drawable that hides a Geometry, is submitted with its animated
+            // vertices.
             //
-            // Unlike skinning, there is nothing to hand the runtime here: the Remix API has no concept of
-            // morph targets, so the alternative to the base pose is either an invisible mesh or a mesh
-            // rebuilt from CPU-blended vertices every frame -- which is the churn the skinning path exists
-            // to avoid, and for a much smaller payoff. Morrowind uses vertex morphs sparingly, so the
-            // visible cost is a handful of meshes that do not animate rather than a handful missing.
+            // The Remix API has no morph targets, so there is nothing to hand the runtime the way bone
+            // transforms are handed over for a skin. But OSG has already done the work: MorphGeometry::cull
+            // blends the targets on the CPU into one of two frame-parity buffers, and getMorphedGeometry
+            // returns whichever holds the last completed result. So this costs a mesh rebuild on the frames
+            // the vertices actually change and nothing on the others -- meshFor decides that by watching
+            // the vertex array's modified count.
+            //
+            // This used to submit getSourceGeometry(), the bind pose, on the reasoning that a face that
+            // does not move is a smaller error than a missing one. True as far as it went, but the visible
+            // consequence was that no NPC's mouth moved while talking, which is most of what Morrowind uses
+            // morphs for.
             if (const auto* morph = dynamic_cast<const SceneUtil::MorphGeometry*>(&drawable))
-                geometry = morph->getSourceGeometry().get();
+            {
+                // const_cast because meshFor needs a mutable reference to run a TriangleIndexFunctor over
+                // the geometry, which is a read that OSG's visitor interface does not express as const.
+                // Nothing downstream modifies it. Same reason the surrounding traversal takes drawables by
+                // non-const reference despite only reading them.
+                geometry = const_cast<osg::Geometry*>(morph->getMorphedGeometry());
+            }
 
             if (geometry == nullptr)
                 return;
@@ -2003,6 +2016,7 @@ namespace MWRender
             // matrix are checked too, because both are baked in at creation time -- the material into
             // the surface, the matrix into the texcoords -- and neither can be swapped afterwards.
             if (found->second.mVertexCount == vertexCount && found->second.mMaterial == material
+                && found->second.mModifiedCount == positions->getModifiedCount()
                 && std::equal(std::begin(found->second.mTexMat), std::end(found->second.mTexMat),
                     std::begin(surface.mTexMat)))
             {
@@ -2106,6 +2120,7 @@ namespace MWRender
         cached.mVertexCount = vertexCount;
         cached.mIndexCount = static_cast<unsigned int>(mIndexScratch.size());
         cached.mMaterial = material;
+        cached.mModifiedCount = positions->getModifiedCount();
         cached.mBonesPerVertex = skinning.mBonesPerVertex;
         std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(cached.mTexMat));
         mMeshes.emplace(key, cached);

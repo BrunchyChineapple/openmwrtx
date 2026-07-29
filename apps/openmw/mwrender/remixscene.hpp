@@ -194,6 +194,15 @@ namespace MWRender
             /// The texture matrix the cached texcoords were built with. Baked in for the same reason as
             /// the material: it lives in the vertex data, so a change means a rebuild.
             float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+            /// The vertex array's modified count when this mesh was built.
+            ///
+            /// A vertex count comparison catches different geometry reusing an address, but not the same
+            /// geometry whose contents changed underneath us -- which is exactly what morph animation is.
+            /// OSG bumps this counter on every dirty(), and MorphGeometry::cull dirties the array on the
+            /// frames it recomputes, so comparing it rebuilds precisely when the pose moved and never
+            /// otherwise. Static geometry never touches it, and skinned meshes are keyed on their bind
+            /// pose, so neither pays anything for this.
+            unsigned int mModifiedCount = 0;
             /// Non-zero when the mesh was created with skinning, in which case instances of it have to
             /// supply bone transforms. Zero for static geometry, and also for a skin the runtime or this
             /// code refused, so it answers "does this instance need bones" rather than "is this a rig".

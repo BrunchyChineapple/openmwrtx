@@ -67,6 +67,23 @@ namespace SceneUtil
 
         osg::ref_ptr<osg::Geometry> getSourceGeometry() const;
 
+        /** Return the geometry as most recently morphed by the cull traversal.
+         *
+         * Exists for consumers outside the render path -- currently the Remix scene submission -- that
+         * need the animated vertices rather than the bind pose. Reading the source geometry instead
+         * yields a face that never moves, which is what the Remix backend did before this.
+         *
+         * Safe to call at any point in the frame, and safe before the geometry has ever been culled:
+         * setSourceGeometry deep-copies the source vertices into both buffers, so the worst case is the
+         * unmorphed pose rather than a null or empty array.
+         *
+         * The value is one frame behind if called before the cull traversal, because that is what
+         * computes it. That is deliberate rather than merely tolerated: the two buffers are indexed by
+         * frame parity, so reading the last completed frame's buffer cannot alias the one the cull is
+         * about to write.
+         */
+        const osg::Geometry* getMorphedGeometry() const { return getGeometry(mLastFrameNumber); }
+
         void accept(osg::NodeVisitor& nv) override;
         bool supports(const osg::PrimitiveFunctor&) const override { return true; }
         void accept(osg::PrimitiveFunctor&) const override;
