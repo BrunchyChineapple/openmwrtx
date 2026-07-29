@@ -335,8 +335,40 @@ namespace RemixRT
             return false;
         }
 
-        // The loader helper tries the plain path first, then retries with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
-        // so the runtime's own sibling DLLs (DLSS, NRD, NRC, USD, ...) resolve out of its directory.
+        // The runtime's directory is put on the process DLL search path before loading, and reading the
+        // loader helper is the only way to see why that is necessary.
+        //
+        // remixapi_lib_loadRemixDllAndInitialize tries three strategies in order and stops at the first
+        // that works: a plain LoadLibraryW, then LoadLibraryExW with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        // then SetDllDirectoryW on the parent directory. Strategies two and three exist precisely to make
+        // the runtime's sibling DLLs findable -- and neither ever runs here, because strategy one succeeds:
+        // the path we pass is absolute and valid.
+        //
+        // That is enough for the runtime's *static* imports, since Windows always searches a module's own
+        // directory for those. It is not enough for anything the runtime loads by name at run time, which
+        // searches the executable's directory, System32 and PATH -- and this executable does not live next
+        // to the runtime. NRC is the case that exposed it: enabling the Neural Radiance Cache made
+        // nrc::vulkan::Initialize fail with a bare "unexpected condition" and no message of its own,
+        // because NRC_Vulkan.dll and its CUDA runtime sit next to d3d9.dll where nothing was looking.
+        //
+        // SetDllDirectoryW rather than AddDllDirectory: AddDllDirectory requires
+        // SetDefaultDllDirectories, which changes the search order for the whole process, and OpenMW loads
+        // its own plugins by name. This adds one directory and leaves everything else alone. It has to stay
+        // set for the life of the process rather than being restored after the load, because the
+        // dependencies in question are loaded lazily -- NRC's arrive if and when the user switches it on.
+        {
+            const std::wstring runtimeDirectory = runtimePath.parent_path().wstring();
+            if (!runtimeDirectory.empty() && SetDllDirectoryW(runtimeDirectory.c_str()) == 0)
+            {
+                // Not fatal. The runtime itself loads from an absolute path regardless; what is lost is the
+                // lazily loaded extras, and each of those reports its own failure.
+                Log(Debug::Warning) << "Remix: could not add " << runtimePath.parent_path()
+                                    << " to the DLL search path (error " << GetLastError()
+                                    << "); features that load their own libraries, NRC especially, will "
+                                       "fail to initialise";
+            }
+        }
+
         remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(
             runtimePath.c_str(), &mImpl->mApi, &mImpl->mModule);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -823,6 +855,18 @@ namespace RemixRT
         static_cast<unsigned int>(Runtime::Format_BC7) == REMIXAPI_FORMAT_BC7_SRGB, "texture format drift");
     static_assert(static_cast<unsigned int>(Runtime::Format_BC7_Linear) == REMIXAPI_FORMAT_BC7_UNORM,
         "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_RGBA8_Linear) == REMIXAPI_FORMAT_R8G8B8A8_UNORM,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BGRA8_Linear) == REMIXAPI_FORMAT_B8G8R8A8_UNORM,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BC1_RGB_Linear) == REMIXAPI_FORMAT_BC1_RGB_UNORM,
+        "texture format drift");
+    static_assert(static_cast<unsigned int>(Runtime::Format_BC1_RGBA_Linear) == REMIXAPI_FORMAT_BC1_RGBA_UNORM,
+        "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC2_Linear) == REMIXAPI_FORMAT_BC2_UNORM, "texture format drift");
+    static_assert(
+        static_cast<unsigned int>(Runtime::Format_BC3_Linear) == REMIXAPI_FORMAT_BC3_UNORM, "texture format drift");
 
     unsigned long long Runtime::createTexture(unsigned long long hash, unsigned int width,
         unsigned int height, unsigned int mipLevels, TextureFormat format, const void* data,
@@ -858,7 +902,7 @@ namespace RemixRT
 
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
-        unsigned char alphaTestReference)
+        unsigned char alphaTestReference, unsigned long long normalTextureHash)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -868,6 +912,10 @@ namespace RemixRT
         // parses it with strtoull and compares the parsed value, not the string.
         wchar_t pseudoPath[32] = {};
         std::swprintf(pseudoPath, std::size(pseudoPath), L"0x%llx", textureHash);
+
+        wchar_t normalPath[32] = {};
+        if (normalTextureHash != 0)
+            std::swprintf(normalPath, std::size(normalPath), L"0x%llx", normalTextureHash);
 
         remixapi_MaterialInfoOpaqueEXT opaque = {};
         opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -887,6 +935,8 @@ namespace RemixRT
         material.pNext = &opaque;
         material.hash = hash;
         material.albedoTexture = pseudoPath;
+        if (normalTextureHash != 0)
+            material.normalTexture = normalPath;
         applyDefaultSamplerState(material);
 
         remixapi_MaterialHandle handle = nullptr;

@@ -109,6 +109,10 @@ namespace MWRender
             bool mHasTexMat = false;
             /// Water gets a refractive material rather than whatever texture it happens to carry.
             bool mIsWater = false;
+            /// Tangent-space normal map, when one is bound. Found by reading each texture unit's
+            /// SceneUtil::TextureType tag rather than by assuming a unit index, because the ShaderVisitor
+            /// picks the unit dynamically from however many the state set already had.
+            const osg::Texture2D* mNormalMap = nullptr;
         };
 
         /// Converts and caches one drawable, returning its Remix mesh handle, or 0 if unusable.
@@ -213,7 +217,11 @@ namespace MWRender
         unsigned long long materialFor(const SurfaceState& surface);
 
         /// Uploads \a image, returning the texture hash to reference it by, or 0 if unusable.
-        unsigned long long textureFor(const osg::Image& image);
+        ///
+        /// @param colour true for anything whose values are a colour and so want sRGB decoding on sample;
+        ///        false for data -- a normal map above all, where a gamma curve applied to what are
+        ///        supposed to be vector components tilts every normal toward the surface.
+        unsigned long long textureFor(const osg::Image& image, bool colour);
 
         /// Releases meshes not submitted for a while.
         void evictStaleMeshes();
@@ -227,7 +235,8 @@ namespace MWRender
         /// Keyed by osg::Image address. Textures and materials are never evicted: OpenMW's resource
         /// system shares images aggressively and keeps them alive for the session, the set is bounded by
         /// how many distinct textures the game has, and re-uploading one costs a full staging copy.
-        std::unordered_map<const void*, CachedTexture> mTextures;
+        /// Keyed by the image address shifted left one, with the colour/linear flag in the low bit.
+        std::unordered_map<unsigned long long, CachedTexture> mTextures;
         /// Keyed by texture hash combined with the alpha-test threshold, since those two are all that
         /// currently distinguish one material from another.
         std::unordered_map<unsigned long long, unsigned long long> mMaterials;

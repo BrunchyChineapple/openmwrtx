@@ -256,17 +256,28 @@ namespace RemixRT
         /// linearises on sample for an _SRGB format and does not for a _UNORM one, so naming the wrong
         /// variant leaves the albedo off by a gamma curve. Textures that are not colour -- normal maps
         /// above all -- have to use the UNORM variants for exactly the same reason.
+        /// Every layout appears twice, once sRGB and once linear, because the same bytes mean different
+        /// things depending on what the texture is for and only the caller knows which. A normal map
+        /// uploaded through an sRGB format has a gamma curve applied to what are supposed to be vector
+        /// components, which tilts every normal toward the surface and shows up as flat, weak bumps
+        /// rather than as an obvious failure.
         enum TextureFormat : unsigned int
         {
             Format_RGBA8 = 43, ///< 8-bit RGBA, sRGB-encoded
+            Format_RGBA8_Linear = 37,
             Format_BGRA8 = 50, ///< 8-bit BGRA, sRGB-encoded
+            Format_BGRA8_Linear = 44,
             Format_BC1_RGB = 132, ///< DXT1 without alpha, sRGB-encoded
+            Format_BC1_RGB_Linear = 131,
             Format_BC1_RGBA = 134, ///< DXT1 with a one-bit alpha, sRGB-encoded
+            Format_BC1_RGBA_Linear = 133,
             Format_BC2 = 138, ///< DXT3, explicit four-bit alpha, sRGB-encoded
+            Format_BC2_Linear = 137,
             Format_BC3 = 136, ///< DXT5, interpolated alpha, sRGB-encoded
-            Format_BC5 = 139, ///< Two-channel, linear. Normal maps; never colour.
+            Format_BC3_Linear = 135,
+            Format_BC5 = 139, ///< Two-channel. Normal maps only, so linear is the only variant.
             Format_BC7 = 146, ///< High-quality RGBA, sRGB-encoded
-            Format_BC7_Linear = 145, ///< BC7 holding non-colour data
+            Format_BC7_Linear = 145,
         };
 
         /// Uploads a texture the runtime can then be told to use by hash.
@@ -297,8 +308,11 @@ namespace RemixRT
         ///        Non-zero rejects texels whose alpha is not greater than this, which is how cutout
         ///        foliage and lattices keep their holes.
         /// @return an opaque handle, or 0 on failure.
+        /// @param normalTextureHash optional tangent-space normal map, uploaded through a *linear*
+        ///        format. Zero for none, which leaves the geometric normal in place.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
-            float roughness, float metallic, unsigned char alphaTestReference);
+            float roughness, float metallic, unsigned char alphaTestReference,
+            unsigned long long normalTextureHash = 0);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

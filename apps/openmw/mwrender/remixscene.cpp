@@ -1,8 +1,11 @@
 #include "remixscene.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 
 #include <osg/Camera>
 #include <osg/FrameStamp>
@@ -22,6 +25,7 @@
 #include <components/sceneutil/lightmanager.hpp>
 #include <components/sceneutil/morphgeometry.hpp>
 #include <components/sceneutil/riggeometry.hpp>
+#include <components/sceneutil/texturetype.hpp>
 #include <components/settings/values.hpp>
 // terraindrawable.hpp holds an osg::ref_ptr to a forward-declared CompositeMapRenderer, and ref_ptr's
 // destructor needs the complete type. Included for that reason alone; nothing here uses it.
@@ -168,29 +172,34 @@ namespace
     struct CompressedFormat
     {
         unsigned int mGlInternalFormat;
-        RemixRT::Runtime::TextureFormat mFormat;
+        RemixRT::Runtime::TextureFormat mColour; ///< sRGB-decoding variant, for albedo and emission.
+        RemixRT::Runtime::TextureFormat mLinear; ///< For data: normals, roughness, masks.
         unsigned int mBlockBytes;
         const char* mName;
     };
 
+    /// Shorthand for the table below only. Runtime is a class, not a namespace, so this has to be a type
+    /// alias rather than a namespace alias.
+    using Fmt = RemixRT::Runtime;
+
     constexpr CompressedFormat kCompressedFormats[] = {
         // S3TC / DXT, GL_EXT_texture_compression_s3tc plus its sRGB counterpart.
-        { 0x83F0, RemixRT::Runtime::Format_BC1_RGB, 8, "BC1_RGB" }, // GL_COMPRESSED_RGB_S3TC_DXT1
-        { 0x8C4C, RemixRT::Runtime::Format_BC1_RGB, 8, "BC1_RGB(srgb)" },
-        { 0x83F1, RemixRT::Runtime::Format_BC1_RGBA, 8, "BC1_RGBA" }, // DXT1 with a one-bit alpha
-        { 0x8C4D, RemixRT::Runtime::Format_BC1_RGBA, 8, "BC1_RGBA(srgb)" },
-        { 0x83F2, RemixRT::Runtime::Format_BC2, 16, "BC2" }, // DXT3, explicit four-bit alpha
-        { 0x8C4E, RemixRT::Runtime::Format_BC2, 16, "BC2(srgb)" },
-        { 0x83F3, RemixRT::Runtime::Format_BC3, 16, "BC3" }, // DXT5, interpolated alpha
-        { 0x8C4F, RemixRT::Runtime::Format_BC3, 16, "BC3(srgb)" },
-        // RGTC, GL_ARB_texture_compression_rgtc. Two-channel and linear: normal maps, never colour, so
-        // these take the UNORM Remix format. The signed spelling is listed because the loader can produce
+        { 0x83F0, Fmt::Format_BC1_RGB, Fmt::Format_BC1_RGB_Linear, 8, "BC1_RGB" }, // GL_COMPRESSED_RGB_S3TC_DXT1
+        { 0x8C4C, Fmt::Format_BC1_RGB, Fmt::Format_BC1_RGB_Linear, 8, "BC1_RGB(srgb)" },
+        { 0x83F1, Fmt::Format_BC1_RGBA, Fmt::Format_BC1_RGBA_Linear, 8, "BC1_RGBA" }, // one-bit alpha
+        { 0x8C4D, Fmt::Format_BC1_RGBA, Fmt::Format_BC1_RGBA_Linear, 8, "BC1_RGBA(srgb)" },
+        { 0x83F2, Fmt::Format_BC2, Fmt::Format_BC2_Linear, 16, "BC2" }, // DXT3, explicit four-bit alpha
+        { 0x8C4E, Fmt::Format_BC2, Fmt::Format_BC2_Linear, 16, "BC2(srgb)" },
+        { 0x83F3, Fmt::Format_BC3, Fmt::Format_BC3_Linear, 16, "BC3" }, // DXT5, interpolated alpha
+        { 0x8C4F, Fmt::Format_BC3, Fmt::Format_BC3_Linear, 16, "BC3(srgb)" },
+        // RGTC, GL_ARB_texture_compression_rgtc. Two channels and no colour meaning at all, so the same
+        // linear format serves both columns. The signed spelling is listed because the loader can produce
         // it, not because a signed normal map would be interpreted correctly here.
-        { 0x8DBD, RemixRT::Runtime::Format_BC5, 16, "BC5" }, // GL_COMPRESSED_RG_RGTC2
-        { 0x8DBE, RemixRT::Runtime::Format_BC5, 16, "BC5(signed)" },
+        { 0x8DBD, Fmt::Format_BC5, Fmt::Format_BC5, 16, "BC5" }, // GL_COMPRESSED_RG_RGTC2
+        { 0x8DBE, Fmt::Format_BC5, Fmt::Format_BC5, 16, "BC5(signed)" },
         // BPTC, GL_ARB_texture_compression_bptc. What modern high-resolution replacement packs use.
-        { 0x8E8C, RemixRT::Runtime::Format_BC7, 16, "BC7" }, // GL_COMPRESSED_RGBA_BPTC_UNORM
-        { 0x8E8D, RemixRT::Runtime::Format_BC7, 16, "BC7(srgb)" },
+        { 0x8E8C, Fmt::Format_BC7, Fmt::Format_BC7_Linear, 16, "BC7" }, // GL_COMPRESSED_RGBA_BPTC_UNORM
+        { 0x8E8D, Fmt::Format_BC7, Fmt::Format_BC7_Linear, 16, "BC7(srgb)" },
     };
 
     /// Looks up \a glInternalFormat, or null if the runtime has no format for it.
@@ -213,12 +222,109 @@ namespace
     /// conventional cutout point.
     constexpr unsigned char kDefaultAlphaTestReference = 128;
 
-    /// Roughness for textured surfaces.
+    /// Roughness for a surface no rule matched.
     ///
-    /// A single value for everything, because Morrowind's materials carry no roughness information at
-    /// all -- there is one diffuse texture and nothing else. Fairly rough, since most of the game's
-    /// surfaces are stone, wood and cloth; specific materials will need per-texture overrides later.
+    /// Fairly rough, because most of Morrowind is stone, wood and cloth, and because a wrong guess in the
+    /// rough direction reads as an unremarkable surface while a wrong guess in the smooth direction reads
+    /// as wet plastic.
     constexpr float kTexturedRoughness = 0.65f;
+
+    /// Surface response by texture name, and why it has to be done this way.
+    ///
+    /// The principled source would be the NIF's own NiMaterialProperty, which carries a glossiness and a
+    /// specular colour. It cannot be used: NifOsg::Loader zeroes both for every Morrowind-era file
+    /// (nifloader.cpp, "Morrowind has its support disabled"), so nothing survives to read. And the reason
+    /// it zeroes them is the deeper problem -- Morrowind's own renderer ignored specular, so the values in
+    /// the files were never authored to mean anything and harvesting them before they are cleared would
+    /// mostly collect defaults.
+    ///
+    /// What is left is the texture name, and Morrowind's naming is systematic enough to carry real signal:
+    /// tx_<material>_<variant>. This is a classification, not a measurement, and it is the same judgement
+    /// a Remix mod author makes by hand for each texture -- the difference is that it is written down here
+    /// where it can be reviewed and corrected.
+    ///
+    /// Matched as a substring against the diffuse texture's path, first rule wins, so more specific
+    /// patterns must come first. Metallic is set only where Morrowind's own art is unambiguously metal;
+    /// a false positive there is far more visible than a roughness that is slightly off, because a
+    /// metallic surface takes its colour entirely from what it reflects.
+    struct SurfaceRule
+    {
+        const char* mPattern;
+        float mRoughness;
+        float mMetallic;
+    };
+
+    constexpr SurfaceRule kSurfaceRules[] = {
+        // Metals. Before the generic armour and weapon patterns, which would otherwise claim them.
+        { "metal", 0.35f, 1.0f },
+        { "_silver", 0.22f, 1.0f },
+        { "_gold", 0.25f, 1.0f },
+        { "_ebony", 0.20f, 1.0f },
+        { "_steel", 0.30f, 1.0f },
+        { "_iron", 0.45f, 1.0f },
+        { "_dwrv", 0.38f, 1.0f }, // Dwemer
+        { "_dwemer", 0.38f, 1.0f },
+        { "_mithril", 0.28f, 1.0f },
+        { "_daedric", 0.32f, 1.0f },
+        // Smooth dielectrics.
+        { "glass", 0.10f, 0.0f },
+        { "_glaze", 0.18f, 0.0f },
+        { "ice", 0.12f, 0.0f },
+        { "_polish", 0.20f, 0.0f },
+        { "_marble", 0.25f, 0.0f },
+        { "_gem", 0.12f, 0.0f },
+        { "_pearl", 0.20f, 0.0f },
+        // Organic and worked surfaces.
+        { "_wood", 0.62f, 0.0f },
+        { "wood", 0.62f, 0.0f },
+        { "_bark", 0.85f, 0.0f },
+        { "_leaf", 0.60f, 0.0f },
+        { "_leaves", 0.60f, 0.0f },
+        { "_bone", 0.55f, 0.0f },
+        { "_chitin", 0.40f, 0.0f },
+        { "_leather", 0.60f, 0.0f },
+        { "_hide", 0.72f, 0.0f },
+        { "_fur", 0.90f, 0.0f },
+        { "_cloth", 0.85f, 0.0f },
+        { "_fabric", 0.85f, 0.0f },
+        { "_rug", 0.90f, 0.0f },
+        { "_silk", 0.55f, 0.0f },
+        { "_paper", 0.80f, 0.0f },
+        { "_parchment", 0.80f, 0.0f },
+        { "_skin", 0.55f, 0.0f },
+        { "_flesh", 0.60f, 0.0f },
+        { "_hair", 0.70f, 0.0f },
+        // Rough mineral surfaces. Last, because "stone" and "rock" appear inside many other names.
+        { "_plaster", 0.80f, 0.0f },
+        { "_stucco", 0.82f, 0.0f },
+        { "_brick", 0.78f, 0.0f },
+        { "_stone", 0.75f, 0.0f },
+        { "stone", 0.75f, 0.0f },
+        { "_rock", 0.80f, 0.0f },
+        { "rock", 0.80f, 0.0f },
+        { "_sand", 0.88f, 0.0f },
+        { "_dirt", 0.90f, 0.0f },
+        { "_mud", 0.75f, 0.0f },
+        { "_ash", 0.92f, 0.0f },
+        { "_grass", 0.85f, 0.0f },
+        { "_moss", 0.88f, 0.0f },
+        { "_snow", 0.70f, 0.0f },
+    };
+
+    /// Classifies \a path, or null when no rule matched.
+    const SurfaceRule* surfaceRuleFor(std::string_view path)
+    {
+        // Lower cased once here rather than per rule. Morrowind's own data is inconsistently cased and
+        // mods more so, and a case-sensitive match would silently classify half a texture set.
+        std::string lowered(path);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        for (const SurfaceRule& rule : kSurfaceRules)
+            if (lowered.find(rule.mPattern) != std::string::npos)
+                return &rule;
+        return nullptr;
+    }
 
     /// Reads the alpha-test threshold OpenMW asks for, or 0 for none.
     ///
@@ -627,6 +733,31 @@ namespace
                     stateSet.getTextureAttribute(0, osg::StateAttribute::TEXTURE)))
             {
                 surface.mTexture = texture;
+            }
+
+            // Every unit is examined for a role tag, and the unit index is deliberately not assumed.
+            // Shader::ShaderVisitor binds an auto-detected normal map at `texAttributes.size()` -- the
+            // next free unit, whatever that happens to be for this state set -- and records what it is by
+            // attaching a SceneUtil::TextureType naming it. The tag is the only reliable identification.
+            const unsigned int units = static_cast<unsigned int>(stateSet.getTextureAttributeList().size());
+            for (unsigned int unit = 0; unit < units; ++unit)
+            {
+                const auto* type = dynamic_cast<const SceneUtil::TextureType*>(
+                    stateSet.getTextureAttribute(unit, SceneUtil::TextureType::AttributeType));
+                if (type == nullptr)
+                    continue;
+
+                // "normalHeightMap" is a normal map with height in alpha. The normal half is what Remix is
+                // being given; the height half would need Remix's separate heightTexture slot and a
+                // channel split, which is not done here.
+                if (type->getName() != "normalMap" && type->getName() != "normalHeightMap")
+                    continue;
+
+                if (const auto* normal = dynamic_cast<const osg::Texture2D*>(
+                        stateSet.getTextureAttribute(unit, osg::StateAttribute::TEXTURE)))
+                {
+                    surface.mNormalMap = normal;
+                }
             }
 
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
@@ -1083,9 +1214,14 @@ namespace MWRender
         return meshFor(geometry, materialFor(surface), surface, rig);
     }
 
-    unsigned long long RemixScene::textureFor(const osg::Image& image)
+    unsigned long long RemixScene::textureFor(const osg::Image& image, bool colour)
     {
-        const void* key = &image;
+        // Keyed on the image *and* the colour interpretation. The same bytes uploaded as sRGB and as
+        // linear are two different textures to the runtime, and one image used both ways -- a diffuse map
+        // that some other mesh binds as a normal map -- would otherwise silently get whichever
+        // interpretation was asked for first.
+        const unsigned long long key
+            = (reinterpret_cast<unsigned long long>(&image) << 1) | (colour ? 1ull : 0ull);
         if (auto found = mTextures.find(key); found != mTextures.end())
             return found->second.mUsable ? found->second.mHash : 0ull;
 
@@ -1103,8 +1239,10 @@ namespace MWRender
             return 0;
         }
 
-        const unsigned long long hash
-            = (reinterpret_cast<unsigned long long>(key) * 0xD6E8FEB86659FD93ull) | 1ull;
+        // Derived from the cache key, which already carries the colour flag, so the sRGB and linear
+        // uploads of one image get distinct runtime hashes. Mixed rather than used directly because the
+        // handle *is* the hash and adjacent allocations would otherwise produce adjacent handles.
+        const unsigned long long hash = (key * 0xD6E8FEB86659FD93ull) | 1ull;
 
         std::vector<unsigned char> converted;
         const void* uploadData = nullptr;
@@ -1133,7 +1271,7 @@ namespace MWRender
                 mTextures.emplace(key, cached);
                 return 0;
             }
-            format = compressed->mFormat;
+            format = colour ? compressed->mColour : compressed->mLinear;
             cached.mFormat = compressed->mName;
 
             // Every byte count below is derived from the format and the extent, never taken from OSG, and
@@ -1251,7 +1389,7 @@ namespace MWRender
 
             uploadData = converted.data();
             uploadSize = converted.size();
-            format = RemixRT::Runtime::Format_RGBA8;
+            format = colour ? RemixRT::Runtime::Format_RGBA8 : RemixRT::Runtime::Format_RGBA8_Linear;
             // Distinguished in the log, because a source with no alpha channel gets 255 written into it
             // and any cutout against the result is a no-op.
             cached.mFormat = alpha >= 0 ? "RGBA8" : "RGBA8(opaque)";
@@ -1295,7 +1433,7 @@ namespace MWRender
         if (image == nullptr)
             return mDefaultMaterial;
 
-        const unsigned long long textureHash = textureFor(*image);
+        const unsigned long long textureHash = textureFor(*image, true);
         if (textureHash == 0)
             return mDefaultMaterial;
 
@@ -1314,31 +1452,58 @@ namespace MWRender
         if (alphaTestReference == 0 && surface.mAlphaBlend)
             alphaTestReference = mBlendCutout;
 
-        // The alpha threshold is part of the material identity: the same texture can be a cutout on one
-        // mesh and opaque on another, and OpenMW decides that per state set, not per texture.
-        const unsigned long long key
-            = textureHash ^ (static_cast<unsigned long long>(alphaTestReference) << 56);
+        // Surface response, classified from the texture's own path. See kSurfaceRules for why the name is
+        // the only source available and what that costs in confidence.
+        const SurfaceRule* rule = surfaceRuleFor(image->getFileName());
+        const float roughness = rule != nullptr ? rule->mRoughness : kTexturedRoughness;
+        const float metallic = rule != nullptr ? rule->mMetallic : 0.0f;
+
+        // Normal map, uploaded linear. A missing one is not a failure: vanilla Morrowind ships none, and
+        // these only appear when a texture pack provides them and OpenMW's "auto use object normal maps"
+        // setting is on.
+        unsigned long long normalHash = 0;
+        if (surface.mNormalMap != nullptr && surface.mNormalMap->getImage() != nullptr)
+            normalHash = textureFor(*surface.mNormalMap->getImage(), false);
+
+        // Everything baked into the material is part of its identity. The same texture can be a cutout on
+        // one mesh and opaque on another, and can be paired with a normal map on one and not the other, so
+        // any of these differing means a different material rather than a reused one.
+        unsigned long long key = textureHash;
+        const auto mix = [&key](unsigned long long value) {
+            key = (key ^ value) * 0x100000001B3ull;
+        };
+        mix(alphaTestReference);
+        mix(normalHash);
+        mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
+        mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
+
         if (auto found = mMaterials.find(key); found != mMaterials.end())
             return found->second;
 
-        // One line per distinct material, capped. "Alpha is not working" has three separate causes --
-        // no cutout requested, a cutout requested against a texture with no alpha channel, or a cutout
-        // requested at a threshold nothing can pass -- and they are indistinguishable from the screen.
+        // One line per distinct material, capped. Each of these has cost real time to work out from the
+        // screen alone: "alpha is not working" has three indistinguishable causes -- no cutout requested,
+        // a cutout against a texture with no alpha channel, and a cutout at a threshold nothing can pass
+        // -- and "everything looks like plastic" is either no rule matching or the rule being wrong.
         if (mMaterialsLogged < kMaterialLogLimit)
         {
             ++mMaterialsLogged;
-            const auto found = mTextures.find(image);
-            Log(Debug::Info) << "Remix material " << mMaterialsLogged << ": texture 0x" << std::hex
-                             << textureHash << std::dec << " " << image->s() << "x" << image->t()
-                             << " format " << (found != mTextures.end() ? found->second.mFormat : "?")
-                             << " alphaTest " << static_cast<unsigned int>(surface.mAlphaTestReference)
-                             << " blend " << (surface.mAlphaBlend ? "yes" : "no") << " -> cutout "
-                             << static_cast<unsigned int>(alphaTestReference)
+            const unsigned long long cacheKey
+                = (reinterpret_cast<unsigned long long>(image) << 1) | 1ull;
+            const auto found = mTextures.find(cacheKey);
+            Log(Debug::Info) << "Remix material " << mMaterialsLogged << ": " << image->getFileName()
+                             << " " << image->s() << "x" << image->t() << " "
+                             << (found != mTextures.end() ? found->second.mFormat : "?") << "; alphaTest "
+                             << static_cast<unsigned int>(surface.mAlphaTestReference) << " blend "
+                             << (surface.mAlphaBlend ? "yes" : "no") << " -> cutout "
+                             << static_cast<unsigned int>(alphaTestReference) << "; rule "
+                             << (rule != nullptr ? rule->mPattern : "(none, default)") << " roughness "
+                             << roughness << " metallic " << metallic << "; normal map "
+                             << (normalHash != 0 ? "yes" : "no")
                              << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
         }
 
         const unsigned long long handle = mRuntime.createTexturedMaterial(
-            key | 1ull, textureHash, kTexturedRoughness, 0.0f, alphaTestReference);
+            key | 1ull, textureHash, roughness, metallic, alphaTestReference, normalHash);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
