@@ -128,6 +128,7 @@ namespace RemixRT
 namespace MWRender
 {
     class RemixScene;
+    class RemixSky;
 }
 
 struct SDL_Window;
@@ -149,6 +150,10 @@ namespace OMW
         // Walks OpenMW's scene graph and hands the geometry to Remix. Declared after mRemix so it is
         // destroyed first: its destructor releases meshes through the runtime.
         std::unique_ptr<MWRender::RemixScene> mRemixScene;
+        // Pushes OpenMW's weather into the runtime's atmosphere options. Holds no runtime resources of its
+        // own -- only the last values it wrote, so it can avoid resending them -- but declared here beside
+        // mRemixScene so the ordering rule above is obvious rather than accidental.
+        std::unique_ptr<MWRender::RemixSky> mRemixSky;
         // Scratch for the readback display path. A member so the allocation is reused across frames
         // rather than churning a multi-megabyte buffer every frame.
         std::vector<unsigned char> mRemixReadback;

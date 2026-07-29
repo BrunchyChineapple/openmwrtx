@@ -105,6 +105,41 @@ namespace MWRender
 
         osg::Vec4f getSkyColor() const { return mSkyColour; }
 
+        /// The sky state as last set, for consumers that need the values rather than the rendered result.
+        ///
+        /// Everything here already passes through SkyManager on its way to the sky domes and celestial
+        /// bodies; this only retains it. The Remix backend uses it to drive the runtime's own atmosphere,
+        /// which has a real sun and moons of its own and needs the numbers rather than the geometry.
+        ///
+        /// Directions are the corrected, Z-up, point-at-the-body vectors SkyManager is handed, not the raw
+        /// orbit constants WeatherManager starts from -- RenderingManager::setSunDirection rewrites the
+        /// sun's Z before it arrives here.
+        struct State
+        {
+            /// Direction toward the sun, normalised. Never below the horizon: OpenMW's orbit model sets
+            /// z = 400 - |x|, so a consumer that needs a night sun has to use mNight to put it there.
+            osg::Vec3f mSunDirection{ 0.f, 0.f, 1.f };
+            bool mHaveSunDirection = false;
+            MoonState mMasser{};
+            bool mHaveMasser = false;
+            MoonState mSecunda{};
+            bool mHaveSecunda = false;
+            /// Straight out of the last WeatherResult, already blended across a weather transition.
+            osg::Vec4f mFogColor{ 0.f, 0.f, 0.f, 1.f };
+            osg::Vec4f mSkyColor{ 0.f, 0.f, 0.f, 1.f };
+            osg::Vec4f mSunColor{ 0.f, 0.f, 0.f, 1.f };
+            osg::Vec4f mAmbientColor{ 0.f, 0.f, 0.f, 1.f };
+            float mFogDepth = 0.f;
+            float mWindSpeed = 0.f;
+            float mCloudSpeed = 0.f;
+            bool mNight = false;
+            bool mIsStorm = false;
+            osg::Vec3f mStormDirection{ 0.f, 1.f, 0.f };
+            bool mHaveWeather = false;
+        };
+
+        const State& getState() const { return mState; }
+
     private:
         void create();
         ///< no need to call this, automatically done on first enable()
@@ -199,6 +234,12 @@ namespace MWRender
         osg::Vec4f mMoonScriptColor;
 
         osg::ref_ptr<SceneUtil::RTTNode> mSkyRTT;
+
+        /// Retained copy of what has been set, exposed through getState(). Written by the setters
+        /// unconditionally -- before mCreated as well as after -- because a consumer outside the render
+        /// path has no reason to care whether the sky domes exist yet, and those setters return early
+        /// while !mCreated.
+        State mState;
     };
 }
 

@@ -631,6 +631,21 @@ namespace MWRender
 
     void SkyManager::setWeather(const WeatherResult& weather)
     {
+        // Recorded before the mCreated guard for the same reason as the sun and moons: a consumer outside
+        // the render path wants the weather regardless of whether the sky domes have been built. These
+        // values are already blended across a weather transition by WeatherManager.
+        mState.mFogColor = weather.mFogColor;
+        mState.mSkyColor = weather.mSkyColor;
+        mState.mSunColor = weather.mSunColor;
+        mState.mAmbientColor = weather.mAmbientColor;
+        mState.mFogDepth = weather.mFogDepth;
+        mState.mWindSpeed = weather.mWindSpeed;
+        mState.mCloudSpeed = weather.mCloudSpeed;
+        mState.mNight = weather.mNight;
+        mState.mIsStorm = weather.mIsStorm;
+        mState.mStormDirection = weather.mStormDirection;
+        mState.mHaveWeather = true;
+
         if (!mCreated)
             return;
 
@@ -881,6 +896,15 @@ namespace MWRender
 
     void SkyManager::setSunDirection(const osg::Vec3f& direction)
     {
+        // Recorded before the mCreated guard, and normalised here rather than by the consumer, so
+        // getState() reports the same unit vector Sun::setDirection places the disc along.
+        const float length = direction.length();
+        if (length > 0.f)
+        {
+            mState.mSunDirection = direction / length;
+            mState.mHaveSunDirection = true;
+        }
+
         if (!mCreated)
             return;
 
@@ -889,6 +913,9 @@ namespace MWRender
 
     void SkyManager::setMasserState(const MoonState& state)
     {
+        mState.mMasser = state;
+        mState.mHaveMasser = true;
+
         if (!mCreated)
             return;
 
@@ -897,6 +924,9 @@ namespace MWRender
 
     void SkyManager::setSecundaState(const MoonState& state)
     {
+        mState.mSecunda = state;
+        mState.mHaveSecunda = true;
+
         if (!mCreated)
             return;
 

@@ -50,6 +50,9 @@
 #include <components/remixrt/runtime.hpp>
 
 #include "mwrender/remixscene.hpp"
+#include "mwrender/remixsky.hpp"
+#include "mwrender/renderingmanager.hpp"
+#include "mwworld/weather.hpp"
 #include <components/sceneutil/depth.hpp>
 #include <components/sceneutil/screencapture.hpp>
 #include <components/sceneutil/unrefqueue.hpp>
@@ -393,6 +396,25 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             // Submits the camera and the visible scene together, because they have to agree: the camera
             // goes over as parameters rather than matrices, and geometry in the same units.
             cameraOk = mRemixScene->submit(mViewer->getSceneData(), *camera) > 0;
+
+            // The sky is configuration rather than geometry, so it goes separately and its result does not
+            // bear on whether there is a scene to raytrace. Driven from the values OpenMW's own sky was
+            // handed this frame, which WeatherManager has already blended across any weather transition.
+            if (mRemixSky != nullptr)
+            {
+                MWBase::World* world = MWBase::Environment::get().getWorld();
+                MWRender::RenderingManager* rendering = world != nullptr ? world->getRenderingManager()
+                                                                        : nullptr;
+                MWRender::SkyManager* sky = rendering != nullptr ? rendering->getSkyManager() : nullptr;
+                if (sky != nullptr)
+                {
+                    const MWWorld::Weather* next = world->getNextWeather();
+                    mRemixSky->update(sky->getState(), world->isCellExterior(),
+                        world->getCurrentWeatherScriptId(),
+                        next != nullptr ? next->mScriptId : -1, world->getWeatherTransition(),
+                        Settings::camera().mViewingDistance);
+                }
+            }
         }
         const auto afterSubmit = std::chrono::steady_clock::now();
         const bool presentOk = mRemix->present();
@@ -1150,6 +1172,11 @@ void OMW::Engine::prepareEngine()
                 // Feeds OpenMW's scene graph to Remix. Without it the runtime has a camera and nothing
                 // else, never enters its raytracing path, and produces no output at all.
                 mRemixScene = std::make_unique<MWRender::RemixScene>(*mRemix);
+
+                // Drives the runtime's own sky, sun, moons and fog from OpenMW's weather. Separate from
+                // the scene because it submits no geometry: Remix builds the sun and each moon as distant
+                // lights itself, and this only tells it where they are and what the weather is doing.
+                mRemixSky = std::make_unique<MWRender::RemixSky>(*mRemix);
             }
             else
             {
