@@ -139,7 +139,7 @@ add_component_dir (shader
 # RTX Remix backend. Builds on every platform; the runtime itself is Windows x64 only, so the
 # non-Windows path compiles to stubs that report the backend as unavailable.
 add_component_dir (remixrt
-    runtime glinterop
+    runtime glinterop assethash
     )
 
 add_component_dir (sceneutil
@@ -632,6 +632,7 @@ target_link_libraries(components
     Base64
     SQLite3::SQLite3
     smhasher
+    xxHash
     ${ICU_LIBRARIES}
     ZLIB::ZLIB
     )

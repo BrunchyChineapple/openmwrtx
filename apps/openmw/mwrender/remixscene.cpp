@@ -28,6 +28,7 @@
 #include <osgParticle/Particle>
 #include <osgParticle/ParticleSystem>
 
+#include <components/remixrt/assethash.hpp>
 #include <components/sceneutil/morphgeometry.hpp>
 #include <components/sceneutil/riggeometry.hpp>
 #include <components/sceneutil/texturetype.hpp>
@@ -1489,7 +1490,8 @@ namespace MWRender
             mLoggedFirstSubmit = true;
             mWasPopulated = populated;
             Log(Debug::Info) << "Remix scene: handed over " << mLastInstanceCount << " instances from "
-                             << mMeshes.size() << " meshes, " << mLastLightCount << " lights and "
+                             << mMeshes.size() << " meshes (" << mMeshesShared
+                             << " geometries shared an existing mesh), " << mLastLightCount << " lights and "
                              << mTexturesUploaded << " textures; " << mSkinnedInstances
                              << " instances were skinned and " << mSkinnedDropped
                              << " skins were not ready; " << mLastParticleCount << " particles from "
@@ -1544,11 +1546,6 @@ namespace MWRender
             mTextures.emplace(key, cached);
             return 0;
         }
-
-        // Derived from the cache key, which already carries the colour flag, so the sRGB and linear
-        // uploads of one image get distinct runtime hashes. Mixed rather than used directly because the
-        // handle *is* the hash and adjacent allocations would otherwise produce adjacent handles.
-        const unsigned long long hash = (key * 0xD6E8FEB86659FD93ull) | 1ull;
 
         std::vector<unsigned char> converted;
         const void* uploadData = nullptr;
@@ -1708,6 +1705,29 @@ namespace MWRender
             return 0;
         }
 
+        // Identity from content, not from the address the image happens to live at.
+        //
+        // This value is the texture's public identity: it is what a USD replacement is authored against,
+        // what a texture tag is stored under in rtx.conf, and what Remix's texture list displays. Deriving
+        // it from &image made all three useless across a restart -- tags went dead, replacements could
+        // never bind, and the same texture showed a different hash every run.
+        //
+        // Hashed over exactly the bytes handed to the runtime, with XXH3-64, which is deliberately the same
+        // algorithm over the same kind of input that Remix applies to a D3D9 texture (XXH3_64bits over the
+        // staging buffer of subresource 0). For a compressed texture those bytes are the DDS blocks
+        // unaltered, so this has a real chance of agreeing with a hash captured from another host driving
+        // the same art -- which is the prerequisite for reusing replacement packs authored elsewhere.
+        //
+        // Dimensions and the colour interpretation fold in afterwards because identical bytes can be two
+        // legitimately different textures: one image bound as sRGB albedo and as a linear normal map must
+        // not collapse to a single entry, which is the distinction the old cache key spent its low bit on.
+        unsigned long long hash = RemixRT::AssetHash::bytes(uploadData, uploadSize);
+        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(width), hash);
+        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(height), hash);
+        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(format), hash);
+        hash = RemixRT::AssetHash::combine(colour ? 1ull : 0ull, hash);
+        hash = RemixRT::AssetHash::avoidZero(hash);
+
         if (mRuntime.createTexture(hash, static_cast<unsigned int>(width),
                 static_cast<unsigned int>(height), mipLevels, format, uploadData, uploadSize)
             == 0)
@@ -1720,7 +1740,40 @@ namespace MWRender
         cached.mUsable = true;
         mTextures.emplace(key, cached);
         ++mTexturesUploaded;
+
+        // The hash is logged in upper-case hex specifically so it can be pasted from Remix's texture list
+        // back into this log. Remix identifies every texture by the hash handed to it here and shows nothing
+        // else about it, so without this there is no way to get from a thumbnail that looks wrong to the
+        // file responsible -- which was previously a dead end for exactly the sort of "these normals are
+        // off" report this exists to answer.
+        if (mTexturesLogged < kTextureLogLimit)
+        {
+            ++mTexturesLogged;
+            Log(Debug::Info) << "Remix texture " << mTexturesLogged << ": " << std::hex << std::uppercase
+                             << hash << std::nouppercase << std::dec << " " << image.getFileName() << " "
+                             << width << "x" << height << " " << cached.mFormat << " "
+                             << (colour ? "sRGB" : "linear") << ", " << mipLevels << " mip"
+                             << (mipLevels == 1 ? "" : "s")
+                             << (mTexturesLogged == kTextureLogLimit ? " (last of these)" : "");
+        }
+
         return hash;
+    }
+
+    const RemixScene::CachedSurfaceResponse& RemixScene::surfaceResponseFor(const osg::Image& image)
+    {
+        if (auto found = mSurfaceResponses.find(&image); found != mSurfaceResponses.end())
+            return found->second;
+
+        const SurfaceRule* rule = surfaceRuleFor(image.getFileName());
+
+        CachedSurfaceResponse response;
+        response.mRoughness = rule != nullptr ? rule->mRoughness : kTexturedRoughness;
+        response.mMetallic = rule != nullptr ? rule->mMetallic : 0.0f;
+        // Points into the static rule table, so there is nothing to own or outlive.
+        response.mPattern = rule != nullptr ? rule->mPattern : nullptr;
+
+        return mSurfaceResponses.emplace(&image, response).first->second;
     }
 
     unsigned long long RemixScene::materialFor(const SurfaceState& surface, float emissive)
@@ -1777,10 +1830,11 @@ namespace MWRender
         }
 
         // Surface response, classified from the texture's own path. See kSurfaceRules for why the name is
-        // the only source available and what that costs in confidence.
-        const SurfaceRule* rule = surfaceRuleFor(image->getFileName());
-        const float roughness = rule != nullptr ? rule->mRoughness : kTexturedRoughness;
-        const float metallic = rule != nullptr ? rule->mMetallic : 0.0f;
+        // the only source available and what that costs in confidence. Memoised per image -- see
+        // surfaceResponseFor for why that matters here rather than being a micro-optimisation.
+        const CachedSurfaceResponse& response = surfaceResponseFor(*image);
+        const float roughness = response.mRoughness;
+        const float metallic = response.mMetallic;
 
         // Normal map, uploaded linear. A missing one is not a failure: vanilla Morrowind ships none, and
         // these only appear when a texture pack provides them and OpenMW's "auto use object normal maps"
@@ -1830,7 +1884,8 @@ namespace MWRender
                              << static_cast<unsigned int>(surface.mAlphaTestReference) << " blend "
                              << (surface.mAlphaBlend ? "yes" : "no") << " -> " << transparencyDescription
                              << "; rule "
-                             << (rule != nullptr ? rule->mPattern : "(none, default)") << " roughness "
+                             << (response.mPattern != nullptr ? response.mPattern : "(none, default)")
+                             << " roughness "
                              << roughness << " metallic " << metallic << "; normal map "
                              << (normalHash != 0 ? "yes" : "no")
                              << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
@@ -2133,24 +2188,29 @@ namespace MWRender
 
         const unsigned int vertexCount = static_cast<unsigned int>(positions->size());
 
-        if (auto found = mMeshes.find(key); found != mMeshes.end())
+        // Fast path, and the reason the memo exists: hashing this geometry's content every frame would
+        // cost far more than sharing saves. The checks are the ones the mesh cache itself used to make --
+        // a changed vertex count means different geometry at a reused address, a changed modified counter
+        // means the same geometry animated underneath us, and the material and texture matrix are baked in
+        // at creation so neither can be swapped afterwards.
+        if (auto memo = mGeometryIdentities.find(key); memo != mGeometryIdentities.end())
         {
-            // Cheap staleness check. A full content hash every frame would cost more than it saves, but
-            // a changed vertex count definitely means different geometry at the same address, and
-            // reusing the cached mesh then would draw the wrong thing. The material and the texture
-            // matrix are checked too, because both are baked in at creation time -- the material into
-            // the surface, the matrix into the texcoords -- and neither can be swapped afterwards.
-            if (found->second.mVertexCount == vertexCount && found->second.mMaterial == material
-                && found->second.mModifiedCount == positions->getModifiedCount()
-                && std::equal(std::begin(found->second.mTexMat), std::end(found->second.mTexMat),
+            GeometryIdentity& identity = memo->second;
+            if (identity.mVertexCount == vertexCount && identity.mMaterial == material
+                && identity.mModifiedCount == positions->getModifiedCount()
+                && std::equal(std::begin(identity.mTexMat), std::end(identity.mTexMat),
                     std::begin(surface.mTexMat)))
             {
-                found->second.mLastUsedFrame = mFrame;
-                mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
-                return found->second.mHandle;
+                // The mesh can still be missing here, because eviction works on meshes and this memo is
+                // only a lookup cache. Falling through rebuilds it rather than returning a dead handle.
+                if (auto found = mMeshes.find(identity.mMeshHash); found != mMeshes.end())
+                {
+                    identity.mLastUsedFrame = mFrame;
+                    found->second.mLastUsedFrame = mFrame;
+                    mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
+                    return found->second.mHandle;
+                }
             }
-            mRuntime.destroyMesh(found->second.mHandle);
-            mMeshes.erase(found);
         }
 
         mIndexScratch.clear();
@@ -2219,11 +2279,65 @@ namespace MWRender
             vertex.mColor = 0xFFFFFFFFu;
         }
 
-        // Derived from the address, which is unique for as long as the geometry lives, and mixed so that
-        // adjacent allocations do not produce adjacent hashes. The cache destroys the mesh on eviction,
-        // so a later allocation reusing this address cannot inherit it.
-        const unsigned long long hash
-            = (reinterpret_cast<unsigned long long>(key) * 0x9E3779B97F4A7C15ull) | 1ull;
+        // Identity from content. This value is what Remix knows the mesh as and what a USD replacement is
+        // authored against, so an address-derived one meant no replacement could ever bind and every
+        // capture named its meshes differently.
+        //
+        // Hashed over exactly what is submitted -- the built vertex buffer and index buffer -- so it covers
+        // positions, normals, texcoords and the baked texture matrix together. Note this is NOT yet the
+        // formulation Remix computes for a D3D9 draw, which hashes positions, indices and a geometry
+        // descriptor separately under rtx.geometryAssetHashRule. Matching that is the next step and is
+        // deliberately confined to this function: nothing else depends on how the number is made.
+        unsigned long long contentHash = RemixRT::AssetHash::bytes(
+            mVertexScratch.data(), mVertexScratch.size() * sizeof(RemixRT::Runtime::Vertex));
+        contentHash = RemixRT::AssetHash::bytesSeeded(
+            mIndexScratch.data(), mIndexScratch.size() * sizeof(unsigned int), contentHash);
+        unsigned long long hash = RemixRT::AssetHash::avoidZero(contentHash);
+
+        // Identical content already submitted? Then share it -- one Remix mesh, one BLAS, however many
+        // instances reference it.
+        //
+        // The material has to match as well, and cannot be folded into the hash to force that: the whole
+        // point of hashing content alone is that the value agrees with what Remix would compute for this
+        // geometry. So the rare genuine collision -- the same geometry reused with a different material,
+        // which cannot share a mesh because the material is baked in -- is resolved by moving to a derived
+        // hash instead. The unperturbed value is always tried first, so the common case keeps the
+        // replacement-addressable identity and only the colliding variant gives it up.
+        bool reused = false;
+        unsigned long long reusedHandle = 0;
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            auto found = mMeshes.find(hash);
+            if (found == mMeshes.end())
+                break;
+
+            if (found->second.mMaterial == material
+                && std::equal(std::begin(found->second.mTexMat), std::end(found->second.mTexMat),
+                    std::begin(surface.mTexMat)))
+            {
+                found->second.mLastUsedFrame = mFrame;
+                mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
+                reusedHandle = found->second.mHandle;
+                reused = true;
+                break;
+            }
+
+            hash = RemixRT::AssetHash::avoidZero(RemixRT::AssetHash::combine(material, hash));
+        }
+
+        if (reused)
+        {
+            GeometryIdentity identity;
+            identity.mMeshHash = hash;
+            identity.mLastUsedFrame = mFrame;
+            identity.mVertexCount = vertexCount;
+            identity.mModifiedCount = positions->getModifiedCount();
+            identity.mMaterial = material;
+            std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(identity.mTexMat));
+            mGeometryIdentities[key] = identity;
+            ++mMeshesShared;
+            return reusedHandle;
+        }
 
         RemixRT::Runtime::Skinning skinning;
         if (rig != nullptr)
@@ -2248,7 +2362,17 @@ namespace MWRender
         cached.mModifiedCount = positions->getModifiedCount();
         cached.mBonesPerVertex = skinning.mBonesPerVertex;
         std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(cached.mTexMat));
-        mMeshes.emplace(key, cached);
+        mMeshes[hash] = cached;
+
+        GeometryIdentity identity;
+        identity.mMeshHash = hash;
+        identity.mLastUsedFrame = mFrame;
+        identity.mVertexCount = vertexCount;
+        identity.mModifiedCount = positions->getModifiedCount();
+        identity.mMaterial = material;
+        std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(identity.mTexMat));
+        mGeometryIdentities[key] = identity;
+
         mLastMeshBonesPerVertex = skinning.mBonesPerVertex;
         return handle;
     }
@@ -2269,6 +2393,18 @@ namespace MWRender
             {
                 ++it;
             }
+        }
+
+        // The identity memos are evicted on the same schedule rather than alongside their mesh, because
+        // the mapping is many-to-one now: several geometries can name the same mesh, so a mesh going away
+        // says nothing about whether any particular memo is still wanted. Leaving them would grow the map
+        // for the whole session as the player moves and cells page out.
+        for (auto it = mGeometryIdentities.begin(); it != mGeometryIdentities.end();)
+        {
+            if (mFrame - it->second.mLastUsedFrame > kMeshEvictionFrames)
+                it = mGeometryIdentities.erase(it);
+            else
+                ++it;
         }
     }
 }

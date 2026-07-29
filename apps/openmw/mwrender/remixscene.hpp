@@ -216,6 +216,27 @@ namespace MWRender
             unsigned int mBonesPerVertex = 0;
         };
 
+        /// What a given osg::Geometry resolved to the last time it was submitted.
+        ///
+        /// Meshes are identified to Remix by a hash of their content, which is what makes the identity
+        /// stable across runs and lets identical geometry share one mesh. Content hashing is too expensive
+        /// to repeat for every drawable every frame, though, so the answer is memoised against the
+        /// geometry's address and revalidated with the same cheap checks the mesh cache itself used to
+        /// make: vertex count, OSG's modified counter, and the material and texture matrix that are baked
+        /// into the mesh at creation.
+        ///
+        /// Separate from CachedMesh because the two are no longer one-to-one: several geometries can now
+        /// resolve to the same mesh, which is the point.
+        struct GeometryIdentity
+        {
+            unsigned long long mMeshHash = 0;
+            std::uint64_t mLastUsedFrame = 0;
+            unsigned int mVertexCount = 0;
+            unsigned int mModifiedCount = 0;
+            unsigned long long mMaterial = 0;
+            float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+        };
+
         struct CachedTexture
         {
             unsigned long long mHash = 0;
@@ -305,7 +326,15 @@ namespace MWRender
         unsigned long long mWaterMaterial = 0;
         unsigned long long mProbeMaterial = 0;
         unsigned long long mProbeMesh = 0;
-        std::unordered_map<const void*, CachedMesh> mMeshes;
+        /// Keyed by the mesh's content hash, which is also the identity Remix knows it by and the key a USD
+        /// replacement is authored against. Previously keyed by geometry address, which is why the same
+        /// mesh presented a different identity on every run.
+        std::unordered_map<unsigned long long, CachedMesh> mMeshes;
+
+        /// Keyed by osg::Geometry address, purely as a memo to keep content hashing off the per-frame path.
+        /// Unlike mMeshes this is not an identity -- it is a cache of a lookup, and an address reused by a
+        /// different geometry is caught by the revalidation checks in GeometryIdentity.
+        std::unordered_map<const void*, GeometryIdentity> mGeometryIdentities;
         /// Keyed by osg::Image address. Textures and materials are never evicted: OpenMW's resource
         /// system shares images aggressively and keeps them alive for the session, the set is bounded by
         /// how many distinct textures the game has, and re-uploading one costs a full staging copy.
@@ -314,6 +343,30 @@ namespace MWRender
         /// Keyed by texture hash combined with the alpha-test threshold, since those two are all that
         /// currently distinguish one material from another.
         std::unordered_map<unsigned long long, unsigned long long> mMaterials;
+
+        /// One texture's classified surface response, memoised so the classification runs once per texture
+        /// rather than once per drawable per frame.
+        ///
+        /// Stores what is consumed rather than the matched rule itself, because the rule type is private to
+        /// the implementation file. The pattern is kept only for logging and points into the static rule
+        /// table, so it needs no lifetime management; null means no rule matched.
+        struct CachedSurfaceResponse
+        {
+            float mRoughness = 0.0f;
+            float mMetallic = 0.0f;
+            const char* mPattern = nullptr;
+        };
+
+        /// Keyed by osg::Image address, with the same never-evicted lifetime reasoning as mTextures above:
+        /// the answer depends only on the image's own filename, which does not change while it is alive.
+        std::unordered_map<const osg::Image*, CachedSurfaceResponse> mSurfaceResponses;
+
+        /// Classifies a texture's path into a surface response, or returns the memoised answer.
+        ///
+        /// Worth memoising because it is pure string work -- a lowercased copy of the path, then a
+        /// substring scan over fifty rules -- and it sits ahead of the material cache in materialFor, so
+        /// every drawable paid for it every frame even when the material itself was already built.
+        const CachedSurfaceResponse& surfaceResponseFor(const osg::Image& image);
         /// Keyed by LightSource::getId, which OpenMW already guarantees unique per live light source --
         /// unlike the node address, which is reused as cells page in and out.
         std::unordered_map<int, CachedLight> mLights;
@@ -321,6 +374,12 @@ namespace MWRender
         unsigned int mLastInstanceCount = 0;
         unsigned int mLastLightCount = 0;
         unsigned int mTexturesUploaded = 0;
+
+        /// How many times a geometry resolved to a mesh that already existed with identical content.
+        ///
+        /// Reported because the saving is invisible otherwise: sharing shows up only as a mesh count that
+        /// is lower than the instance count, which is also true for plenty of other reasons.
+        unsigned int mMeshesShared = 0;
         /// Emitter radius and radiance-times-radius-squared for converted lights. Read from the
         /// environment once at construction so they can be tuned without a rebuild; Remix's own light
         /// options act on its legacy conversion path and cannot reach lights created through the API.
@@ -343,6 +402,12 @@ namespace MWRender
         /// dozen the player walks into.
         unsigned int mMaterialsLogged = 0;
         static constexpr unsigned int kMaterialLogLimit = 48;
+
+        /// Capped like the material log, but higher: the point of it is to be able to look up an arbitrary
+        /// hash seen in Remix's texture list, so covering only the first few textures of a session would
+        /// miss most of what anyone would want to ask about.
+        unsigned int mTexturesLogged = 0;
+        static constexpr unsigned int kTextureLogLimit = 512;
         /// Same idea for lights, and a smaller sample: the interesting question is whether the derivation
         /// produces sane radiance for a real attenuation curve, and a dozen answers that in one glance.
         unsigned int mLightsLogged = 0;
