@@ -225,6 +225,11 @@ extern "C" {
     // Default: false. Use VkSwapchainKHR to present frame into HWND.
     remixapi_Bool       forceNoVkSwapchain;
     remixapi_Bool       editorModeEnabled;
+    // With this disabled, the user must fetch the GUI buffer using 
+    // the, remixapi_dxvk_CopyRenderingOutputType, api with the, 
+    // remixapi_dxvk_CopyRenderingOutputType, field set to: 'REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI'
+    // Otherwise the GUI will be drawn in the final color buffer.
+    remixapi_Bool       combineGuiInFinalColor;
   } remixapi_StartupInfo;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Startup)(const remixapi_StartupInfo* info);
@@ -502,6 +507,8 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS                = 1 << 25,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL                = 1 << 26,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;
@@ -859,6 +866,7 @@ extern "C" {
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH = 1,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS = 2,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING = 3,
+    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI = 4,
   } remixapi_dxvk_CopyRenderingOutputType;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CopyRenderingOutput)(
@@ -882,13 +890,16 @@ extern "C" {
     REMIXAPI_FORMAT_B8G8R8A8_SRGB = 50,    // VK_FORMAT_B8G8R8A8_SRGB
     REMIXAPI_FORMAT_BC1_RGB_UNORM = 131,   // VK_FORMAT_BC1_RGB_UNORM_BLOCK
     REMIXAPI_FORMAT_BC1_RGB_SRGB = 132,    // VK_FORMAT_BC1_RGB_SRGB_BLOCK
-    // BC1 with a one-bit alpha, and BC2 (DXT3) with explicit four-bit alpha. Both added by this fork:
-    // upstream's switch mapped neither, and BC1_RGBA shares BC1_RGB's block layout, so DXT1 data that
-    // carries a cutout was being uploaded as opaque -- foliage and lattices came out as solid squares.
+    // BC1 with a one-bit alpha. Identical block layout to BC1_RGB, so a caller that has DXT1 data does
+    // not know which of the two it holds from the bytes alone -- the source format says. Uploading
+    // alpha-carrying DXT1 as BC1_RGB silently drops the cutout, which turns foliage and lattices into
+    // solid squares.
     REMIXAPI_FORMAT_BC1_RGBA_UNORM = 133,  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
     REMIXAPI_FORMAT_BC1_RGBA_SRGB = 134,   // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
     REMIXAPI_FORMAT_BC3_UNORM = 135,       // VK_FORMAT_BC3_UNORM_BLOCK
     REMIXAPI_FORMAT_BC3_SRGB = 136,        // VK_FORMAT_BC3_SRGB_BLOCK
+    // BC2, i.e. DXT3: explicit four-bit alpha. Rarer than BC1 and BC3 but present in Morrowind-era
+    // texture sets, and without it those textures have to be dropped entirely.
     REMIXAPI_FORMAT_BC2_UNORM = 137,       // VK_FORMAT_BC2_UNORM_BLOCK
     REMIXAPI_FORMAT_BC2_SRGB = 138,        // VK_FORMAT_BC2_SRGB_BLOCK
     REMIXAPI_FORMAT_BC5_UNORM = 139,       // VK_FORMAT_BC5_UNORM_BLOCK (normal maps)
