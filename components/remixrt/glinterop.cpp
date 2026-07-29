@@ -437,37 +437,40 @@ void main()
     // the driver reorders on the way in. Which path is active can change at runtime, so the choice is a
     // uniform rather than two programs: picking a shader once at creation would bake in whichever mode
     // happened to be active on the first frame.
-    // uEncodeSrgb exists because this composite replaces a step we bypass, and may have to replace more of
-    // it than it does.
+    // uEncodeGamma raises the output through a power curve to compensate for brightness lost somewhere
+    // past this framebuffer. It is a knob, not a correction with a known right answer -- see the long
+    // note at the point it is uploaded for what has been measured and what has been ruled out.
     //
-    // A D3D9 game running under Remix never reaches this code: the runtime is its renderer and presents
-    // through DXVK's own swapchain blitter. That presenter offers both UNORM and _SRGB swapchain formats
-    // (d3d9_swapchain.cpp), and a blit into an _SRGB image applies a linear-to-sRGB encode on the way out.
-    // If the runtime's final colour image holds linear values, that encode is the last thing done to them
-    // before they reach the display -- and this composite, which takes the image out of the runtime before
-    // presentation, does not do it.
+    // The short version, because it is easy to misread this as a colour-space conversion: the framebuffer
+    // contents measure CORRECT without it. An external capture of the framebuffer looked right before
+    // this existed and looks too bright with it. So this deliberately writes wrong data to make the panel
+    // show the right picture, and the moment the real fault is found this should go away rather than be
+    // retuned.
     //
-    // Writing linear values where sRGB is expected maps 0.5 to roughly 0.21: everything darkens and the
-    // midtones collapse toward each other, which reads as dim and washed out at the same time. That is the
-    // symptom pair being chased, and it is exactly what a missing transfer function looks like.
-    //
-    // A uniform rather than a decision, because the premise -- that the image is linear -- is unverified,
-    // and the screen can settle it in one restart where reasoning has repeatedly failed to.
+    // uTestPattern is the tool that established that much, by substituting values chosen here instead of
+    // sampling Remix at all.
     const char* const kFragmentShader = R"(#version 330 core
 uniform sampler2D uImage;
 uniform int uSwizzle;
-uniform int uEncodeSrgb;
+uniform float uEncodeGamma;
+uniform int uTestPattern;
 in vec2 vUv;
 out vec4 fColour;
 
-vec3 linearToSrgb(vec3 linear)
+vec3 encodeGamma(vec3 colour, float gamma)
 {
-    // The piecewise IEC 61966-2-1 curve rather than pow(x, 1/2.2). The linear segment near black is the
-    // part that matters here: an approximation diverges most in shadow, which is where this scene is.
-    vec3 clamped = clamp(linear, 0.0, 1.0);
-    vec3 low = clamped * 12.92;
-    vec3 high = 1.055 * pow(clamped, vec3(1.0 / 2.4)) - 0.055;
-    return mix(low, high, greaterThan(clamped, vec3(0.0031308)));
+    // A tunable power curve, not the piecewise IEC 61966-2-1 sRGB curve this replaced.
+    //
+    // The piecewise curve is the right choice when the job is "encode linear values as sRGB", and that
+    // is what this started as. It is the wrong shape for what the uniform actually does now, which is
+    // compensate for an unidentified loss between our framebuffer and the panel. A fixed curve cannot be
+    // dialled in, and dialling it in is both what makes the image usable and the only measurement of the
+    // loss currently available: the exponent that looks correct is the exponent the display is eating.
+    //
+    // pow(x, 1/2.2) tracks the sRGB curve closely except in deep shadow, where the linear toe near black
+    // keeps sRGB from crushing. Worth remembering if the low end ever looks wrong at gamma 2.2 -- the
+    // divergence is real, it is just small next to the effect being corrected.
+    return pow(clamp(colour, 0.0, 1.0), vec3(1.0 / gamma));
 }
 
 void main()
@@ -475,8 +478,26 @@ void main()
     vec3 colour = texture(uImage, vUv).rgb;
     if (uSwizzle != 0)
         colour = colour.bgr;
-    if (uEncodeSrgb != 0)
-        colour = linearToSrgb(colour);
+
+    // Substitute a value this shader chose, so the screen can be compared against a number rather than
+    // against another image. Every measurement so far says the framebuffer is correct and every reference
+    // image has turned out to measure something other than the screen: OpenMW's own screenshot samples
+    // one render stage too early and captures the raster frame, and Game Bar tone maps its own output on
+    // an HDR desktop. Neither is ground truth, so this stops using images as evidence.
+    //
+    // The step wedge is the informative one. Uniform dimness and a compressed range look the same in a
+    // photograph but not in a wedge: if every band is darker by about the same proportion the frame is
+    // being scaled on the way to the display, whereas bands bunching toward black is a transfer function
+    // being applied that should not be.
+    if (uTestPattern == 1)
+        colour = vec3(1.0);
+    else if (uTestPattern == 2)
+        colour = vec3(0.5);
+    else if (uTestPattern == 3)
+        colour = vec3(floor(clamp(vUv.x, 0.0, 0.999) * 5.0) * 0.25);
+
+    if (uEncodeGamma > 1.001)
+        colour = encodeGamma(colour, uEncodeGamma);
     fColour = vec4(colour, 1.0);
 }
 )";
@@ -513,8 +534,9 @@ namespace RemixRT
         GLuint vao = 0;
         GLint imageLocation = -1;
         GLint swizzleLocation = -1;
-        GLint encodeSrgbLocation = -1;
+        GLint encodeGammaLocation = -1;
         GLint flipLocation = -1;
+        GLint testPatternLocation = -1;
         Entrypoints fns;
         // Only used by the readback path: an ordinary texture we own and upload into, as opposed to the
         // imported one that aliases Remix's memory.
@@ -733,8 +755,11 @@ namespace RemixRT
 
             resources->imageLocation = ext->glGetUniformLocation(resources->program, "uImage");
             resources->swizzleLocation = ext->glGetUniformLocation(resources->program, "uSwizzle");
-        resources->encodeSrgbLocation = ext->glGetUniformLocation(resources->program, "uEncodeSrgb");
+            resources->encodeGammaLocation
+                = ext->glGetUniformLocation(resources->program, "uEncodeGamma");
             resources->flipLocation = ext->glGetUniformLocation(resources->program, "uFlip");
+            resources->testPatternLocation
+                = ext->glGetUniformLocation(resources->program, "uTestPattern");
             // A VAO is required in core profile even with no vertex attributes.
             ext->glGenVertexArrays(1, &resources->vao);
             resources->fns = resolveEntrypoints();
@@ -833,15 +858,80 @@ namespace RemixRT
 
         // Read once, not per frame: an environment variable cannot change while the process runs, and this
         // is on the draw thread.
-        static const bool encodeSrgb = []() {
-            const char* value = std::getenv("OPENMW_REMIX_SRGB");
-            return value != nullptr && *value != '\0' && *value != '0';
+        //
+        // This is compensation for a fault we have not located, and it is labelled as such because
+        // calling it a fix would hide the open question.
+        //
+        // What is established. Applying this makes the image match what the same runtime and the same
+        // config produce under MGE-XE, and without it the frame is dim with collapsed midtones. But a
+        // Game Bar capture -- which records the framebuffer contents, not the panel -- looked correct
+        // BEFORE this was applied and looks too bright after. So the bits were already right, and this
+        // makes the data wrong in order to make the display look right. The loss is downstream of our
+        // framebuffer.
+        //
+        // The runtime source agrees the bits were right. dispatchSRGBDither runs inside the injectRTX
+        // chain (rtx_context.cpp:769), operates in place on m_finalOutput with AccessType::ReadWrite, and
+        // its shader applies linearToGamma when performSRGBConversion is set. That flag is
+        // "!captureScreenImage && g_allowSrgbConversionForOutput": captureScreenImage is true only on a
+        // single requested frame, and g_allowSrgbConversionForOutput is true here because this host calls
+        // the legacy dxvk_CreateD3D9 slot with editorModeEnabled false. Nothing writes m_finalOutput
+        // after that pass -- it is read into srcImage and blitted to the game target. The copy reads that
+        // same image.
+        //
+        // Ruled out on our side: the framebuffer is not sRGB (OpenMW requests 8/8/8/0 with no
+        // sRGB-capable attribute, engine.cpp), GL_FRAMEBUFFER_SRGB is disabled at the draw (probed), the
+        // readback texture is GL_RGBA16F rather than an _SRGB format so sampling applies no decode, and
+        // OpenMW's gamma ramp is identity at the configured gamma/contrast of 1.0.
+        //
+        // So this stays a knob rather than becoming a constant. The exponent that looks correct is the
+        // only measurement of the loss we currently have, and a value near 2.2 would mean a full extra
+        // sRGB decode is happening somewhere past the framebuffer, while something nearer 1.4 would mean
+        // it is milder and probably not a transfer function at all.
+        //
+        //   OPENMW_REMIX_GAMMA=1    off, raw pass-through
+        //   OPENMW_REMIX_GAMMA=2.2  a full sRGB-shaped encode
+        static const float encodeGamma = []() {
+            const char* value = std::getenv("OPENMW_REMIX_GAMMA");
+            float gamma = 2.2f;
+            if (value != nullptr && *value != '\0')
+            {
+                const double parsed = std::atof(value);
+                // Reject nonsense rather than silently dividing by it: the shader divides by this.
+                if (parsed >= 0.1 && parsed <= 10.0)
+                    gamma = static_cast<float>(parsed);
+                else
+                    Log(Debug::Warning) << "Remix composite: ignoring OPENMW_REMIX_GAMMA='" << value
+                                        << "', outside 0.1 to 10";
+            }
+            Log(Debug::Info)
+                << "Remix composite: display compensation gamma " << gamma
+                << (gamma > 1.001f ? "" : " (off, raw pass-through)")
+                << ". This corrects for a loss between our framebuffer and the panel that has not been "
+                   "located -- the framebuffer contents themselves measure correct without it. Tune with "
+                   "OPENMW_REMIX_GAMMA.";
+            return gamma;
         }();
-        if (mResources->encodeSrgbLocation >= 0)
-            ext->glUniform1i(mResources->encodeSrgbLocation, encodeSrgb ? 1 : 0);
+        if (mResources->encodeGammaLocation >= 0)
+            ext->glUniform1f(mResources->encodeGammaLocation, encodeGamma);
         if (mResources->flipLocation >= 0)
             ext->glUniform2f(mResources->flipLocation, mFlipHorizontal ? -1.0f : 1.0f,
                 mFlipVertical ? -1.0f : 1.0f);
+
+        // 1 = full white, 2 = mid grey, 3 = a five-step wedge from black to white. Logged once so a
+        // screenshot of a flat white frame cannot be mistaken for a broken composite later.
+        static const int testPattern = []() {
+            const char* value = std::getenv("OPENMW_REMIX_TESTPATTERN");
+            const int pattern = (value != nullptr && *value != '\0') ? std::atoi(value) : 0;
+            if (pattern != 0)
+                Log(Debug::Warning)
+                    << "Remix composite: drawing test pattern " << pattern
+                    << " INSTEAD of Remix's image (1=white 1.0, 2=grey 0.5, 3=step wedge). Compare "
+                       "against a white window on the desktop: if this white is dimmer, the frame was "
+                       "always correct and the display path is mapping it differently.";
+            return pattern;
+        }();
+        if (mResources->testPatternLocation >= 0)
+            ext->glUniform1i(mResources->testPatternLocation, testPattern);
 
         ext->glBindVertexArray(mResources->vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -884,18 +974,60 @@ namespace RemixRT
                     glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], GL_RGBA,
                         GL_UNSIGNED_BYTE, frame.data());
 
+                    // A histogram, because peak is not exposure and reporting it as though it were sent
+                    // this investigation down a blind alley for a long time.
+                    //
+                    // Peak said 0.667 and "8317 of 8320 non-black", and that was read as "Remix hands us a
+                    // well-exposed image". It says nothing of the kind. A pitch-dark interior with one
+                    // candle flame in it has exactly those numbers: the flame alone sets the peak, and
+                    // non-black counts any pixel above zero, including 1/255. The frame can be almost
+                    // entirely near-black and still report both.
+                    //
+                    // What settles it is where the bulk of the distribution sits, so keep the median and
+                    // the tails. The test pattern proved the display reaches full brightness for a value
+                    // of 1.0, so if the median here is very low then the image genuinely is dark and the
+                    // remaining question is Remix's exposure, not this display path.
                     unsigned char peak = 0;
                     std::size_t nonBlack = 0;
                     std::size_t sampled = 0;
+                    double sum = 0.0;
+                    std::size_t histogram[256] = {};
                     for (std::size_t p = 0; p < pixels; p += 997)
                     {
                         ++sampled;
-                        const unsigned char value = std::max(
-                            { frame[p * 4], frame[p * 4 + 1], frame[p * 4 + 2] });
-                        peak = std::max(peak, value);
+                        // Rec. 709 luma rather than the max channel. Max channel is what a peak probe
+                        // wants; perceived brightness is what a dimness complaint is about, and a
+                        // saturated blue reads far darker than its max channel suggests.
+                        const double luma = 0.2126 * frame[p * 4] + 0.7152 * frame[p * 4 + 1]
+                            + 0.0722 * frame[p * 4 + 2];
+                        const unsigned char value = static_cast<unsigned char>(luma + 0.5);
+                        ++histogram[value];
+                        sum += luma;
+                        peak = std::max(peak, std::max(
+                            { frame[p * 4], frame[p * 4 + 1], frame[p * 4 + 2] }));
                         if (value != 0)
                             ++nonBlack;
                     }
+
+                    const auto percentile = [&](double fraction) {
+                        const std::size_t target
+                            = static_cast<std::size_t>(double(sampled) * fraction);
+                        std::size_t running = 0;
+                        for (int bin = 0; bin < 256; ++bin)
+                        {
+                            running += histogram[bin];
+                            if (running >= target)
+                                return bin;
+                        }
+                        return 255;
+                    };
+                    const double mean = sampled > 0 ? sum / double(sampled) : 0.0;
+                    const int median = percentile(0.50);
+                    const int p90 = percentile(0.90);
+                    const int p99 = percentile(0.99);
+                    std::size_t belowTenPercent = 0;
+                    for (int bin = 0; bin < 26; ++bin)
+                        belowTenPercent += histogram[bin];
 
                     // One call, and it decides whether a transfer function is being applied twice. If the
                     // default framebuffer is sRGB and this is enabled, every value the composite writes is
@@ -904,12 +1036,15 @@ namespace RemixRT
                     const GLboolean framebufferSrgb = glIsEnabled(0x8DB9 /* GL_FRAMEBUFFER_SRGB */);
 
                     Log(Debug::Info)
-                        << "Remix composite: framebuffer after the draw peaks at " << int(peak)
-                        << "/255 (" << (peak / 255.0f) << "), " << nonBlack << " of " << sampled
-                        << " sampled non-black, GL_FRAMEBUFFER_SRGB "
+                        << "Remix composite: framebuffer luma over " << sampled << " samples -- median "
+                        << median << "/255 (" << (median / 255.0f) << "), mean "
+                        << (mean / 255.0) << ", p90 " << p90 << ", p99 " << p99 << ", peak channel "
+                        << int(peak) << " (" << (peak / 255.0f) << "), "
+                        << (100.0 * double(belowTenPercent) / double(std::max<std::size_t>(sampled, 1)))
+                        << "% below 0.1, " << nonBlack << " non-black, GL_FRAMEBUFFER_SRGB "
                         << (framebufferSrgb ? "ENABLED" : "disabled")
-                        << ". Directly comparable with the readback peak now: a large gap means the "
-                           "composite draw is losing it, agreement means the loss is after this point.";
+                        << ". The median is the exposure; the peak is one candle flame and was read as "
+                           "exposure for far too long.";
                 }
             }
         }
