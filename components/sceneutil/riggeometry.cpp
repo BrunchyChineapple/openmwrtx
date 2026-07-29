@@ -97,6 +97,49 @@ namespace SceneUtil
         return mSourceGeometry;
     }
 
+    osg::Matrixf RigGeometry::skinTransform() const
+    {
+        if (mSkinToSkelMatrix)
+            return (*mSkinToSkelMatrix) * mData->mTransform;
+        return mData->mTransform;
+    }
+
+    const std::vector<std::pair<RigGeometry::BoneWeights, RigGeometry::VertexList>>*
+    RigGeometry::getInfluences() const
+    {
+        return mData ? &mData->mInfluences : nullptr;
+    }
+
+    size_t RigGeometry::getBoneCount() const
+    {
+        return mData ? mData->mBones.size() : 0;
+    }
+
+    bool RigGeometry::getBoneMatrices(std::vector<osg::Matrixf>& boneMatrices) const
+    {
+        if (!mSkeleton || !mData)
+            return false;
+
+        // mNodes is filled from mData->mBones in initFromParentSkeleton, so a mismatch means the skin was
+        // never initialised against a skeleton and the indices in mInfluences have nothing to resolve
+        // against. Indexing anyway would be a straightforward out-of-bounds read.
+        if (mNodes.size() != mData->mBones.size())
+            return false;
+
+        const osg::Matrixf transform = skinTransform();
+
+        boneMatrices.resize(mNodes.size());
+        for (size_t i = 0; i < mNodes.size(); ++i)
+        {
+            if (mNodes[i] == nullptr)
+                boneMatrices[i] = osg::Matrixf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            else
+                boneMatrices[i]
+                    = mData->mBones[i].mInvBindMatrix * mNodes[i]->mMatrixInSkeletonSpace * transform;
+        }
+        return true;
+    }
+
     bool RigGeometry::initFromParentSkeleton(osg::NodeVisitor* nv)
     {
         const osg::NodePath& path = nv->getNodePath();
@@ -180,11 +223,7 @@ namespace SceneUtil
             ++boneInfo;
         }
 
-        osg::Matrixf transform;
-        if (mSkinToSkelMatrix)
-            transform = (*mSkinToSkelMatrix) * mData->mTransform;
-        else
-            transform = mData->mTransform;
+        const osg::Matrixf transform = skinTransform();
 
         for (const auto& [influences, vertices] : mData->mInfluences)
         {
@@ -249,11 +288,7 @@ namespace SceneUtil
         updateSkinToSkelMatrix(nv->getNodePath());
 
         osg::BoundingBox box;
-        osg::Matrixf transform;
-        if (mSkinToSkelMatrix)
-            transform = (*mSkinToSkelMatrix) * mData->mTransform;
-        else
-            transform = mData->mTransform;
+        const osg::Matrixf transform = skinTransform();
 
         size_t index = 0;
         for (const BoneInfo& info : mData->mBones)

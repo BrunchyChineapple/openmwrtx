@@ -47,6 +47,7 @@ namespace SceneUtil
 
         using BoneWeight = std::pair<size_t, float>;
         using BoneWeights = std::vector<BoneWeight>;
+        using VertexList = std::vector<unsigned short>;
 
         void setBoneInfo(std::vector<BoneInfo>&& bones);
         // Convert influences in bone and weight list per vertex format
@@ -61,6 +62,40 @@ namespace SceneUtil
         void setRootBone(std::string_view name);
 
         osg::ref_ptr<osg::Geometry> getSourceGeometry() const;
+
+        /// Per-vertex bone influences, grouped by identical weight set, or null before influences are set.
+        ///
+        /// Each entry pairs one set of (bone index, weight) pairs with every vertex that shares it. The
+        /// grouping is a real space saving on a character mesh -- most vertices share a handful of distinct
+        /// weight sets -- but it means a consumer wanting per-vertex data has to expand it. Vertices with
+        /// no influences at all are absent from the list entirely, and those keep their bind-pose position:
+        /// the deformation writes only the vertices it finds here.
+        ///
+        /// Exposed for consumers that deform the mesh themselves rather than reading the result. The
+        /// deformed geometry this class produces is double buffered and private on purpose, so it is not
+        /// something an outside caller can safely hold on to.
+        const std::vector<std::pair<BoneWeights, VertexList>>* getInfluences() const;
+
+        /// Bones the influence indices refer to. Available as soon as the influences are, which is before
+        /// a parent skeleton has been found -- the influence data is static, only the matrices are not.
+        size_t getBoneCount() const;
+
+        /// Fills \a boneMatrices with one matrix per bone, ready to be applied to bind-pose vertices.
+        ///
+        /// The matrices are exactly what cull() blends: bind-pose vertex to this drawable's local space,
+        /// with the skin transform already folded in. Folding it in per bone rather than leaving it to the
+        /// caller is valid because the weights of a vertex sum to one, so
+        /// `sum(w_i * B_i) * T == sum(w_i * (B_i * T))` -- and it means a GPU consumer needs nothing but
+        /// this array and the weights.
+        ///
+        /// A bone the skeleton could not resolve gets an all-zero matrix, which contributes nothing when
+        /// blended. That reproduces what cull() does by skipping the influence: the vertex is pulled
+        /// toward the origin in proportion to the missing weight. It looks wrong because the skin *is*
+        /// wrong, and silently substituting an identity would hide a broken mesh rather than show it.
+        ///
+        /// @return false if the skin is not ready -- no parent skeleton found yet, or no influence data --
+        ///         in which case \a boneMatrices is untouched.
+        bool getBoneMatrices(std::vector<osg::Matrixf>& boneMatrices) const;
 
         void accept(osg::NodeVisitor& nv) override;
         bool supports(const osg::PrimitiveFunctor&) const override { return true; }
@@ -93,7 +128,6 @@ namespace SceneUtil
 
         osg::ref_ptr<osg::RefMatrix> mSkinToSkelMatrix;
 
-        using VertexList = std::vector<unsigned short>;
         struct InfluenceData : public osg::Referenced
         {
             std::vector<BoneInfo> mBones;
@@ -110,6 +144,9 @@ namespace SceneUtil
         bool initFromParentSkeleton(osg::NodeVisitor* nv);
 
         void updateSkinToSkelMatrix(const osg::NodePath& nodePath);
+
+        /// Skeleton space to this drawable's local space. Requires mData.
+        osg::Matrixf skinTransform() const;
     };
 
 }
