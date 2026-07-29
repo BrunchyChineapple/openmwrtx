@@ -477,6 +477,20 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                     SDL_SetRelativeMouseMode(mRemixSavedMouseRelative ? SDL_TRUE : SDL_FALSE);
                     if (mWindow != nullptr)
                         SDL_SetWindowGrab(mWindow, mRemixSavedMouseGrab ? SDL_TRUE : SDL_FALSE);
+
+                    // Then have OpenMW re-assert its own input state, rather than trusting that
+                    // restoring the two SDL flags was enough.
+                    //
+                    // While the menu is up, both sides have been touching cursor state: this code moved
+                    // the pointer out of relative mode, and the runtime drives the Win32 cursor display
+                    // counter to force its own cursor to be the only one visible. Putting back what we
+                    // personally changed leaves anything else out of step, and the symptom is OpenMW's
+                    // cursor never coming back after the menu has been used once.
+                    //
+                    // changeInputMode derives everything -- cursor visibility, mouse look, the GUI
+                    // cursor -- from the window manager's own idea of whether a GUI is open, so it is the
+                    // authoritative answer rather than a guess at what the state was.
+                    mInputManager->changeInputMode(mWindowManager->isGuiMode());
                 }
                 Log(Debug::Info) << "Remix: developer menu " << (menuWantsMouse ? "opened" : "closed")
                                  << "; pointer " << (menuWantsMouse ? "released to it" : "returned")
@@ -494,7 +508,44 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             unsigned int readWidth = 0;
             unsigned int readHeight = 0;
             if (mRemix->readOutputPixels(mRemixReadback, readWidth, readHeight))
+            {
+                // Report how bright Remix's output actually is, periodically.
+                //
+                // "The screen went black" has come up repeatedly and is ambiguous every time: it can mean
+                // Remix rendered nothing, or that it rendered and the image is not reaching the screen,
+                // or that the game itself is showing black -- a loading screen, a fade, the death
+                // screen. Those need completely different investigations and nothing in the log
+                // distinguished them.
+                //
+                // Free to measure here: these pixels are already in host memory for the upload, so this
+                // costs a sparse walk of a buffer that was going to be touched anyway. Sampled rather
+                // than scanned because at 4K a full pass is 33 MB. Must happen before takeReadbackFrame,
+                // which swaps the buffer away.
+                static unsigned readbackFrames = 0;
+                if (++readbackFrames % 600 == 0 && !mRemixReadback.empty())
+                {
+                    unsigned char brightest = 0;
+                    std::size_t nonBlack = 0;
+                    std::size_t sampled = 0;
+                    // Every 997th pixel: prime, so the stride cannot land in step with the row length
+                    // and sample only one column of the image.
+                    for (std::size_t i = 0; i + 3 < mRemixReadback.size(); i += 997 * 4)
+                    {
+                        ++sampled;
+                        const unsigned char value = std::max({ mRemixReadback[i], mRemixReadback[i + 1],
+                            mRemixReadback[i + 2] });
+                        brightest = std::max(brightest, value);
+                        if (value != 0)
+                            ++nonBlack;
+                    }
+                    Log(Debug::Info) << "Remix readback: " << nonBlack << " of " << sampled
+                                     << " sampled pixels non-black, brightest " << int(brightest)
+                                     << "/255. All-black here means Remix produced nothing; bright here "
+                                        "with a black screen means the image is not reaching it.";
+                }
+
                 mRemixComposite->takeReadbackFrame(mRemixReadback, readWidth, readHeight);
+            }
         }
 
         // Report the outcome of the pump once. Each of these can fail quietly -- a bad return here is
@@ -1004,6 +1055,14 @@ void OMW::Engine::prepareEngine()
             // unaffected -- which is exactly why the symptom was a sky rotated ninety degrees, with a
             // horizon running vertically down the screen, rather than an inverted world.
             mRemix->setConfigVariable("rtx.zUp", "1");
+
+            // Centimetres per game unit. Morrowind is about 69.99 units to the metre, so 1.4288 cm each.
+            //
+            // This does not affect geometry, the camera or lighting -- it is not a global unit conversion
+            // -- but it does drive the atmosphere's worldUnitsPerKm, cloud shadow positioning and the
+            // precipitation particle scale. Left at 1 those all believe a kilometre is 100000 units when
+            // for Morrowind it is 143000, a 43% error in every atmospheric distance.
+            mRemix->setConfigVariable("rtx.sceneScale", "1.43");
             mRemix->setConfigVariable("rtx.skyMode", "1");
             mRemix->setGameValue("__weather.target", "clear");
             mRemix->setGameValue("__weather.blend_seconds", "0");
