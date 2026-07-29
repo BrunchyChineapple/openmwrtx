@@ -101,6 +101,13 @@ namespace MWRender
             /// blending and no test at all, and a path tracer has to be told to make a cutout out of it
             /// -- see materialFor. Without this, alpha-blended leaves come through as solid polygons.
             bool mAlphaBlend = false;
+        /// Whether the surface blends ADDITIVELY, i.e. its blend function has a destination factor of
+        /// GL_ONE and so can only ever brighten what is behind it.
+        ///
+        /// This is the difference between a flame and a smoke plume, and it cannot be inferred from
+        /// mAlphaBlend -- both are blended, and Morrowind uses the same particle machinery for both. An
+        /// additive surface is emissive by construction; an alpha-blended one occludes and must be lit.
+        bool mAdditive = false;
             /// The 2D affine part of unit 0's texture matrix, as
             /// { m00, m01, m10, m11, m30, m31 }, applied to texcoords as a row vector.
             ///
@@ -132,8 +139,11 @@ namespace MWRender
         ///
         /// @param rig when non-null, its current bone matrices are submitted with the instance. Must be
         ///        the same rig the mesh was created from.
+        /// @param pickingValue identifies this draw so the developer menu can resolve a click in the
+        ///        scene to it. Must be distinct per draw within a frame; zero leaves it unpickable.
         void drawSubmitted(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
-            bool doubleSided, const SceneUtil::RigGeometry* rig = nullptr);
+            bool doubleSided, const SceneUtil::RigGeometry* rig = nullptr,
+            unsigned int pickingValue = 0);
 
         /// Records a submitted instance's world-space origin, for the diagnostic extent log.
         void noteInstancePosition(double x, double y, double z);
@@ -237,6 +247,9 @@ namespace MWRender
         std::unordered_map<const void*, ParticleMesh> mParticleMeshes;
         /// Particles submitted on the last call to submit(), for the report line.
         unsigned int mLastParticleCount = 0;
+        /// Particle *instances* this frame, as opposed to the quad count above. Only used to hand each one
+        /// a distinct object-picking value, offset past the traversal's range so the two cannot collide.
+        unsigned int mParticleInstances = 0;
 
         /// Converts and caches \a geometry against \a material, returning its mesh handle, or 0.
         unsigned long long meshFor(osg::Geometry& geometry, unsigned long long material,

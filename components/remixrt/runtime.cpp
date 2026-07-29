@@ -1095,7 +1095,8 @@ namespace RemixRT
     static_assert(sizeof(remixapi_Transform) == 12 * sizeof(float), "transform layout drift");
 
     bool Runtime::drawInstance(unsigned long long mesh, const float* transform,
-        unsigned int categoryFlags, bool doubleSided, const float* boneTransforms, unsigned int boneCount)
+        unsigned int categoryFlags, bool doubleSided, const float* boneTransforms, unsigned int boneCount,
+        unsigned int objectPickingValue)
     {
         if (!mImpl->mStarted || mImpl->mApi.DrawInstance == nullptr || mesh == 0 || transform == nullptr)
             return false;
@@ -1110,6 +1111,10 @@ namespace RemixRT
         // Chained rather than copied: remixapi_Transform is three rows of four floats, which is the
         // layout the caller already hands over, so the array can be pointed at directly. The struct only
         // has to outlive the call, and the runtime deep-copies what it keeps.
+        //
+        // Both extensions go on one pNext chain, newest first. Order carries no meaning -- the runtime
+        // finds each by struct type with pnext::find -- but the links have to be built so neither is
+        // orphaned, which is the easy mistake when a second one is added later.
         remixapi_InstanceInfoBoneTransformsEXT bones = {};
         if (boneTransforms != nullptr && boneCount > 0)
         {
@@ -1117,6 +1122,29 @@ namespace RemixRT
             bones.boneTransforms_values = reinterpret_cast<const remixapi_Transform*>(boneTransforms);
             bones.boneTransforms_count = std::min(boneCount, kMaxBones);
             instance.pNext = &bones;
+        }
+
+        // What the developer menu resolves a click in the world to.
+        //
+        // Without this the menu cannot select anything by pointing at it, which is the primary way
+        // textures get tagged and materials get picked for replacement. The runtime reads back a picking
+        // image and maps the value found at that pixel to the draw's texture hash, but the fork only
+        // records that mapping when the value is non-zero: externalDrawObjectPicking guards on
+        // drawCall.drawCallID != 0 and stores nothing otherwise. A host that never attaches this struct
+        // therefore submits every instance as zero, no metadata is kept for any of them, and the readback
+        // has nothing to resolve -- clicking the scene silently does nothing, with the thumbnail grid
+        // still working because that path keys on the texture hash directly.
+        //
+        // Values must be distinct per draw within a frame; the runtime warns once and drops the collision
+        // otherwise. They need no stability across frames, because a request is answered from the frame
+        // it was made against.
+        remixapi_InstanceInfoObjectPickingEXT picking = {};
+        if (objectPickingValue != 0)
+        {
+            picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
+            picking.objectPickingValue = objectPickingValue;
+            picking.pNext = instance.pNext;
+            instance.pNext = &picking;
         }
 
         return mImpl->mApi.DrawInstance(&instance) == REMIXAPI_ERROR_CODE_SUCCESS;

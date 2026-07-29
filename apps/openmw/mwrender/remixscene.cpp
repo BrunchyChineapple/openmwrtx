@@ -15,6 +15,7 @@
 #include <osg/TriangleIndexFunctor>
 
 #include <osg/AlphaFunc>
+#include <osg/BlendFunc>
 #include <osg/Image>
 #include <osg/Light>
 #include <osg/StateSet>
@@ -119,14 +120,17 @@ namespace
     /// effectively stopped.
     constexpr float kLegacyLightEndValue = 1.0f / 255.0f;
 
-    /// Emissive radiance scale for particle quads.
+    /// Emissive radiance scale for ADDITIVELY blended particle quads.
     ///
-    /// Particles are self-lit rather than shaded. Morrowind's are overwhelmingly flames, glows, sparks and
-    /// magic, all of which emit; the exceptions -- smoke, fog, dust -- are the minority, and a smoke puff
-    /// that glows faintly is a far smaller error than a flame rendered as grey cardboard, which is what a
-    /// path tracer produces from a non-emissive quad. Distinguishing the two properly means reading the
-    /// blend equation and deciding additive from alpha, which is worth doing once particles are on screen
-    /// and can be judged.
+    /// Applied only where SurfaceState::mAdditive says the blend function accumulates -- flames, glows,
+    /// sparks, magic. Those are self-lit by construction and come through as grey cardboard without it,
+    /// which is what a path tracer makes of a non-emissive quad.
+    ///
+    /// It used to be applied to every particle unconditionally, on the reasoning that a faintly glowing
+    /// smoke puff was the smaller error. That was wrong twice over: at 6.0 over a pale texture the puff is
+    /// not faintly glowing but saturated solid white, and an emitter is outside the lighting solution
+    /// altogether -- it takes no shadow and picks up no bounce colour, so smoke stops behaving like smoke
+    /// rather than merely looking too bright.
     constexpr float kParticleEmissive = 6.0f;
 
     /// Cutout threshold for particles, far below the one used for foliage.
@@ -797,8 +801,12 @@ namespace
             // The rig is passed on only if the mesh actually carries skinning. A rig whose skin this code
             // refused still produced a perfectly good static mesh from its bind pose, and sending bone
             // transforms for it would be asking the runtime to deform vertices that have no weights.
-            mScene.drawSubmitted(
-                mesh, transform, categories, true, mScene.lastMeshIsSkinned() ? rig : nullptr);
+            // mInstances + 1 as the picking identity: it is already a per-frame running count, and the
+            // one thing the runtime requires is that no two draws in a frame share a value. Zero means
+            // "not pickable", hence the offset -- the first instance of a frame would otherwise opt
+            // itself out.
+            mScene.drawSubmitted(mesh, transform, categories, true,
+                mScene.lastMeshIsSkinned() ? rig : nullptr, mInstances + 1);
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
         }
@@ -909,6 +917,19 @@ namespace
             const unsigned int blendMode = stateSet.getMode(GL_BLEND);
             if (blendMode != osg::StateAttribute::INHERIT)
                 surface.mAlphaBlend = (blendMode & osg::StateAttribute::ON) != 0;
+
+            // Additive blending, which is what separates a flame from a smoke plume.
+            //
+            // The destination factor is the whole test. GL_ONE means the fragment is ADDED to what is
+            // already in the framebuffer, so the surface only ever brightens the scene -- that is emission,
+            // and it covers both (ONE, ONE) and (SRC_ALPHA, ONE). Ordinary alpha blending is
+            // (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), which replaces rather than accumulates, so the surface
+            // occludes what is behind it and must be lit rather than lit-from-within.
+            if (const auto* blendFunc = dynamic_cast<const osg::BlendFunc*>(
+                    stateSet.getAttribute(osg::StateAttribute::BLENDFUNC)))
+            {
+                surface.mAdditive = blendFunc->getDestination() == GL_ONE;
+            }
         }
 
         void pushState(osg::Node& node)
@@ -1261,6 +1282,7 @@ namespace MWRender
         mSkinnedInstances = 0;
         mSkinnedDropped = 0;
         mLastParticleCount = 0;
+        mParticleInstances = 0;
         mHaveExtent = false;
         if (sceneRoot == nullptr || mDefaultMaterial == 0)
             return 0;
@@ -1690,11 +1712,12 @@ namespace MWRender
     }
 
     void RemixScene::drawSubmitted(unsigned long long mesh, const float* transform,
-        unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig)
+        unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig,
+        unsigned int pickingValue)
     {
         if (rig == nullptr)
         {
-            mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided);
+            mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided, nullptr, 0, pickingValue);
             return;
         }
 
@@ -1735,7 +1758,7 @@ namespace MWRender
         }
 
         if (mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided,
-                mBoneTransformScratch.data(), boneCount))
+                mBoneTransformScratch.data(), boneCount, pickingValue))
             ++mSkinnedInstances;
     }
 
@@ -1759,7 +1782,18 @@ namespace MWRender
         const bool worldSpace = userData != nullptr && userData->getNumDescriptions() > 0
             && userData->getDescriptions()[0] == "worldspace";
 
-        const unsigned long long material = materialFor(surface, kParticleEmissive);
+        // Emissive only for additive particles. This is the distinction kParticleEmissive's own comment
+        // said was worth making once particles were on screen and could be judged -- they are, and smoke
+        // was coming through as a solid white puff, because a fixed emissive of 6.0 over a pale grey smoke
+        // texture saturates every channel long before it reaches the tonemapper.
+        //
+        // Flames, glows, sparks and magic blend additively and genuinely emit, so they keep the term. Smoke,
+        // fog and dust blend with ONE_MINUS_SRC_ALPHA: they occlude what is behind them and are lit by the
+        // scene like anything else, which is what a path tracer is good at. Handing them an emissive term
+        // does not merely brighten them, it removes them from the lighting solution entirely -- an emitter
+        // takes no shadow and picks up no colour from its surroundings, so smoke stops being smoke.
+        const float particleEmissive = surface.mAdditive ? kParticleEmissive : 0.0f;
+        const unsigned long long material = materialFor(surface, particleEmissive);
         if (material == 0)
             return;
 
@@ -1844,7 +1878,14 @@ namespace MWRender
         // used directly and because world-space particle systems have no node transform to apply anyway.
         constexpr float identity[12]
             = { 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f };
-        mRuntime.drawInstance(mesh, identity, categoryFlags, true);
+        // Picking values for particles start above the traversal's ceiling rather than continuing its
+        // count, because the two paths advance independently and the runtime only warns once about a
+        // collision before dropping it. Reserving a disjoint range is cheaper than coordinating a shared
+        // counter across them, and it keeps flames and smoke selectable in the developer menu -- the
+        // textures most likely to need tagging by hand.
+        ++mParticleInstances;
+        mRuntime.drawInstance(
+            mesh, identity, categoryFlags, true, nullptr, 0, kMaxInstancesPerFrame + mParticleInstances);
         mLastParticleCount += static_cast<unsigned int>(mVertexScratch.size() / 4);
     }
 

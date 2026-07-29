@@ -394,8 +394,12 @@ namespace RemixRT
         ///        entry per bone the mesh's skinning indices refer to. Required for a mesh created with
         ///        skinning and meaningless without one. At most kMaxBones.
         /// @param boneCount number of entries in \a boneTransforms.
+        /// @param objectPickingValue identifies this draw to the developer menu, so clicking the scene
+        ///        selects what is under the cursor. Must be non-zero and distinct per draw within a
+        ///        frame; zero opts out and leaves the instance unpickable.
         bool drawInstance(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
-            bool doubleSided, const float* boneTransforms = nullptr, unsigned int boneCount = 0);
+            bool doubleSided, const float* boneTransforms = nullptr, unsigned int boneCount = 0,
+            unsigned int objectPickingValue = 0);
 
         /// Most bones one skinned instance can have. The runtime packs bone indices one per byte, so
         /// this is a hard limit rather than a tuning value.
