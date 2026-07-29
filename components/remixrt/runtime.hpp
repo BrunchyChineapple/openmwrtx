@@ -9,6 +9,14 @@ struct SDL_Window;
 
 namespace RemixRT
 {
+    /// Decodes one IEEE 754 binary16.
+    ///
+    /// Lives here because the readback surface is half-float, so anything that wants to inspect Remix's
+    /// output as numbers rather than bytes needs it -- the brightness probe being the reason it exists.
+    /// Handles subnormals and infinities rather than only the normal range, because a path tracer's output
+    /// legitimately contains both very small values in shadow and very large ones in a highlight.
+    float halfToFloat(unsigned short bits);
+
     /// Owns the lifetime of the RTX Remix runtime and the handle to its C API.
     ///
     /// Remix reconstructs a scene from meshes, materials, lights and a camera and path-traces it.
@@ -152,7 +160,13 @@ namespace RemixRT
         /// Treat it as a diagnostic and tuning path, not the shipping one -- at 4K it moves 33 MB a
         /// frame. One staging surface is reused across calls.
         ///
-        /// @param out resized to width * height * 4 on success.
+        /// Bytes per pixel of the readback, and of the shared output surface it comes from.
+        ///
+        /// Eight, not four: the surface is half-float RGBA to match the runtime's own final colour image,
+        /// so the readback carries the range the renderer produced instead of an eight-bit clamp of it.
+        static constexpr unsigned int kOutputBytesPerPixel = 8;
+
+        /// @param out resized to width * height * kOutputBytesPerPixel on success.
         bool readOutputPixels(std::vector<unsigned char>& out, unsigned int& outWidth, unsigned int& outHeight);
 
         /// Nanoseconds the last readOutputPixels spent in each of its three stages.
@@ -325,9 +339,12 @@ namespace RemixRT
         /// @return an opaque handle, or 0 on failure.
         /// @param normalTextureHash optional tangent-space normal map, uploaded through a *linear*
         ///        format. Zero for none, which leaves the geometric normal in place.
+        /// @param emissive radiance multiplier for self-lit surfaces, taking the albedo texture as the
+        ///        emissive colour. Zero for an ordinary surface. Needed for particles: a flame is a
+        ///        light source, and a path tracer given a non-emissive flame quad renders grey cardboard.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
-            unsigned long long normalTextureHash = 0);
+            unsigned long long normalTextureHash = 0, float emissive = 0.0f);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

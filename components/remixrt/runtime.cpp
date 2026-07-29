@@ -609,7 +609,17 @@ namespace RemixRT
         // there is no Win32 handle to hand to OpenGL. It must start as null to request export mode
         // rather than import.
         HANDLE sharedHandle = nullptr;
-        HRESULT hr = mImpl->mDevice->CreateRenderTarget(width, height, D3DFMT_A8R8G8B8,
+        // Half float, not A8R8G8B8, and this is the first link in the chain rather than a refinement.
+        //
+        // The runtime's final colour image is VK_FORMAT_R16G16B16A16_SFLOAT (rtx_resources.cpp, "final
+        // output"). Asking for an eight-bit shared surface made dxvk_CopyRenderingOutput clamp and quantise
+        // that on the way in, so everything downstream was working from an SDR copy of an HDR image and no
+        // amount of care later could recover the range. Matching the source format is the only way the
+        // question "how much range is there" can even be asked.
+        //
+        // Note this also changes the channel order: D3DFMT_A16B16G16R16F maps to the same Vulkan format as
+        // the source, so the data arrives as RGBA rather than the BGRA an A8R8G8B8 surface produced.
+        HRESULT hr = mImpl->mDevice->CreateRenderTarget(width, height, D3DFMT_A16B16G16R16F,
             D3DMULTISAMPLE_NONE, 0, FALSE, &mImpl->mOutputSurface, &sharedHandle);
         if (FAILED(hr) || mImpl->mOutputSurface == nullptr)
         {
@@ -913,7 +923,7 @@ namespace RemixRT
 
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
-        unsigned char alphaTestReference, unsigned long long normalTextureHash)
+        unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -948,6 +958,15 @@ namespace RemixRT
         material.albedoTexture = pseudoPath;
         if (normalTextureHash != 0)
             material.normalTexture = normalPath;
+        if (emissive > 0.0f)
+        {
+            // The albedo doubles as the emissive colour, so a flame's own texture drives what it emits
+            // rather than a flat tint. Radiance scale rather than colour, for the same reason the light
+            // conversion separates the two.
+            material.emissiveTexture = pseudoPath;
+            material.emissiveIntensity = emissive;
+            material.emissiveColorConstant = { 1.0f, 1.0f, 1.0f };
+        }
         applyDefaultSamplerState(material);
 
         remixapi_MaterialHandle handle = nullptr;
@@ -1037,6 +1056,38 @@ namespace RemixRT
             return false;
         return mImpl->mApi.DrawLightInstance(reinterpret_cast<remixapi_LightHandle>(light))
             == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    float halfToFloat(unsigned short bits)
+    {
+        const unsigned int sign = static_cast<unsigned int>(bits & 0x8000u) << 16;
+        const unsigned int exponent = (bits >> 10) & 0x1Fu;
+        const unsigned int mantissa = bits & 0x3FFu;
+
+        if (exponent == 0)
+        {
+            // Zero or subnormal. Scaling the mantissa by 2^-24 is exact and avoids a normalisation loop
+            // that is easy to get subtly wrong for no benefit at this call rate.
+            const float value = static_cast<float>(mantissa) * 5.9604644775390625e-8f;
+            return (bits & 0x8000u) != 0 ? -value : value;
+        }
+
+        unsigned int result = 0;
+        if (exponent == 0x1Fu)
+        {
+            // Infinity or NaN, preserved rather than clamped, so a probe reporting a peak cannot quietly
+            // turn a broken frame into a plausible-looking number.
+            result = sign | 0x7F800000u | (mantissa << 13);
+        }
+        else
+        {
+            // Rebias the exponent from 15 to 127 and shift the mantissa into place.
+            result = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+        }
+
+        float out = 0.0f;
+        std::memcpy(&out, &result, sizeof(out));
+        return out;
     }
 
     static_assert(Runtime::kMaxBones == REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT, "bone limit drift");
@@ -1160,7 +1211,7 @@ namespace RemixRT
             if (surface != nullptr)
                 continue;
             const HRESULT createHr = mImpl->mDevice->CreateOffscreenPlainSurface(
-                width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &surface, nullptr);
+                width, height, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &surface, nullptr);
             if (FAILED(createHr) || surface == nullptr)
             {
                 Log(Debug::Error) << "Remix readback: CreateOffscreenPlainSurface failed, hr 0x"
@@ -1220,8 +1271,8 @@ namespace RemixRT
         }
 
         const auto copyStart = std::chrono::steady_clock::now();
-        // Row by row: the locked pitch is not necessarily width * 4.
-        const size_t rowBytes = static_cast<size_t>(width) * 4;
+        // Row by row: the locked pitch is not necessarily width * bytes per pixel.
+        const size_t rowBytes = static_cast<size_t>(width) * kOutputBytesPerPixel;
         out.resize(rowBytes * height);
         const auto* src = static_cast<const unsigned char*>(locked.pBits);
         for (UINT y = 0; y < height; ++y)

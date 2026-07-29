@@ -33,6 +33,10 @@ namespace
     // Core GL since 1.2, but <GL/gl.h> on Windows stops at 1.1, so it is not necessarily declared.
     // Valid as a transfer format only, which is exactly how the readback path uses it.
     constexpr GLenum kBgra = 0x80E1;
+/// Spelled out for the same reason as kBgra: the GL headers reachable from here are the ones OSG exposes,
+/// which predate these tokens. GL_RGBA16F and GL_HALF_FLOAT from the OpenGL 3.0 core additions.
+constexpr GLenum kRgba16f = 0x881A;
+constexpr GLenum kHalfFloat = 0x140B;
 
     // VkExternalMemoryHandleTypeFlagBits values we know how to translate.
     constexpr unsigned int kVkHandleTypeOpaqueWin32 = 0x00000002;
@@ -433,15 +437,47 @@ void main()
     // the driver reorders on the way in. Which path is active can change at runtime, so the choice is a
     // uniform rather than two programs: picking a shader once at creation would bake in whichever mode
     // happened to be active on the first frame.
+    // uEncodeSrgb exists because this composite replaces a step we bypass, and may have to replace more of
+    // it than it does.
+    //
+    // A D3D9 game running under Remix never reaches this code: the runtime is its renderer and presents
+    // through DXVK's own swapchain blitter. That presenter offers both UNORM and _SRGB swapchain formats
+    // (d3d9_swapchain.cpp), and a blit into an _SRGB image applies a linear-to-sRGB encode on the way out.
+    // If the runtime's final colour image holds linear values, that encode is the last thing done to them
+    // before they reach the display -- and this composite, which takes the image out of the runtime before
+    // presentation, does not do it.
+    //
+    // Writing linear values where sRGB is expected maps 0.5 to roughly 0.21: everything darkens and the
+    // midtones collapse toward each other, which reads as dim and washed out at the same time. That is the
+    // symptom pair being chased, and it is exactly what a missing transfer function looks like.
+    //
+    // A uniform rather than a decision, because the premise -- that the image is linear -- is unverified,
+    // and the screen can settle it in one restart where reasoning has repeatedly failed to.
     const char* const kFragmentShader = R"(#version 330 core
 uniform sampler2D uImage;
 uniform int uSwizzle;
+uniform int uEncodeSrgb;
 in vec2 vUv;
 out vec4 fColour;
+
+vec3 linearToSrgb(vec3 linear)
+{
+    // The piecewise IEC 61966-2-1 curve rather than pow(x, 1/2.2). The linear segment near black is the
+    // part that matters here: an approximation diverges most in shadow, which is where this scene is.
+    vec3 clamped = clamp(linear, 0.0, 1.0);
+    vec3 low = clamped * 12.92;
+    vec3 high = 1.055 * pow(clamped, vec3(1.0 / 2.4)) - 0.055;
+    return mix(low, high, greaterThan(clamped, vec3(0.0031308)));
+}
+
 void main()
 {
     vec3 colour = texture(uImage, vUv).rgb;
-    fColour = vec4(uSwizzle != 0 ? colour.bgr : colour, 1.0);
+    if (uSwizzle != 0)
+        colour = colour.bgr;
+    if (uEncodeSrgb != 0)
+        colour = linearToSrgb(colour);
+    fColour = vec4(colour, 1.0);
 }
 )";
 
@@ -477,6 +513,7 @@ namespace RemixRT
         GLuint vao = 0;
         GLint imageLocation = -1;
         GLint swizzleLocation = -1;
+        GLint encodeSrgbLocation = -1;
         GLint flipLocation = -1;
         Entrypoints fns;
         // Only used by the readback path: an ordinary texture we own and upload into, as opposed to the
@@ -583,8 +620,15 @@ namespace RemixRT
             if (mResources->readbackTexture == 0)
                 glGenTextures(1, &mResources->readbackTexture);
             glBindTexture(GL_TEXTURE_2D, mResources->readbackTexture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width),
-                static_cast<GLsizei>(height), 0, kBgra, GL_UNSIGNED_BYTE, nullptr);
+            // RGBA16F, matching the half-float shared surface the readback now comes from. An RGBA8
+            // texture here would undo the point of widening the chain: the range would survive the copy
+            // out of the runtime and then be clamped on upload instead.
+            //
+            // GL_RGBA rather than GL_BGRA for the transfer, because D3DFMT_A16B16G16R16F maps to the same
+            // Vulkan format as the runtime's own output and so arrives in RGBA order, unlike the A8R8G8B8
+            // surface this replaces.
+            glTexImage2D(GL_TEXTURE_2D, 0, kRgba16f, static_cast<GLsizei>(width),
+                static_cast<GLsizei>(height), 0, GL_RGBA, kHalfFloat, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -610,7 +654,7 @@ namespace RemixRT
             const auto start = std::chrono::steady_clock::now();
             glBindTexture(GL_TEXTURE_2D, mResources->readbackTexture);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(mResources->readbackWidth),
-                static_cast<GLsizei>(mResources->readbackHeight), kBgra, GL_UNSIGNED_BYTE,
+                static_cast<GLsizei>(mResources->readbackHeight), GL_RGBA, kHalfFloat,
                 mReadbackUpload.data());
             checkGl("glTexSubImage2D(readback)");
             const auto end = std::chrono::steady_clock::now();
@@ -689,6 +733,7 @@ namespace RemixRT
 
             resources->imageLocation = ext->glGetUniformLocation(resources->program, "uImage");
             resources->swizzleLocation = ext->glGetUniformLocation(resources->program, "uSwizzle");
+        resources->encodeSrgbLocation = ext->glGetUniformLocation(resources->program, "uEncodeSrgb");
             resources->flipLocation = ext->glGetUniformLocation(resources->program, "uFlip");
             // A VAO is required in core profile even with no vertex attributes.
             ext->glGenVertexArrays(1, &resources->vao);
@@ -770,8 +815,9 @@ namespace RemixRT
         if (readback)
         {
             texture = uploadReadbackTexture(ext);
-            // Uploaded with GL_BGRA as the transfer format, so the driver has already put the channels
-            // in order and no shader-side swap is wanted.
+            // No shader-side swap: the half-float surface arrives in RGBA order already, since it shares a
+            // Vulkan format with the runtime's own output rather than being the byte-reversed BGRA an
+            // A8R8G8B8 surface produced.
             swizzle = false;
             if (texture == 0)
                 return;
@@ -784,6 +830,15 @@ namespace RemixRT
             ext->glUniform1i(mResources->imageLocation, 0);
         if (mResources->swizzleLocation >= 0)
             ext->glUniform1i(mResources->swizzleLocation, swizzle ? 1 : 0);
+
+        // Read once, not per frame: an environment variable cannot change while the process runs, and this
+        // is on the draw thread.
+        static const bool encodeSrgb = []() {
+            const char* value = std::getenv("OPENMW_REMIX_SRGB");
+            return value != nullptr && *value != '\0' && *value != '0';
+        }();
+        if (mResources->encodeSrgbLocation >= 0)
+            ext->glUniform1i(mResources->encodeSrgbLocation, encodeSrgb ? 1 : 0);
         if (mResources->flipLocation >= 0)
             ext->glUniform2f(mResources->flipLocation, mFlipHorizontal ? -1.0f : 1.0f,
                 mFlipVertical ? -1.0f : 1.0f);
@@ -794,6 +849,71 @@ namespace RemixRT
 
         glBindTexture(GL_TEXTURE_2D, 0);
         ext->glUseProgram(0);
+        // What actually landed in the framebuffer, read back from it.
+        //
+        // This exists because every explanation for "the screen is dimmer than a screenshot of it" has been
+        // wrong so far, and they were all reasoned rather than measured. The readback probe says Remix hands
+        // us a well-exposed image peaking near 1.0. This says what survives the composite draw into
+        // OpenMW's default framebuffer. Between the two there is nowhere left for the brightness to hide:
+        //
+        //   both peaks near 1.0   -> the bits on screen are correct and the loss is past the framebuffer
+        //                            entirely, which means the display path or the comparison itself
+        //   this peak much lower  -> the composite draw is losing it, and that is a small amount of code
+        //
+        // A 32x32 block from the centre of the viewport rather than the whole frame: glReadPixels stalls
+        // the pipeline, so this has to stay small, and it only runs every 600th composite.
+        {
+            static unsigned compositeFrames = 0;
+            if (++compositeFrames % 600 == 0)
+            {
+                GLint viewport[4] = {};
+                glGetIntegerv(GL_VIEWPORT, viewport);
+                if (viewport[2] > 0 && viewport[3] > 0)
+                {
+                    // The whole framebuffer, sampled with the same prime stride the readback probe uses.
+                    //
+                    // The first version of this read a 32x32 block from the centre and compared its peak
+                    // against the readback's whole-frame peak, which is not a comparison at all: one was the
+                    // brightest pixel anywhere in a 4K frame, the other the middle of a dark wall. It
+                    // reported 22/255 against 0.80 and that difference was unreadable. Reading the whole
+                    // thing costs 33 MB once every six hundred frames, which is nothing for a diagnostic
+                    // and is the only way the two numbers mean the same thing.
+                    const std::size_t pixels
+                        = static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]);
+                    std::vector<unsigned char> frame(pixels * 4, 0);
+                    glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], GL_RGBA,
+                        GL_UNSIGNED_BYTE, frame.data());
+
+                    unsigned char peak = 0;
+                    std::size_t nonBlack = 0;
+                    std::size_t sampled = 0;
+                    for (std::size_t p = 0; p < pixels; p += 997)
+                    {
+                        ++sampled;
+                        const unsigned char value = std::max(
+                            { frame[p * 4], frame[p * 4 + 1], frame[p * 4 + 2] });
+                        peak = std::max(peak, value);
+                        if (value != 0)
+                            ++nonBlack;
+                    }
+
+                    // One call, and it decides whether a transfer function is being applied twice. If the
+                    // default framebuffer is sRGB and this is enabled, every value the composite writes is
+                    // encoded again on the way in -- and the pass-through shader is handing it values that
+                    // are already encoded.
+                    const GLboolean framebufferSrgb = glIsEnabled(0x8DB9 /* GL_FRAMEBUFFER_SRGB */);
+
+                    Log(Debug::Info)
+                        << "Remix composite: framebuffer after the draw peaks at " << int(peak)
+                        << "/255 (" << (peak / 255.0f) << "), " << nonBlack << " of " << sampled
+                        << " sampled non-black, GL_FRAMEBUFFER_SRGB "
+                        << (framebufferSrgb ? "ENABLED" : "disabled")
+                        << ". Directly comparable with the readback peak now: a large gap means the "
+                           "composite draw is losing it, agreement means the loss is after this point.";
+                }
+            }
+        }
+
         glDepthMask(GL_TRUE);
 
         // Re-read the failure flag: the wait above may have set it, in which case the matching signal

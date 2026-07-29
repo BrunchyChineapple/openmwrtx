@@ -532,24 +532,39 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 static unsigned readbackFrames = 0;
                 if (++readbackFrames % 600 == 0 && !mRemixReadback.empty())
                 {
-                    unsigned char brightest = 0;
+                    // Half floats now, and the peak value is the point. The chain carries the runtime's
+                    // own R16G16B16A16_SFLOAT range rather than an eight-bit clamp of it, so this answers
+                    // the question that decides whether an HDR presentation path is worth building: a peak
+                    // above 1.0 means there is real range being thrown away at the display, and a peak that
+                    // sits at or under 1.0 means the tonemapper has already flattened everything and the
+                    // fix belongs there instead.
+                    float brightest = 0.0f;
                     std::size_t nonBlack = 0;
                     std::size_t sampled = 0;
+                    std::size_t overOne = 0;
+                    const auto* halfs = reinterpret_cast<const std::uint16_t*>(mRemixReadback.data());
+                    const std::size_t pixels
+                        = mRemixReadback.size() / RemixRT::Runtime::kOutputBytesPerPixel;
                     // Every 997th pixel: prime, so the stride cannot land in step with the row length
                     // and sample only one column of the image.
-                    for (std::size_t i = 0; i + 3 < mRemixReadback.size(); i += 997 * 4)
+                    for (std::size_t p = 0; p < pixels; p += 997)
                     {
                         ++sampled;
-                        const unsigned char value = std::max({ mRemixReadback[i], mRemixReadback[i + 1],
-                            mRemixReadback[i + 2] });
+                        const float value = std::max({ RemixRT::halfToFloat(halfs[p * 4 + 0]),
+                            RemixRT::halfToFloat(halfs[p * 4 + 1]),
+                            RemixRT::halfToFloat(halfs[p * 4 + 2]) });
                         brightest = std::max(brightest, value);
-                        if (value != 0)
+                        if (value > 0.0f)
                             ++nonBlack;
+                        if (value > 1.0f)
+                            ++overOne;
                     }
                     Log(Debug::Info) << "Remix readback: " << nonBlack << " of " << sampled
-                                     << " sampled pixels non-black, brightest " << int(brightest)
-                                     << "/255. All-black here means Remix produced nothing; bright here "
-                                        "with a black screen means the image is not reaching it.";
+                                     << " sampled pixels non-black, " << overOne
+                                     << " above 1.0, brightest " << brightest
+                                     << ". A peak above 1.0 is range an SDR present is discarding; a peak "
+                                        "at or below 1.0 means the tonemapper already flattened it and no "
+                                        "amount of display plumbing will bring it back.";
                 }
 
                 mRemixComposite->takeReadbackFrame(mRemixReadback, readWidth, readHeight);
