@@ -267,6 +267,18 @@ namespace RemixRT
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference);
 
+        /// Creates a translucent, refractive material -- water, glass.
+        ///
+        /// @param refractiveIndex 1.33 for water, about 1.5 for glass.
+        /// @param transmittance linear RGB tint acquired over \a measurementDistance of the medium.
+        ///        This is absorption, not surface colour: a value of one in a channel means that
+        ///        channel passes through unattenuated.
+        /// @param measurementDistance in the same units as the geometry -- OpenMW units, so a value
+        ///        that looks right for a metre-scaled game will be roughly seventy times too short.
+        /// @return an opaque handle, or 0 on failure.
+        unsigned long long createTranslucentMaterial(unsigned long long hash, float refractiveIndex,
+            const float* transmittance, float measurementDistance);
+
         /// Releases a material.
         void destroyMaterial(unsigned long long material);
 

@@ -85,6 +85,25 @@ namespace MWRender
             const osg::Texture2D* mTexture = nullptr;
             /// Alpha-test threshold, 0..255. Zero means no cutout, i.e. fully opaque.
             unsigned char mAlphaTestReference = 0;
+            /// Whether the surface is alpha blended.
+            ///
+            /// Tracked separately from the threshold because most of Morrowind's foliage asks for
+            /// blending and no test at all, and a path tracer has to be told to make a cutout out of it
+            /// -- see materialFor. Without this, alpha-blended leaves come through as solid polygons.
+            bool mAlphaBlend = false;
+            /// The 2D affine part of unit 0's texture matrix, as
+            /// { m00, m01, m10, m11, m30, m31 }, applied to texcoords as a row vector.
+            ///
+            /// Has to be carried because Remix vertices have no UV transform: the only place a texture
+            /// matrix can go is baked into the texcoords. Ignoring it is not cosmetic -- OpenMW scales
+            /// terrain UVs this way to tile a layer across a chunk, so without it the base texture is
+            /// stretched once over the whole chunk and reads as flat, featureless ground.
+            float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+            /// Whether mTexMat differs from identity, so the common case costs one bool rather than six
+            /// float comparisons per drawable per frame.
+            bool mHasTexMat = false;
+            /// Water gets a refractive material rather than whatever texture it happens to carry.
+            bool mIsWater = false;
         };
 
         /// Converts and caches one drawable, returning its Remix mesh handle, or 0 if unusable.
@@ -127,6 +146,9 @@ namespace MWRender
             /// Baked into the mesh's surface at creation time, so a drawable whose material changes
             /// needs the mesh rebuilt -- the API has no way to retarget an existing one.
             unsigned long long mMaterial = 0;
+            /// The texture matrix the cached texcoords were built with. Baked in for the same reason as
+            /// the material: it lives in the vertex data, so a change means a rebuild.
+            float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
         };
 
         struct CachedTexture
@@ -136,6 +158,11 @@ namespace MWRender
             /// data already released. Cached as a negative result so the conversion is not retried for
             /// every drawable sharing it, every frame.
             bool mUsable = false;
+            /// The uploaded format, as a literal, for the diagnostic in materialFor. Worth keeping
+            /// because a cutout against a format with no alpha channel -- BC1_RGB, or an RGB source
+            /// widened with alpha forced to 255 -- is silently a no-op, and that looks exactly like the
+            /// cutout never having been requested.
+            const char* mFormat = "none";
         };
 
         struct CachedLight
@@ -156,7 +183,8 @@ namespace MWRender
         void releaseStaleLights();
 
         /// Converts and caches \a geometry against \a material, returning its mesh handle, or 0.
-        unsigned long long meshFor(osg::Geometry& geometry, unsigned long long material);
+        unsigned long long meshFor(
+            osg::Geometry& geometry, unsigned long long material, const SurfaceState& surface);
 
         /// Resolves \a surface to a material handle, uploading its texture on first use.
         /// Falls back to the untextured default material rather than dropping the drawable.
@@ -170,6 +198,7 @@ namespace MWRender
 
         RemixRT::Runtime& mRuntime;
         unsigned long long mDefaultMaterial = 0;
+        unsigned long long mWaterMaterial = 0;
         unsigned long long mProbeMaterial = 0;
         unsigned long long mProbeMesh = 0;
         std::unordered_map<const void*, CachedMesh> mMeshes;
@@ -187,6 +216,20 @@ namespace MWRender
         unsigned int mLastInstanceCount = 0;
         unsigned int mLastLightCount = 0;
         unsigned int mTexturesUploaded = 0;
+        /// Emitter radius and radiance-times-radius-squared for converted lights. Read from the
+        /// environment once at construction so they can be tuned without a rebuild; Remix's own light
+        /// options act on its legacy conversion path and cannot reach lights created through the API.
+        float mLightRadius = 0.0f;
+        float mLightPower = 0.0f;
+        /// Threshold an alpha-blended surface is cut out at when it asks for no explicit test.
+        /// Environment-tunable so foliage can be dialled in without a rebuild; 0 disables the
+        /// substitution and leaves blended surfaces solid.
+        unsigned char mBlendCutout = 0;
+        /// How many distinct materials have been described in the log, and the ceiling on that. Bounded
+        /// because Morrowind has thousands of textures and the interesting ones are all in the first few
+        /// dozen the player walks into.
+        unsigned int mMaterialsLogged = 0;
+        static constexpr unsigned int kMaterialLogLimit = 48;
         /// World-space extent of the instance origins submitted this frame. Logged next to the camera
         /// position, because "geometry is nowhere near the camera" and "geometry is right there but not
         /// being rendered" are different problems and the instance count alone cannot tell them apart.

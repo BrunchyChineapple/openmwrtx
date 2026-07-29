@@ -24,6 +24,18 @@ namespace Terrain
         std::vector<osg::ref_ptr<osg::Drawable>> mDrawables;
         osg::ref_ptr<osg::Texture2D> mTexture;
         size_t mCompiled;
+
+        /// The state set of the first sub-quad's base layer, and the factor its texture matrix has to be
+        /// scaled by to tile once per sub-quad across the whole chunk.
+        ///
+        /// Kept for consumers that need the layer texture itself rather than the composited result, which
+        /// only ever exists on the GPU: mTexture is a render target with no osg::Image behind it. The
+        /// path tracer needs a real albedo, and there is nowhere else to get one -- mDrawables cannot be
+        /// used for it, because CompositeMapRenderer::compile releases each entry as it renders it.
+        ///
+        /// Null for a chunk composited from nothing, which should not happen but is not worth asserting.
+        osg::ref_ptr<osg::StateSet> mBaseLayerPass;
+        float mBaseLayerTiling = 1.f;
     };
 
     /**

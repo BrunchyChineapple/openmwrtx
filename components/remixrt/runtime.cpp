@@ -683,6 +683,30 @@ namespace RemixRT
         return mImpl->mApi.SetupCamera(&camera) == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    /// Fills in the sampler state every material has to carry.
+    ///
+    /// These three bytes are NOT safe to leave zeroed, and the failure mode is subtle enough to be worth
+    /// spelling out. The runtime reads them as MDL enumerants (lss::Mdl::Filter, lss::Mdl::WrapMode) and
+    /// zero is Nearest for the filter and Clamp for both wrap modes -- so a zero-initialised
+    /// remixapi_MaterialInfo asks for point sampling with clamp-to-edge addressing.
+    ///
+    /// The wrap mode is the damaging half. SceneManager::processDrawCallState takes the sampler the API
+    /// attached to the draw, overwrites its filter and address modes from these fields
+    /// (POPULATE_SAMPLER_INFO in rtx_materials.h), and rebuilds it. Clamp-to-edge on geometry whose
+    /// texcoords leave [0,1] -- which is most of Morrowind, and all of the terrain, whose layers tile by
+    /// scaling UVs -- smears the last row and column of texels across everything past the edge. That
+    /// reads as long streaks running down the surface, locked to it rather than to the camera, and it is
+    /// indistinguishable at a glance from a UV bug or a denoiser artefact.
+    ///
+    /// The C++ wrapper in remix.h sets these in its constructor; the C struct used here does not, which
+    /// is why it has to be done explicitly.
+    static void applyDefaultSamplerState(remixapi_MaterialInfo& material)
+    {
+        material.filterMode = 1; // lss::Mdl::Filter::Linear
+        material.wrapModeU = 1; // lss::Mdl::WrapMode::Repeat
+        material.wrapModeV = 1; // lss::Mdl::WrapMode::Repeat
+    }
+
     unsigned long long Runtime::createFlatMaterial(unsigned long long hash, float red, float green,
         float blue, float roughness, float metallic, float emissive, const float* emissiveColour)
     {
@@ -716,6 +740,7 @@ namespace RemixRT
         material.emissiveColorConstant = emissiveColour != nullptr
             ? remixapi_Float3D{ emissiveColour[0], emissiveColour[1], emissiveColour[2] }
             : remixapi_Float3D{ red, green, blue };
+        applyDefaultSamplerState(material);
 
         remixapi_MaterialHandle handle = nullptr;
         if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -836,6 +861,36 @@ namespace RemixRT
         material.pNext = &opaque;
         material.hash = hash;
         material.albedoTexture = pseudoPath;
+        applyDefaultSamplerState(material);
+
+        remixapi_MaterialHandle handle = nullptr;
+        if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return 0;
+        return reinterpret_cast<unsigned long long>(handle);
+    }
+
+    unsigned long long Runtime::createTranslucentMaterial(unsigned long long hash,
+        float refractiveIndex, const float* transmittance, float measurementDistance)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0
+            || transmittance == nullptr)
+            return 0;
+
+        remixapi_MaterialInfoTranslucentEXT translucent = {};
+        translucent.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
+        translucent.refractiveIndex = refractiveIndex;
+        translucent.transmittanceColor = { transmittance[0], transmittance[1], transmittance[2] };
+        translucent.transmittanceMeasurementDistance = measurementDistance;
+        // Not thin-walled: a thin wall models a surface with no interior, like a soap bubble, and would
+        // discard the absorption that gives water its depth cue entirely.
+        translucent.thinWallThickness_hasvalue = 0;
+        translucent.useDiffuseLayer = 0;
+
+        remixapi_MaterialInfo material = {};
+        material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+        material.pNext = &translucent;
+        material.hash = hash;
+        applyDefaultSamplerState(material);
 
         remixapi_MaterialHandle handle = nullptr;
         if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -1287,6 +1342,21 @@ namespace RemixRT
         }
         if (mImpl->mPresentWindow != nullptr)
         {
+            // Put our own window procedure back before destroying the window.
+            //
+            // DXVK subclasses the window it presents to, replacing GWLP_WNDPROC with
+            // dxvk::D3D9WindowProc, and that hook reads per-window state which Shutdown() has already
+            // freed by the time we get here. DestroyWindow then sends WM_DESTROY and WM_NCDESTROY
+            // straight into the dead hook, which dereferences a stale pointer -- a crash on every clean
+            // exit, in D3D9WindowProc beneath NtUserDestroyWindow, with the whole teardown chain from
+            // ~Engine on the stack.
+            //
+            // This is a real restore rather than a workaround: presentWindowProc is the procedure this
+            // window's class was registered with, so putting it back leaves the window exactly as we
+            // created it. Doing it the other way round -- destroying the window before Shutdown -- would
+            // instead hand the runtime a dead HWND to tear its swapchain down against.
+            SetWindowLongPtrW(
+                mImpl->mPresentWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&presentWindowProc));
             DestroyWindow(mImpl->mPresentWindow);
             mImpl->mPresentWindow = nullptr;
         }

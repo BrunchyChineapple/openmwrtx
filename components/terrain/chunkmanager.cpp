@@ -144,6 +144,17 @@ namespace Terrain
             float height = texCoords.w() * 2.f;
 
             std::vector<osg::ref_ptr<osg::StateSet>> passes = createPasses(chunkSize, chunkCenter, true);
+
+            // The first sub-quad's base layer is kept for consumers that need a real texture rather than
+            // the composited render target -- see CompositeMap::mBaseLayerPass. The tiling factor is the
+            // reciprocal of the fraction of the target this sub-quad covers, because the pass above was
+            // built for this sub-quad's footprint and callers apply it across the whole chunk.
+            if (compositeMap.mBaseLayerPass == nullptr && !passes.empty())
+            {
+                compositeMap.mBaseLayerPass = passes.front();
+                compositeMap.mBaseLayerTiling = texCoords.z() > 0.f ? 1.f / texCoords.z() : 1.f;
+            }
+
             for (std::vector<osg::ref_ptr<osg::StateSet>>::iterator it = passes.begin(); it != passes.end(); ++it)
             {
                 osg::ref_ptr<osg::Geometry> geom = osg::createTexturedQuadGeometry(

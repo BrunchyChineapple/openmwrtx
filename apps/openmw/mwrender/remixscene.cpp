@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include <osg/Camera>
+#include <osg/FrameStamp>
 #include <osg/Geometry>
 #include <osg/MatrixTransform>
 #include <osg/NodeVisitor>
@@ -14,11 +15,16 @@
 #include <osg/Image>
 #include <osg/Light>
 #include <osg/StateSet>
+#include <osg/TexMat>
 #include <osg/Texture2D>
 
 #include <components/debug/debuglog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
 #include <components/settings/values.hpp>
+// terraindrawable.hpp holds an osg::ref_ptr to a forward-declared CompositeMapRenderer, and ref_ptr's
+// destructor needs the complete type. Included for that reason alone; nothing here uses it.
+#include <components/terrain/compositemaprenderer.hpp>
+#include <components/terrain/terraindrawable.hpp>
 
 #include "vismask.hpp"
 
@@ -60,29 +66,76 @@ namespace
 
     /// Emitting radius for a converted OpenMW light, in OpenMW units.
     ///
-    /// OpenMW's lights are points with an attenuation curve; they carry no physical size. A path tracer
-    /// needs one, because a true point light gives razor-sharp shadows and infinite radiance at the
-    /// source. About twenty units is a fist-sized emitter at Morrowind's scale, which reads as a torch
-    /// or a candle rather than a studio softbox.
-    constexpr float kLightRadius = 20.0f;
-
-    /// Converts OpenMW's light intensity into radiance for a sphere of kLightRadius.
+    /// OpenMW's lights are points with an attenuation curve and no physical size. A path tracer needs
+    /// one, because a true point light gives razor-sharp shadows and unbounded radiance at the source.
     ///
-    /// Not physically derived, and it cannot be: OpenMW's lighting is an artist-tuned attenuation curve
-    /// evaluated per vertex, with no defined relationship to radiometric units. This is the constant
-    /// that makes torches read as torches at the current radius, and it has to be retuned if
-    /// kLightRadius changes, because radiance for a fixed total power scales with the inverse square of
-    /// the radius.
-    constexpr float kLightRadianceScale = 400.0f;
-
-    /// Smallest change in a light's position or radiance that justifies recreating it.
+    /// This matches the value the Morrowind Remix work settled on: Remix's own legacy light conversion
+    /// computes lightConversionSphereLightFixedRadius * sceneScale, and 0.45 * 1.43 is 0.6435 units, a
+    /// touch under a centimetre. That option cannot reach these lights -- it only applies to lights the
+    /// runtime converts from D3D9, and these are created directly through the API -- so the number has
+    /// to be reproduced here.
     ///
-    /// The API has no light-update call, so a change means destroy and recreate. OpenMW's lights jitter
+    /// An earlier value of twenty units was far too large, and the failure is instructive: a sphere light
+    /// is a volume, so an emitter that big placed against a wall has part of itself on the far side, and
+    /// light pours through solid geometry into the next room.
+    constexpr float kLightRadiusDefault = 0.6435f;
+
+    /// Radiance multiplier at a radius of one unit, i.e. radiance * radius^2.
+    ///
+    /// Expressed this way so the radius above can be changed without re-tuning brightness. Radiance for
+    /// a fixed total power goes as the inverse square of the radius, so a bare radiance constant silently
+    /// couples the two -- shrink the emitter and the scene goes dark by the square of the change.
+    ///
+    /// The value itself is not physically derived and cannot be: OpenMW's lighting is an artist-tuned
+    /// attenuation curve evaluated per vertex with no defined relationship to radiometric units. It is
+    /// chosen to preserve the brightness the previous radius produced, so this change alters shadow
+    /// sharpness and light leakage without altering exposure.
+    constexpr float kLightPowerDefault = 160000.0f;
+
+    /// Smallest change in a light's position that justifies recreating it, in OpenMW units.
+    ///
+    /// The API has no light-update call, so a change means recreating. OpenMW's lights jitter
     /// continuously -- carried lights follow animated bones, and many flicker every frame -- so an exact
-    /// comparison would recreate almost every light every frame. These thresholds are below the point
-    /// where a difference is visible in a path-traced frame.
+    /// comparison would recreate almost every light every frame.
     constexpr float kLightMoveEpsilon = 1.0f;
-    constexpr float kLightRadianceEpsilon = 0.01f;
+
+    /// Smallest *relative* change in radiance that justifies recreating a light.
+    ///
+    /// Relative, not absolute: radiance scales with the inverse square of the emitter radius, so at a
+    /// sub-centimetre radius the values run into the hundreds of thousands and any fixed epsilon is
+    /// either meaninglessly tight or absurdly loose. One percent is below the visible threshold in a
+    /// path-traced frame at any radius.
+    constexpr float kLightRadianceRelativeEpsilon = 0.01f;
+
+    /// Reads a float environment variable, keeping \a fallback when unset or unparseable.
+    ///
+    /// Both light constants are exposed this way because they are tuning values, and tuning through a
+    /// rebuild is not tuning. Remix's own light options cannot be used for it -- they act on the legacy
+    /// conversion path, which this integration does not go through.
+    float envFloat(const char* name, float fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+        const float parsed = std::strtof(value, nullptr);
+        return parsed > 0.0f ? parsed : fallback;
+    }
+
+    /// Reads a 0..255 environment variable, keeping \a fallback only when unset or unparseable.
+    ///
+    /// Separate from envFloat because that one treats zero as unparseable, which is the right call for a
+    /// radius or a brightness but wrong for a threshold: zero is the meaningful "switch this off" value.
+    unsigned char envByte(const char* name, unsigned char fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value)
+            return fallback;
+        return static_cast<unsigned char>(std::clamp<long>(parsed, 0, 255));
+    }
 
     /// GL pixel and internal formats, spelled out rather than taken from OSG's headers.
     ///
@@ -118,26 +171,38 @@ namespace
     constexpr float kTexturedRoughness = 0.65f;
 
     /// Reads the alpha-test threshold OpenMW asks for, or 0 for none.
+    ///
+    /// Deliberately not gated on GL_ALPHA_TEST being enabled. OpenMW is a shader-based renderer:
+    /// Shader::ShaderVisitor moves the test into the fragment shader and substitutes a
+    /// Shader::RemovedAlphaFunc for the attribute, specifically so the fixed-function mode is *never*
+    /// switched on. Requiring the mode therefore rejected every cutout in the game, and foliage,
+    /// lattices and railings all came through as solid polygons.
     unsigned char alphaTestReferenceFor(const osg::StateSet& stateSet)
     {
-        // Only meaningful when the mode is actually enabled. A state set can carry an AlphaFunc while
-        // leaving GL_ALPHA_TEST off, and honouring it then punches holes in solid geometry.
-        if ((stateSet.getMode(GL_ALPHA_TEST) & osg::StateAttribute::ON) == 0)
-            return 0;
-
         const auto* alphaFunc
             = dynamic_cast<const osg::AlphaFunc*>(stateSet.getAttribute(osg::StateAttribute::ALPHAFUNC));
         if (alphaFunc == nullptr)
-            return kDefaultAlphaTestReference;
+            return 0;
 
         // Only the "keep what is more opaque than this" comparisons map onto a path tracer's cutout.
-        // The others exist but do not describe a cutout, and guessing at them would be worse than
-        // treating the surface as opaque.
+        // This also excludes ALWAYS, which is how OpenMW spells "no test at all", so a surface that
+        // wants to be solid stays solid.
         const auto function = alphaFunc->getFunction();
         if (function != osg::AlphaFunc::GREATER && function != osg::AlphaFunc::GEQUAL)
             return 0;
 
-        const float reference = alphaFunc->getReferenceValue();
+        // The substituted attribute carries the comparison but a placeholder reference of 1.0; the real
+        // threshold travels alongside it as an "alphaRef" uniform, because that is what the shader reads.
+        // Trusting the attribute's own value would give 1.0, and "keep only alpha greater than 1.0" keeps
+        // nothing -- cutout geometry would disappear altogether rather than merely stay solid.
+        float reference = alphaFunc->getReferenceValue();
+        if (const osg::Uniform* uniform = stateSet.getUniform("alphaRef"))
+        {
+            float value = 0.0f;
+            if (uniform->get(value))
+                reference = value;
+        }
+
         if (!(reference > 0.0f))
             return kDefaultAlphaTestReference;
 
@@ -216,16 +281,64 @@ namespace
     class SubmitVisitor : public osg::NodeVisitor
     {
     public:
-        SubmitVisitor(MWRender::RemixScene& scene, unsigned int skipMask)
+        SubmitVisitor(MWRender::RemixScene& scene, unsigned int skipMask, const osg::Vec3f& eye)
             : osg::NodeVisitor(osg::NodeVisitor::TRAVERSE_ACTIVE_CHILDREN)
             , mScene(scene)
+            , mEye(eye)
         {
             // The traversal mask is the whole mask mechanism as far as this visitor is concerned. OSG
             // tests traversalMask & nodeMask in Node::accept, so a subgraph masked exclusively as GUI or
             // render-to-texture is excluded here, while ordinary geometry with the default all-bits mask
             // passes.
             setTraversalMask(~skipMask);
+
+            // Declared an intersection visitor, and this is load-bearing rather than cosmetic.
+            //
+            // Terrain::QuadTreeWorld::accept opens with:
+            //     if (!isCullVisitor && getVisitorType() != INTERSECTION_VISITOR) return;
+            // A plain NodeVisitor is therefore refused outright, and OpenMW's exteriors are built almost
+            // entirely behind that gate: the quadtree owns the terrain chunks *and* ObjectPaging's
+            // batched statics, which is every building and rock. Nothing below it was ever visited, so
+            // exteriors came through as loose interactive props -- doors, crates, actors, birds --
+            // floating over an empty world with no ground and no architecture.
+            //
+            // Cull is the other accepted type and is not an option: it means being an
+            // osgUtil::CullVisitor, which the code casts to. Intersection is the honest fit anyway --
+            // this walk asks "what geometry is here", which is the same question a ray cast asks.
+            // Switchable, because this is the one change that can take exteriors down with it: everything
+            // it unlocks lives behind OpenMW's terrain machinery, which is not designed to be driven from
+            // outside the cull traversal. OPENMW_REMIX_TERRAIN=0 restores the plain-NodeVisitor
+            // behaviour -- exteriors without ground or architecture, but running -- and makes the
+            // question answerable by bisection rather than by argument.
+            if (envFlag("OPENMW_REMIX_TERRAIN", true))
+                setVisitorType(osg::NodeVisitor::INTERSECTION_VISITOR);
+
+            // The quadtree picks level of detail from getEyePoint() and keys its cached view data on it.
+            // NodeVisitor's default is the origin, which would select detail for a point the player is
+            // nowhere near.
+            //
+            // No frame stamp, deliberately, and this one was learned the hard way. QuadTreeWorld::accept
+            // ends with:
+            //     if (referenceTime != 0.0) { vd->setLastUsageTimeStamp(referenceTime);
+            //                                 mViewDataMap->clearUnusedViews(referenceTime); }
+            // and clearUnusedViews expires a view by comparing its stored timestamp against that
+            // reference time. Supplying a stamp therefore hands this traversal's clock to a global
+            // expiry sweep -- and it is a *different* clock. osgViewer measures reference time from the
+            // tick it records when the viewer is constructed; osg::Timer::instance()->time_s() measures
+            // from process start, seconds earlier. The value is uniformly ahead of every timestamp OSG
+            // has written, so every view looks expired, and the sweep recycles the ViewData that the cull
+            // traversal is holding a pointer to. Exteriors died on the spot; interiors, having no
+            // quadtree, were unaffected.
+            //
+            // With no stamp the reference time reads as zero and the whole block is skipped, which is the
+            // correct behaviour for a caller that is not the frame's owner. The cost is that this
+            // traversal's view is not marked as used and OpenMW's own sweep retires it -- but the reuse
+            // path then finds the cull traversal's view a better match and copies it, so the LOD
+            // selection is inherited rather than recomputed. Cheaper than the stamp was, and safe.
         }
+
+        osg::Vec3 getEyePoint() const override { return mEye; }
+        osg::Vec3 getViewPoint() const override { return mEye; }
 
         // No manual node-mask test in any of these. OSG already applies the traversal mask in
         // Node::accept via validNodeMask, which tests traversalMask & nodeMask -- so setTraversalMask
@@ -301,9 +414,58 @@ namespace
             // The drawable's own state set is combined with what it inherits, and it wins -- that is
             // OSG's own override-free precedence, and in OpenMW the leaf is usually where the NIF's
             // texture ends up.
+            // A drawable's own node mask contributes categories too. It was being ignored, which had one
+            // very visible consequence: OpenMW sets Mask_Water on the water quad itself rather than on a
+            // parent, so water was never recognised as water and took the opaque grey fallback material.
+            // That quad is CellSizeInUnits * 150 across -- over a million units -- so it read as a flat
+            // grey plane lidding the world out to the horizon, which is easy to mistake for the terrain.
+            const unsigned int categories
+                = currentCategories() | categoriesFor(drawable.getNodeMask());
+
             MWRender::RemixScene::SurfaceState surface = currentSurface();
+            surface.mIsWater = (categories & RemixRT::Runtime::Category_AnimatedWater) != 0;
             if (const osg::StateSet* stateSet = drawable.getStateSet())
                 mergeState(*stateSet, surface);
+
+            // Terrain keeps its texture where a scene-graph walk cannot see it.
+            //
+            // Terrain::TerrainDrawable holds one state set per texture layer as a member and does the
+            // multi-pass draw itself, so nothing about its appearance is reachable through the graph --
+            // which is why terrain came out as flat grey while everything else was textured.
+            //
+            // Only the first pass is used. The remaining layers are alpha-blended over it through
+            // per-layer blend maps, and a path-traced surface has one material: reproducing the blend
+            // would mean compositing the layers into a per-chunk texture on the CPU. The base layer is
+            // the dominant one, so this is the right approximation to start from rather than the final
+            // answer.
+            if (const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable))
+            {
+                const auto& passes = terrain->getPasses();
+                if (!passes.empty() && passes.front() != nullptr)
+                    mergeState(*passes.front(), surface);
+
+                // Distant chunks need one more step, and this is what was putting white patches along
+                // the horizon.
+                //
+                // Past a threshold chunk size (Terrain settings, "composite map level") a chunk is not
+                // drawn from its layer textures at all. Its layers are rendered once into a per-chunk
+                // render target and the chunk gets a single pass bound to that target. The pass merged
+                // above therefore names an osg::Texture2D with no osg::Image behind it -- the pixels only
+                // ever existed on the GPU -- so materialFor fell through to the untextured fallback, and
+                // while that fallback was self-lit the sun blew it out to white.
+                //
+                // The layer textures are still reachable: CompositeMap keeps the quads it composites
+                // from, and each carries the same kind of state set as a near chunk's pass. Taking the
+                // first one is the same base-layer approximation already made above.
+                if (const Terrain::CompositeMap* composite = terrain->getCompositeMap())
+                    mergeCompositeLayer(*composite, surface);
+
+                // Terrain is never a cutout. Its passes enable GL_BLEND because that is how the layers
+                // are composited over one another, not because the ground has holes in it -- and
+                // materialFor turns blending into a cutout, which would punch the land through wherever
+                // a layer texture happened to carry alpha.
+                surface.mAlphaBlend = false;
+            }
 
             const unsigned long long mesh = mScene.submitGeometry(*geometry, surface);
             if (mesh == 0)
@@ -324,7 +486,7 @@ namespace
             // has not been verified against what Remix expects, and a wrong answer there makes geometry
             // vanish rather than look wrong -- which is much harder to diagnose than the cost of
             // disabling backface culling.
-            mScene.drawSubmitted(mesh, transform, currentCategories(), true);
+            mScene.drawSubmitted(mesh, transform, categories, true);
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
         }
@@ -343,6 +505,32 @@ namespace
             return mSurfaceStack.empty() ? MWRender::RemixScene::SurfaceState{} : mSurfaceStack.back();
         }
 
+        /// Substitutes a composited chunk's base layer texture for its render target.
+        ///
+        /// The tiling correction is the interesting part. A chunk larger than the "max composite geometry
+        /// size" setting is composited from a mosaic of sub-quads, and the retained pass carries a texture
+        /// matrix sized for one sub-quad's footprint rather than the chunk's. Applying it unchanged to the
+        /// chunk's own full-chunk texcoords tiles the layer once per chunk instead of once per sub-quad,
+        /// which reads as a stretched, low-frequency smear -- so it is scaled back up by the number of
+        /// sub-quads across, which is what CompositeMap::mBaseLayerTiling holds.
+        static void mergeCompositeLayer(
+            const Terrain::CompositeMap& composite, MWRender::RemixScene::SurfaceState& surface)
+        {
+            if (composite.mBaseLayerPass == nullptr)
+                return;
+
+            mergeState(*composite.mBaseLayerPass, surface);
+
+            if (composite.mBaseLayerTiling > 0.0f && composite.mBaseLayerTiling != 1.0f)
+            {
+                // The 2x2 linear part only. The layer matrix is a pure scale, so there is no translation
+                // to carry along.
+                for (int i = 0; i < 4; ++i)
+                    surface.mTexMat[i] *= composite.mBaseLayerTiling;
+                surface.mHasTexMat = true;
+            }
+        }
+
         /// Folds one state set into \a surface. Later calls override earlier ones, which matches OSG's
         /// precedence for attributes that carry no override flag.
         static void mergeState(const osg::StateSet& stateSet, MWRender::RemixScene::SurfaceState& surface)
@@ -353,6 +541,24 @@ namespace
                 surface.mTexture = texture;
             }
 
+            if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
+                    stateSet.getTextureAttribute(0, osg::StateAttribute::TEXMAT)))
+            {
+                // Row-vector convention, matching the fixed-function texture matrix OSG is emulating:
+                // s' = s*m00 + t*m10 + m30, and likewise for t. The third row and column are dropped
+                // because texcoords here are 2D.
+                const osg::Matrix& m = texMat->getMatrix();
+                surface.mTexMat[0] = static_cast<float>(m(0, 0));
+                surface.mTexMat[1] = static_cast<float>(m(0, 1));
+                surface.mTexMat[2] = static_cast<float>(m(1, 0));
+                surface.mTexMat[3] = static_cast<float>(m(1, 1));
+                surface.mTexMat[4] = static_cast<float>(m(3, 0));
+                surface.mTexMat[5] = static_cast<float>(m(3, 1));
+                surface.mHasTexMat = surface.mTexMat[0] != 1.0f || surface.mTexMat[1] != 0.0f
+                    || surface.mTexMat[2] != 0.0f || surface.mTexMat[3] != 1.0f
+                    || surface.mTexMat[4] != 0.0f || surface.mTexMat[5] != 0.0f;
+            }
+
             // Recomputed rather than inherited when the state set says anything about alpha testing, so
             // that a subgraph turning the test off is respected as well as one turning it on.
             if (stateSet.getMode(GL_ALPHA_TEST) != osg::StateAttribute::INHERIT
@@ -360,6 +566,12 @@ namespace
             {
                 surface.mAlphaTestReference = alphaTestReferenceFor(stateSet);
             }
+
+            // Same treatment for blending, and for the same reason: a state set that switches GL_BLEND
+            // off has to be able to override a parent that switched it on.
+            const unsigned int blendMode = stateSet.getMode(GL_BLEND);
+            if (blendMode != osg::StateAttribute::INHERIT)
+                surface.mAlphaBlend = (blendMode & osg::StateAttribute::ON) != 0;
         }
 
         void pushState(osg::Node& node)
@@ -379,6 +591,7 @@ namespace
         }
 
         MWRender::RemixScene& mScene;
+        osg::Vec3f mEye;
         osg::Matrix mMatrix;
         std::vector<unsigned int> mCategoryStack;
         std::vector<MWRender::RemixScene::SurfaceState> mSurfaceStack;
@@ -396,10 +609,15 @@ namespace MWRender
         // featureless white surface makes it impossible to tell shading from blown-out exposure, and a
         // mirror-smooth one shows the sky instead of the geometry.
         //
-        // Self-lit by default, and that is not a stopgap for looks: no lights are submitted yet, so a
-        // purely reflective surface indoors receives nothing and renders black. Black geometry and
-        // absent geometry look identical, which is exactly the distinction that needs making right now.
-        const bool emissive = envFlag("OPENMW_REMIX_EMISSIVE", true);
+        // Not self-lit any more, and the change matters. It was self-lit so that geometry submitted
+        // before any lights existed could be told apart from geometry that was not submitted at all --
+        // black and absent look identical. Lights are submitted now, so the crutch has a cost and no
+        // benefit: every surface that falls back to this material glows, and the sun then blows it out to
+        // white. Distant terrain is the visible case, because a terrain chunk far enough out is drawn
+        // from a composite render target whose osg::Image is null, so it lands here -- and a field of
+        // white patches along the horizon is the result. OPENMW_REMIX_EMISSIVE=1 brings it back for
+        // diagnosis.
+        const bool emissive = envFlag("OPENMW_REMIX_EMISSIVE", false);
         constexpr unsigned long long kDefaultMaterialHash = 0x0B7A5E'0000'0001ull;
         mDefaultMaterial = mRuntime.createFlatMaterial(
             kDefaultMaterialHash, 0.6f, 0.6f, 0.6f, 0.7f, 0.0f, emissive ? kWorldEmissive : 0.0f);
@@ -408,7 +626,32 @@ namespace MWRender
                                  "will not work";
         else
             Log(Debug::Info) << "Remix scene: default material is " << (emissive ? "self-lit" : "unlit")
-                             << " (OPENMW_REMIX_EMISSIVE=0 to disable once real lights are submitted)";
+                             << " (OPENMW_REMIX_EMISSIVE=1 to make untextured geometry glow)";
+
+        // Foliage cutout threshold. See materialFor for why blending has to become a cutout at all.
+        mBlendCutout = envByte("OPENMW_REMIX_BLEND_CUTOUT", kDefaultAlphaTestReference);
+        Log(Debug::Info) << "Remix scene: alpha-blended surfaces are cut out at "
+                         << static_cast<unsigned int>(mBlendCutout)
+                         << "/255 (OPENMW_REMIX_BLEND_CUTOUT=0 leaves them solid)";
+
+        mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", kLightRadiusDefault);
+        mLightPower = envFloat("OPENMW_REMIX_LIGHT_POWER", kLightPowerDefault);
+        Log(Debug::Info) << "Remix scene: light emitter radius " << mLightRadius
+                         << " units, radiance at that radius "
+                         << (mLightPower / (mLightRadius * mLightRadius))
+                         << " per unit of OpenMW light colour (OPENMW_REMIX_LIGHT_RADIUS and "
+                            "OPENMW_REMIX_LIGHT_POWER override both)";
+
+        // Water. The transmittance distance is in OpenMW units, which is why it looks large: one metre
+        // is about seventy of them, so this absorbs over roughly four metres of depth. Morrowind's water
+        // is a murky green-brown, so red is absorbed hardest.
+        constexpr unsigned long long kWaterMaterialHash = 0x0B7A5E'0000'0002ull;
+        const float waterTransmittance[3] = { 0.35f, 0.75f, 0.60f };
+        mWaterMaterial = mRuntime.createTranslucentMaterial(kWaterMaterialHash, 1.33f,
+            waterTransmittance, 280.0f);
+        if (mWaterMaterial == 0)
+            Log(Debug::Warning) << "Remix scene: could not create the water material; water will use the "
+                                   "untextured fallback and read as a solid plane";
 
         // Strongly emissive so it cannot be confused with a dim surface or lost to auto-exposure.
         constexpr unsigned long long kProbeMaterialHash = 0x0B7A5E'0000'0010ull;
@@ -446,6 +689,8 @@ namespace MWRender
         mTextures.clear();
         if (mProbeMaterial != 0)
             mRuntime.destroyMaterial(mProbeMaterial);
+        if (mWaterMaterial != 0)
+            mRuntime.destroyMaterial(mWaterMaterial);
         if (mDefaultMaterial != 0)
             mRuntime.destroyMaterial(mDefaultMaterial);
     }
@@ -483,7 +728,9 @@ namespace MWRender
         // Actor fade is OpenMW's way of dimming a carried light as its owner fades out. Ignoring it
         // leaves lights at full strength on invisible actors.
         const float fade = source.getActorFade();
-        const float scale = kLightRadianceScale * (fade > 0.0f ? fade : 1.0f);
+        // Power divided by radius squared, so the emitter size and the brightness stay independent.
+        const float scale
+            = (mLightPower / (mLightRadius * mLightRadius)) * (fade > 0.0f ? fade : 1.0f);
 
         const float radiance[3]
             = { diffuse.r() * scale, diffuse.g() * scale, diffuse.b() * scale };
@@ -501,9 +748,15 @@ namespace MWRender
             const bool moved = std::abs(cached.mPosition[0] - position[0]) > kLightMoveEpsilon
                 || std::abs(cached.mPosition[1] - position[1]) > kLightMoveEpsilon
                 || std::abs(cached.mPosition[2] - position[2]) > kLightMoveEpsilon;
-            const bool recoloured = std::abs(cached.mRadiance[0] - radiance[0]) > kLightRadianceEpsilon
-                || std::abs(cached.mRadiance[1] - radiance[1]) > kLightRadianceEpsilon
-                || std::abs(cached.mRadiance[2] - radiance[2]) > kLightRadianceEpsilon;
+            // Relative comparison, against the larger of the two so a light switching on from zero
+            // always counts as changed.
+            const auto changedBy = [](float before, float after) {
+                const float scale = std::max({ std::abs(before), std::abs(after), 1e-6f });
+                return std::abs(before - after) / scale > kLightRadianceRelativeEpsilon;
+            };
+            const bool recoloured = changedBy(cached.mRadiance[0], radiance[0])
+                || changedBy(cached.mRadiance[1], radiance[1])
+                || changedBy(cached.mRadiance[2], radiance[2]);
 
             if (!moved && !recoloured)
             {
@@ -532,7 +785,7 @@ namespace MWRender
             | 1ull;
 
         const unsigned long long handle
-            = mRuntime.createSphereLight(hash, position, radiance, kLightRadius);
+            = mRuntime.createSphereLight(hash, position, radiance, mLightRadius);
         if (handle == 0)
             return;
 
@@ -541,7 +794,7 @@ namespace MWRender
         cached.mLastUsedFrame = mFrame;
         std::copy(std::begin(position), std::end(position), std::begin(cached.mPosition));
         std::copy(std::begin(radiance), std::end(radiance), std::begin(cached.mRadiance));
-        cached.mRadius = kLightRadius;
+        cached.mRadius = mLightRadius;
         mLights.emplace(key, cached);
 
         if (mRuntime.drawLight(handle))
@@ -676,9 +929,15 @@ namespace MWRender
         // Everything OpenMW draws that is not part of the world it wants path traced. GUI is composited
         // by OpenMW itself; render-to-texture subgraphs are inputs to effects rather than scene content,
         // and submitting them would place their geometry in the world twice.
-        const unsigned int skipMask = Mask_GUI | Mask_RenderToTexture | Mask_FirstPerson | Mask_Debug;
+        // Mask_SimpleWater is excluded as well: it is a second, flat-shaded copy of the water quad that
+        // exists only for the local map, so submitting it puts a million-unit duplicate surface in the
+        // world coincident with the real one.
+        const unsigned int skipMask
+            = Mask_GUI | Mask_RenderToTexture | Mask_FirstPerson | Mask_Debug | Mask_SimpleWater;
 
-        SubmitVisitor visitor(*this, skipMask);
+        SubmitVisitor visitor(*this, skipMask,
+            osg::Vec3f(static_cast<float>(eye.x()), static_cast<float>(eye.y()),
+                static_cast<float>(eye.z())));
         sceneRoot->accept(visitor);
         mLastInstanceCount = visitor.instances();
 
@@ -727,7 +986,7 @@ namespace MWRender
 
     unsigned long long RemixScene::submitGeometry(osg::Geometry& geometry, const SurfaceState& surface)
     {
-        return meshFor(geometry, materialFor(surface));
+        return meshFor(geometry, materialFor(surface), surface);
     }
 
     unsigned long long RemixScene::textureFor(const osg::Image& image)
@@ -774,15 +1033,19 @@ namespace MWRender
             {
                 case kGlDxt1Rgb:
                     format = RemixRT::Runtime::Format_BC1_RGB;
+                    cached.mFormat = "BC1_RGB";
                     break;
                 case kGlDxt1Rgba:
                     format = RemixRT::Runtime::Format_BC1_RGBA;
+                    cached.mFormat = "BC1_RGBA";
                     break;
                 case kGlDxt3:
                     format = RemixRT::Runtime::Format_BC2;
+                    cached.mFormat = "BC2";
                     break;
                 case kGlDxt5:
                     format = RemixRT::Runtime::Format_BC3;
+                    cached.mFormat = "BC3";
                     break;
                 default:
                     Log(Debug::Verbose) << "Remix scene: unsupported compressed texture format 0x"
@@ -792,10 +1055,52 @@ namespace MWRender
                     return 0;
             }
 
+            // The byte count is derived here rather than taken from OSG, and cross-checked against it.
+            //
+            // Passing osg::Image::getTotalSizeInBytesIncludingMipmaps() straight through crashed the
+            // runtime: CreateTexture memcpys exactly the size it is given into a staging buffer sized
+            // from that same number, and a value larger than the real mip chain walks the copy off the
+            // end of the mapping. The size a texture upload declares has to be one the caller computed,
+            // not one it inherited, because nothing downstream can check it.
+            //
+            // Block-compressed formats are 4x4 blocks, eight bytes for BC1 and sixteen for BC2 and BC3.
+            const unsigned long long blockBytes
+                = (format == RemixRT::Runtime::Format_BC1_RGB || format == RemixRT::Runtime::Format_BC1_RGBA)
+                ? 8ull
+                : 16ull;
+            const auto levelBytes = [&](unsigned int level) -> unsigned long long {
+                const unsigned long long levelWidth = std::max(1, width >> level);
+                const unsigned long long levelHeight = std::max(1, height >> level);
+                return ((levelWidth + 3ull) / 4ull) * ((levelHeight + 3ull) / 4ull) * blockBytes;
+            };
+
+            const unsigned int osgLevels
+                = std::max(1u, static_cast<unsigned int>(image.getNumMipmapLevels()));
+            unsigned long long chainBytes = 0;
+            for (unsigned int level = 0; level < osgLevels; ++level)
+                chainBytes += levelBytes(level);
+
+            const unsigned long long osgTotal
+                = static_cast<unsigned long long>(image.getTotalSizeInBytesIncludingMipmaps());
+
+            if (chainBytes == osgTotal)
+            {
+                mipLevels = osgLevels;
+                uploadSize = chainBytes;
+            }
+            else
+            {
+                // The two disagree, so the mip chain is not laid out the way the format implies and only
+                // the base level can be trusted. Sharpness at distance suffers; a read off the end of the
+                // image does not.
+                Log(Debug::Verbose) << "Remix scene: texture mip chain is " << osgTotal
+                                    << " bytes but the format implies " << chainBytes << " over "
+                                    << osgLevels << " levels; uploading the base level only";
+                mipLevels = 1;
+                uploadSize = std::min<unsigned long long>(
+                    levelBytes(0), static_cast<unsigned long long>(image.getImageSizeInBytes()));
+            }
             uploadData = data;
-            uploadSize = static_cast<unsigned long long>(image.getTotalSizeInBytesIncludingMipmaps());
-            const unsigned int levels = static_cast<unsigned int>(image.getNumMipmapLevels());
-            mipLevels = levels > 0 ? levels : 1u;
         }
         else if (dataType == kGlUnsignedByte)
         {
@@ -868,6 +1173,9 @@ namespace MWRender
             uploadData = converted.data();
             uploadSize = converted.size();
             format = RemixRT::Runtime::Format_RGBA8;
+            // Distinguished in the log, because a source with no alpha channel gets 255 written into it
+            // and any cutout against the result is a no-op.
+            cached.mFormat = alpha >= 0 ? "RGBA8" : "RGBA8(opaque)";
         }
         else
         {
@@ -894,6 +1202,13 @@ namespace MWRender
 
     unsigned long long RemixScene::materialFor(const SurfaceState& surface)
     {
+        // Water before any texture consideration. OpenMW's water is a shader effect -- its texture units
+        // hold a normal map and render targets, none of which is an albedo -- so whatever is bound there
+        // is not what the surface should look like. A path tracer wants the physical description
+        // instead, and gets a much better result from it than the raster version manages.
+        if (surface.mIsWater && mWaterMaterial != 0)
+            return mWaterMaterial;
+
         if (surface.mTexture == nullptr)
             return mDefaultMaterial;
 
@@ -905,15 +1220,46 @@ namespace MWRender
         if (textureHash == 0)
             return mDefaultMaterial;
 
+        // Alpha blending is turned into a cutout when no explicit test was asked for.
+        //
+        // This is the thing that makes foliage read as foliage. Morrowind's leaves, grates, ropes and
+        // banners overwhelmingly use NiAlphaProperty's *blend* flag with no alpha test, so there is no
+        // osg::AlphaFunc anywhere on the path and the threshold above comes out zero -- which the runtime
+        // reads as "fully opaque" and draws the whole quad, leaves plus the transparent square around
+        // them. A path tracer wants one decision per hit, so the transparency has to become a cutout;
+        // Remix does the same thing to legacy draw calls through rtx.alphaBlendToCutout, but that path
+        // cannot see API-submitted geometry, so the choice has to be made here.
+        //
+        // An explicit test always wins: a mesh that asked for a threshold gets the one it asked for.
+        unsigned char alphaTestReference = surface.mAlphaTestReference;
+        if (alphaTestReference == 0 && surface.mAlphaBlend)
+            alphaTestReference = mBlendCutout;
+
         // The alpha threshold is part of the material identity: the same texture can be a cutout on one
         // mesh and opaque on another, and OpenMW decides that per state set, not per texture.
         const unsigned long long key
-            = textureHash ^ (static_cast<unsigned long long>(surface.mAlphaTestReference) << 56);
+            = textureHash ^ (static_cast<unsigned long long>(alphaTestReference) << 56);
         if (auto found = mMaterials.find(key); found != mMaterials.end())
             return found->second;
 
+        // One line per distinct material, capped. "Alpha is not working" has three separate causes --
+        // no cutout requested, a cutout requested against a texture with no alpha channel, or a cutout
+        // requested at a threshold nothing can pass -- and they are indistinguishable from the screen.
+        if (mMaterialsLogged < kMaterialLogLimit)
+        {
+            ++mMaterialsLogged;
+            const auto found = mTextures.find(image);
+            Log(Debug::Info) << "Remix material " << mMaterialsLogged << ": texture 0x" << std::hex
+                             << textureHash << std::dec << " " << image->s() << "x" << image->t()
+                             << " format " << (found != mTextures.end() ? found->second.mFormat : "?")
+                             << " alphaTest " << static_cast<unsigned int>(surface.mAlphaTestReference)
+                             << " blend " << (surface.mAlphaBlend ? "yes" : "no") << " -> cutout "
+                             << static_cast<unsigned int>(alphaTestReference)
+                             << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
+        }
+
         const unsigned long long handle = mRuntime.createTexturedMaterial(
-            key | 1ull, textureHash, kTexturedRoughness, 0.0f, surface.mAlphaTestReference);
+            key | 1ull, textureHash, kTexturedRoughness, 0.0f, alphaTestReference);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
@@ -931,7 +1277,8 @@ namespace MWRender
         mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided);
     }
 
-    unsigned long long RemixScene::meshFor(osg::Geometry& geometry, unsigned long long material)
+    unsigned long long RemixScene::meshFor(
+        osg::Geometry& geometry, unsigned long long material, const SurfaceState& surface)
     {
         if (material == 0)
             return 0;
@@ -948,9 +1295,12 @@ namespace MWRender
         {
             // Cheap staleness check. A full content hash every frame would cost more than it saves, but
             // a changed vertex count definitely means different geometry at the same address, and
-            // reusing the cached mesh then would draw the wrong thing. The material is checked too
-            // because it is baked into the surface at creation time and cannot be swapped afterwards.
-            if (found->second.mVertexCount == vertexCount && found->second.mMaterial == material)
+            // reusing the cached mesh then would draw the wrong thing. The material and the texture
+            // matrix are checked too, because both are baked in at creation time -- the material into
+            // the surface, the matrix into the texcoords -- and neither can be swapped afterwards.
+            if (found->second.mVertexCount == vertexCount && found->second.mMaterial == material
+                && std::equal(std::begin(found->second.mTexMat), std::end(found->second.mTexMat),
+                    std::begin(surface.mTexMat)))
             {
                 found->second.mLastUsedFrame = mFrame;
                 return found->second.mHandle;
@@ -999,8 +1349,20 @@ namespace MWRender
 
             if (texcoords != nullptr && texcoords->size() == positions->size())
             {
-                vertex.mTexcoord[0] = (*texcoords)[i].x();
-                vertex.mTexcoord[1] = (*texcoords)[i].y();
+                const float s = (*texcoords)[i].x();
+                const float t = (*texcoords)[i].y();
+                if (surface.mHasTexMat)
+                {
+                    // Baked here because the vertex layout has nowhere else to put it: Remix vertices
+                    // carry raw texcoords and the material carries no UV transform.
+                    vertex.mTexcoord[0] = s * surface.mTexMat[0] + t * surface.mTexMat[2] + surface.mTexMat[4];
+                    vertex.mTexcoord[1] = s * surface.mTexMat[1] + t * surface.mTexMat[3] + surface.mTexMat[5];
+                }
+                else
+                {
+                    vertex.mTexcoord[0] = s;
+                    vertex.mTexcoord[1] = t;
+                }
             }
             else
             {
@@ -1030,6 +1392,7 @@ namespace MWRender
         cached.mVertexCount = vertexCount;
         cached.mIndexCount = static_cast<unsigned int>(mIndexScratch.size());
         cached.mMaterial = material;
+        std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(cached.mTexMat));
         mMeshes.emplace(key, cached);
         return handle;
     }
