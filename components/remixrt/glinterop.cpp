@@ -582,7 +582,49 @@ namespace RemixRT
         unsigned int readbackHeight = 0;
     };
 
-    CompositeCallback::CompositeCallback(const ImportOperation* import)
+    void ImportOperation::release()
+    {
+        if (mTextureName == 0 && mMemoryObject == 0 && mWaitSemaphore == 0 && mSignalSemaphore == 0)
+            return;
+
+        const Entrypoints fns = resolveEntrypoints();
+
+        // Texture first, then the memory it was created from: the texture is a view onto the memory
+        // object, so releasing the memory while a texture still names it is the wrong order.
+        if (mTextureName != 0)
+        {
+            const GLuint texture = static_cast<GLuint>(mTextureName);
+            glDeleteTextures(1, &texture);
+            mTextureName = 0;
+        }
+        if (mMemoryObject != 0 && fns.deleteMemoryObjects != nullptr)
+        {
+            const GLuint memory = static_cast<GLuint>(mMemoryObject);
+            fns.deleteMemoryObjects(1, &memory);
+        }
+        mMemoryObject = 0;
+
+        if (fns.deleteSemaphores != nullptr)
+        {
+            for (unsigned int* semaphore : { &mWaitSemaphore, &mSignalSemaphore })
+            {
+                if (*semaphore != 0)
+                {
+                    const GLuint name = static_cast<GLuint>(*semaphore);
+                    fns.deleteSemaphores(1, &name);
+                }
+            }
+        }
+        mWaitSemaphore = 0;
+        mSignalSemaphore = 0;
+
+        // Not an error: this is the deliberate response to a handshake we cannot establish, and it is what
+        // keeps the fallback safe rather than merely quiet.
+        mSucceeded = false;
+        Log(Debug::Info) << "Remix GL interop: import released; the shared image is no longer held by GL.";
+    }
+
+    CompositeCallback::CompositeCallback(ImportOperation* import)
         : mImport(import)
     {
         if (const char* value = std::getenv("OPENMW_REMIX_SYNC_NO_TEXBARRIER");
@@ -802,12 +844,13 @@ namespace RemixRT
             resources->fns = resolveEntrypoints();
 
             mResources = std::move(resources);
+            // Deliberately says nothing about synchronisation. It used to, and it was wrong: this runs on
+            // the first composited frame, which can precede the import operation, so it reported "WITHOUT
+            // synchronisation" whenever it merely got there first. That was read as evidence the semaphores
+            // had failed to import and sent an investigation the wrong way for a long time. The state is
+            // logged once below instead, where it is actually known.
             Log(Debug::Info) << "Remix composite: ready"
-                             << (mImport->needsChannelSwap() ? " (BGRA source)" : "")
-                             << (mImport->syncAvailable()
-                                        ? ", synchronised against Remix"
-                                        : ", WITHOUT synchronisation -- reads of the shared image are "
-                                          "undefined; the readback path is the way to get a picture");
+                             << (mImport->needsChannelSwap() ? " (BGRA source)" : "");
         }
 
         const osg::Viewport* viewport = renderInfo.getCurrentCamera()
@@ -834,6 +877,20 @@ namespace RemixRT
         // The readback path carries its own pixels, so it neither needs nor may use the handshake.
         const bool sync = !readback && mImport->syncAvailable()
             && mSyncArmed.load(std::memory_order_relaxed) && !mSyncFailed.load(std::memory_order_relaxed);
+
+        // Reported once, on the first frame that reaches this point, because by now the import has run and
+        // the answer is real. Each term is named separately: "not synchronised" has four distinct causes and
+        // they call for completely different fixes.
+        if (!mLoggedSyncState)
+        {
+            mLoggedSyncState = true;
+            Log(Debug::Info) << "Remix composite: synchronisation " << (sync ? "ACTIVE" : "inactive")
+                             << " -- readback " << (readback ? "on" : "off") << ", semaphores "
+                             << (mImport->syncAvailable() ? "imported" : "MISSING") << ", armed "
+                             << (mSyncArmed.load(std::memory_order_relaxed) ? "yes" : "no")
+                             << ", previously failed "
+                             << (mSyncFailed.load(std::memory_order_relaxed) ? "yes" : "no");
+        }
 
         if (sync)
         {
@@ -865,8 +922,13 @@ namespace RemixRT
                 // syncFailed(). The engine falls back to the unsynchronised copy from here on.
                 mSyncFailed.store(true, std::memory_order_relaxed);
                 Log(Debug::Error) << "Remix composite: the semaphore wait failed, so synchronisation is "
-                                     "disabled from here on and the composited image is undefined. This "
-                                     "is the black-frame case, not a cosmetic warning.";
+                                     "disabled from here on and the readback path takes over.";
+
+                // Release the import rather than leave it held. Without the handshake this texture aliases
+                // memory Remix writes every frame, and that state faulted the device even with nothing
+                // sampling it -- so falling back has to give the memory up, not just stop reading it.
+                mImport->release();
+                return;
             }
         }
 

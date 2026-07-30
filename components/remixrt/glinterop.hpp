@@ -62,6 +62,18 @@ namespace RemixRT
         /// When false, sampling the image is undefined -- the import is not usable as it stands.
         bool syncAvailable() const { return mWaitSemaphore != 0 && mSignalSemaphore != 0; }
 
+        /// Tears the import down: texture, memory object and both semaphores.
+        ///
+        /// Exists because an import that cannot be synchronised must not merely go unused -- it must go
+        /// away. A GL texture aliasing memory Remix writes every frame, with no handshake ordering the two,
+        /// faulted the device rather than producing a wrong picture (LiveKernelEvent 0x1a8), and it did so
+        /// while nothing was sampling it. So the handshake failing has to release the import, not just stop
+        /// reading from it.
+        ///
+        /// Must be called on the thread holding the GL context. Safe to call more than once; every handle
+        /// is zeroed, so textureName() and syncAvailable() report the import as gone afterwards.
+        void release();
+
     private:
         Runtime::ExternalImage mImage;
         Runtime::ExternalSync mSync;
@@ -92,7 +104,7 @@ namespace RemixRT
     class CompositeCallback : public osg::Camera::DrawCallback
     {
     public:
-        explicit CompositeCallback(const ImportOperation* import);
+        explicit CompositeCallback(ImportOperation* import);
 
         void operator()(osg::RenderInfo& renderInfo) const override;
 
@@ -156,7 +168,9 @@ namespace RemixRT
         /// Uploads the most recent readback frame and returns the texture to sample. 0 if unavailable.
         unsigned int uploadReadbackTexture(osg::GLExtensions* ext) const;
 
-        const ImportOperation* mImport;
+        /// Non-const because a failed handshake has to release the import rather than leave it aliasing
+        /// Remix's memory unguarded.
+        ImportOperation* mImport;
         mutable std::unique_ptr<Resources> mResources;
         mutable bool mFailed = false;
         bool mEnabled = true;
@@ -176,6 +190,8 @@ namespace RemixRT
         std::atomic<bool> mSyncArmed{ false };
         mutable std::atomic<bool> mSignalled{ false };
         mutable std::atomic<bool> mSyncFailed{ false };
+        /// One-shot guard for the synchronisation state report.
+        mutable bool mLoggedSyncState = false;
         /// Nanoseconds accumulated in glTexSubImage2D, and how many uploads that covers. Integer
         /// nanoseconds rather than a floating-point millisecond count because atomic<double> arithmetic is
         /// a C++20 addition and this has to build wherever the rest of the engine does.
