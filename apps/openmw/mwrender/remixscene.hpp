@@ -109,6 +109,37 @@ namespace MWRender
             /// mAlphaBlend -- both are blended, and Morrowind uses the same particle machinery for both. An
             /// additive surface is emissive by construction; an alpha-blended one occludes and must be lit.
             bool mAdditive = false;
+            /// An albedo supplied directly as an image, bypassing mTexture.
+            ///
+            /// Exists for composited terrain, whose real albedo is a render target with no image behind it
+            /// -- so it is read back to the CPU and handed over this way. Takes precedence over mTexture
+            /// when set, because for those chunks mTexture is the render target and unusable.
+            const osg::Image* mExplicitImage = nullptr;
+
+            /// Per-vertex coverage for one terrain layer, taken from OpenMW's blend map and written into
+            /// the vertex alpha.
+            ///
+            /// This is how a terrain layer's coverage reaches a path tracer at all. OpenMW draws each layer
+            /// with the layer's diffuse tiled many times across the chunk and a blend map stretched once
+            /// over it, and multiplies the two in a shader -- two textures at different frequencies, which
+            /// a Remix surface with a single albedo cannot express. Sampling the blend map per vertex loses
+            /// very little, because Morrowind's blend maps are already at roughly the terrain vertex
+            /// density, and it needs no second texture and no bake.
+            ///
+            /// The consequence worth knowing is that the same chunk geometry submitted with different
+            /// coverage produces a different vertex buffer and therefore a different mesh -- one per layer
+            /// rather than one per chunk. That is also what a D3D9 game doing multi-pass terrain hands the
+            /// runtime, so it is the cost the runtime is built for rather than a surprise.
+            const osg::Image* mCoverageImage = nullptr;
+            /// Blend map texture matrix, applied to the raw texcoord before sampling mCoverageImage.
+            /// Separate from mTexMat because that one carries the *diffuse* tiling; the two differ by
+            /// exactly the frequency this whole mechanism exists to reconcile.
+            bool mHasCoverageTexMat = false;
+            float mCoverageTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+            /// Which layer of its chunk this is, so two layers sharing a geometry address do not collide
+            /// in the mesh memo. Zero for everything that is not a terrain layer.
+            unsigned int mCoverageLayer = 0;
+
             /// Whether this surface wants real order-independent transparency instead of the cutout that
             /// materialFor otherwise substitutes for alpha blending.
             ///
@@ -335,7 +366,14 @@ namespace MWRender
         /// Keyed by osg::Geometry address, purely as a memo to keep content hashing off the per-frame path.
         /// Unlike mMeshes this is not an identity -- it is a cache of a lookup, and an address reused by a
         /// different geometry is caught by the revalidation checks in GeometryIdentity.
-        std::unordered_map<const void*, GeometryIdentity> mGeometryIdentities;
+        /// Keyed on geometry address combined with the terrain layer index, not on the address alone.
+        ///
+        /// A chunk's layers all share one osg::Geometry, so an address-only key made them evict one
+        /// another and every layer rebuilt its mesh every frame. The combination is injective rather than
+        /// a hash: multiplying by an odd constant is invertible modulo 2^64, so distinct addresses stay
+        /// distinct, and adding a layer index far smaller than the multiplier cannot reach the next
+        /// address's slot. No collisions to reason about.
+        std::unordered_map<std::uint64_t, GeometryIdentity> mGeometryIdentities;
         /// Keyed by osg::Image address. Textures and materials are never evicted: OpenMW's resource
         /// system shares images aggressively and keeps them alive for the session, the set is bounded by
         /// how many distinct textures the game has, and re-uploading one costs a full staging copy.

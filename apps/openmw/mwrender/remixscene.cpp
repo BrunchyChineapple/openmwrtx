@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -56,6 +57,23 @@ namespace
     /// and object paging can present far more geometry than is sane to convert and submit each frame.
     /// Hitting this draws a partial scene and says so, which is a much better failure than hanging.
     constexpr unsigned int kMaxInstancesPerFrame = 20000;
+
+    /// Most groundcover copies handed over in a single frame.
+    ///
+    /// Its own allowance rather than a share of kMaxInstancesPerFrame, because grass is instanced in the
+    /// thousands per chunk across every chunk within Groundcover/"rendering distance". Drawn from the
+    /// general budget it would crowd the world out of its own frame -- architecture and actors dropped so
+    /// that more blades could be submitted. When this runs out the remaining blades are skipped and
+    /// everything else is submitted as usual.
+    constexpr unsigned int kMaxGroundcoverCopies = 8000;
+
+    /// Vertex attribute slots OpenMW's groundcover keeps per-copy placement in.
+    ///
+    /// 6 is (position.xyz, scale) relative to the chunk, 7 is an Euler rotation. Set in
+    /// Groundcover::InstancingVisitor and read by files/shaders/compatibility/groundcover.vert, both as
+    /// bare literals -- there is no shared symbol to reference, so these have to be kept in step by hand.
+    constexpr unsigned int kGroundcoverOffsetAttrib = 6;
+    constexpr unsigned int kGroundcoverRotationAttrib = 7;
 
     /// Reads a boolean environment variable, defaulting to \a fallback when unset or empty.
     bool envFlag(const char* name, bool fallback)
@@ -273,6 +291,22 @@ namespace
         return parsed > 0.0f ? parsed : fallback;
     }
 
+    /// Reads a non-negative integer environment variable, keeping \a fallback when unset or unparseable.
+    ///
+    /// Zero is honoured rather than rejected: for a budget it is the meaningful "submit none of this"
+    /// value, which is the same reason envByte exists alongside envFloat.
+    unsigned int envUInt(const char* name, unsigned int fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+        char* end = nullptr;
+        const long long parsed = std::strtoll(value, &end, 10);
+        if (end == value || parsed < 0)
+            return fallback;
+        return static_cast<unsigned int>(std::min<long long>(parsed, kMaxInstancesPerFrame));
+    }
+
     /// Reads a 0..255 environment variable, keeping \a fallback only when unset or unparseable.
     ///
     /// Separate from envFloat because that one treats zero as unparseable, which is the right call for a
@@ -287,6 +321,72 @@ namespace
         if (end == value)
             return fallback;
         return static_cast<unsigned char>(std::clamp<long>(parsed, 0, 255));
+    }
+
+    /// Samples an image's alpha at \a s, \a t and returns it as 0..255.
+    ///
+    /// Goes through osg::Image::getColor rather than indexing the data directly, because OpenMW's blend
+    /// maps are not one format: they arrive as GL_ALPHA, GL_LUMINANCE_ALPHA or GL_RGBA depending on how the
+    /// chunk was built, and getColor already knows how to read each. This runs once per vertex when a
+    /// terrain layer's mesh is built, not per frame, so the indirection is not on a hot path.
+    ///
+    /// Clamped rather than wrapped: a blend map covers its chunk exactly once, so a texcoord landing
+    /// outside it means the vertex is on the chunk's own edge, and wrapping there would fetch coverage from
+    /// the opposite side of the chunk.
+    unsigned int sampleImageAlpha(const osg::Image& image, float s, float t)
+    {
+        if (image.data() == nullptr || image.s() <= 0 || image.t() <= 0)
+            return 0xFFu;
+
+        const float cs = std::clamp(s, 0.0f, 1.0f);
+        const float ct = std::clamp(t, 0.0f, 1.0f);
+        const osg::Vec4 colour = image.getColor(osg::Vec2(cs, ct));
+        return static_cast<unsigned int>(std::clamp(colour.a(), 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+
+    /// Whether an image carries any non-zero alpha at all.
+    ///
+    /// Worth asking because a terrain chunk lists every land texture used anywhere across its area, and a
+    /// large chunk spans many cells -- so most of its layers cover none of it. Measured at 104 of 227
+    /// layers entirely zero, and a layer that covers nothing still costs an instance, a mesh and its share
+    /// of acceleration-structure work.
+    ///
+    /// Scans the bytes directly for GL_ALPHA, which is what OpenMW's blend maps are, and bails at the first
+    /// non-zero one. The cost is therefore near nothing for a layer that does contribute, and a full 16 KB
+    /// scan only for one that does not -- which is the case being eliminated, so it pays for itself. Other
+    /// formats fall back to a sparse grid through getColor rather than assuming a layout.
+    bool imageHasAnyAlpha(const osg::Image& image)
+    {
+        if (image.data() == nullptr || image.s() <= 0 || image.t() <= 0)
+            return true; // Unknown rather than empty; submitting is the safe answer.
+
+        // Spelled out rather than using the kGl* constants below, which are declared after this function.
+        // 0x1906 is GL_ALPHA, 0x1401 is GL_UNSIGNED_BYTE -- what the log reports for every blend map.
+        if (image.getPixelFormat() == 0x1906u && image.getDataType() == 0x1401u)
+        {
+            for (int row = 0; row < image.t(); ++row)
+            {
+                const unsigned char* line = image.data(0, row);
+                if (line == nullptr)
+                    return true;
+                for (int column = 0; column < image.s(); ++column)
+                {
+                    if (line[column] != 0)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        for (int gy = 0; gy <= 16; ++gy)
+        {
+            for (int gx = 0; gx <= 16; ++gx)
+            {
+                if (sampleImageAlpha(image, gx / 16.0f, gy / 16.0f) != 0)
+                    return true;
+            }
+        }
+        return false;
     }
 
     /// GL pixel and internal formats, spelled out rather than taken from OSG's headers.
@@ -816,7 +916,8 @@ namespace
             // would mean compositing the layers into a per-chunk texture on the CPU. The base layer is
             // the dominant one, so this is the right approximation to start from rather than the final
             // answer.
-            if (const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable))
+            const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable);
+            if (terrain != nullptr)
             {
                 const auto& passes = terrain->getPasses();
                 if (!passes.empty() && passes.front() != nullptr)
@@ -849,16 +950,21 @@ namespace
             if (mesh == 0)
                 return;
 
-            // OSG is row-vector (p * M); the Remix transform is applied as p' = M * p with translation
-            // in the last column. Hence the transpose of the 3x3 and the translation read from OSG's
-            // fourth row. If instances come out rotated or mirrored, this is the line to question.
+            // Groundcover is the one thing OpenMW draws instanced, and instancing is invisible to a
+            // scene-graph walk: the geometry holds a single blade, and the thousands of copies exist only
+            // as a primitive-set instance count plus two vertex attributes the vertex shader unpacks.
+            // Reading the geometry alone therefore yields one blade standing at its chunk's origin, which
+            // is exactly what came through -- grass loaded and was traversed, and the world got one sprig
+            // per chunk.
+            //
+            // Worth expanding rather than approximating because Remix's model is the same shape as OSG's
+            // here: one mesh, many instance transforms. The blade goes over once and each copy costs a
+            // transform, which is what the runtime wants anyway -- every copy shares one BLAS.
+            if (submitGroundcoverCopies(*geometry, mesh, categories))
+                return;
+
             float transform[12];
-            for (int row = 0; row < 3; ++row)
-            {
-                for (int col = 0; col < 3; ++col)
-                    transform[row * 4 + col] = static_cast<float>(mMatrix(col, row));
-                transform[row * 4 + 3] = static_cast<float>(mMatrix(3, row));
-            }
+            writeTransform(mMatrix, transform);
 
             // Double-sided unconditionally for now. OpenMW's winding after the accumulated transforms
             // has not been verified against what Remix expects, and a wrong answer there makes geometry
@@ -882,12 +988,297 @@ namespace
                 mScene.lastMeshIsSkinned() ? rig : nullptr, mInstances + 1);
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
+
+            // The base layer is submitted; the rest of the ground goes over it.
+            if (terrain != nullptr)
+                submitTerrainLayers(*terrain, *geometry, categories, transform);
+        }
+
+        /// Submits a terrain chunk's overlaid layers, one draw each, over the base layer already sent.
+        ///
+        /// This is what makes blended ground possible at all. OpenMW's terrain is multi-pass -- one pass
+        /// per texture layer, each alpha-blended over the last through its own blend map -- and a
+        /// path-traced surface has one material, so merging only the first pass gave every chunk a single
+        /// layer and produced the hard rectangular edges where neighbouring chunks chose different base
+        /// layers.
+        ///
+        /// Each layer carries its own diffuse at its own tiling and its coverage in the vertex alpha, so
+        /// the runtime blends them the same way it blends a multi-pass terrain from a D3D9 game. Which is
+        /// the point: that path is well travelled, and the alternative -- baking the layers into a texture
+        /// -- was tried and is both slower and blurrier.
+        void submitTerrainLayers(const Terrain::TerrainDrawable& terrain, osg::Geometry& geometry,
+            unsigned int categories, const float (&baseTransform)[12])
+        {
+            static const bool enabled = envFlag("OPENMW_REMIX_TERRAIN_LAYERS", true);
+            if (!enabled)
+                return;
+
+            const auto& passes = terrain.getPasses();
+
+            // One-shot diagnostic over the first few chunks. Which of the several ways this can silently
+            // do nothing is not guessable from the result: a chunk with one pass, a blend map whose CPU
+            // image was released, or coverage that arrives and is then ignored all look identical on
+            // screen -- hard-edged ground.
+            static unsigned int logged = 0;
+            const bool logThis = logged < 24;
+            if (logThis)
+            {
+                ++logged;
+                // Composite presence is the fact that matters. A chunk drawn from a composite map has one
+                // pass whose texture is a render target OpenMW already blended on the GPU -- so there are
+                // no layers here to blend, and the hard edges come from approximating that target by its
+                // first layer. Raising Terrain/"composite map level" pushes chunks back onto the
+                // per-layer path, which is where the layers this code needs actually exist.
+                Log(Debug::Info) << "Remix terrain chunk: " << passes.size() << " passes, composite "
+                                 << (terrain.getCompositeMap() != nullptr ? "YES" : "no");
+            }
+
+            if (passes.size() < 2)
+                return;
+
+            for (std::size_t pass = 1; pass < passes.size(); ++pass)
+            {
+                if (mInstances >= kMaxInstancesPerFrame)
+                {
+                    mClamped = true;
+                    return;
+                }
+                if (passes[pass] == nullptr)
+                    continue;
+
+                MWRender::RemixScene::SurfaceState layer = currentSurface();
+                mergeState(*passes[pass], layer);
+
+                // Unit 1 is the blend map -- see components/terrain/material.cpp, which binds the layer
+                // diffuse at unit 0 and the blend map at unit 1 with its own texture matrix. Without an
+                // image behind it there is no coverage to read and the layer would cover the whole chunk
+                // opaquely, hiding everything below it, so skipping is the safe failure.
+                const auto* blendTexture = dynamic_cast<const osg::Texture2D*>(
+                    passes[pass]->getTextureAttribute(1, osg::StateAttribute::TEXTURE));
+
+                if (logThis)
+                {
+                    const osg::Image* img = blendTexture != nullptr ? blendTexture->getImage(0) : nullptr;
+                    Log(Debug::Info) << "  layer " << pass << ": blendTexture "
+                                     << (blendTexture != nullptr ? "yes" : "NO") << ", image "
+                                     << (img != nullptr ? "yes" : "NO")
+                                     << (img != nullptr
+                                             ? " " + std::to_string(img->s()) + "x" + std::to_string(img->t())
+                                                 + " fmt 0x" + std::to_string(img->getPixelFormat())
+                                                 + " data " + (img->data() != nullptr ? "yes" : "NO")
+                                             : std::string())
+                                     << ", texmat "
+                                     << (passes[pass]->getTextureAttribute(1, osg::StateAttribute::TEXMAT)
+                                                != nullptr
+                                             ? "yes"
+                                             : "no");
+                }
+
+                if (blendTexture == nullptr || blendTexture->getImage(0) == nullptr)
+                    continue;
+
+                // A layer that covers none of this chunk is not submitted at all. Skipping it is free
+                // correctness -- a fully transparent surface contributes nothing to the image either way --
+                // and it removes close to half of the terrain instances, because a chunk enumerates every
+                // land texture used anywhere in its area while covering only some of it.
+                if (!imageHasAnyAlpha(*blendTexture->getImage(0)))
+                {
+                    if (logThis)
+                        Log(Debug::Info) << "    skipped: covers none of this chunk";
+                    continue;
+                }
+
+                layer.mCoverageImage = blendTexture->getImage(0);
+                layer.mCoverageLayer = static_cast<unsigned int>(pass);
+
+                if (logThis)
+                {
+                    // A blend map that reads as uniformly 255 means the coverage is not the gradient it is
+                    // supposed to be, which would make every layer cover its chunk completely.
+                    unsigned int lo = 255;
+                    unsigned int hi = 0;
+                    for (int gy = 0; gy <= 4; ++gy)
+                    {
+                        for (int gx = 0; gx <= 4; ++gx)
+                        {
+                            const unsigned int a = sampleImageAlpha(
+                                *layer.mCoverageImage, gx * 0.25f, gy * 0.25f);
+                            lo = std::min(lo, a);
+                            hi = std::max(hi, a);
+                        }
+                    }
+                    Log(Debug::Info) << "    coverage alpha range " << lo << ".." << hi;
+                }
+
+                if (const auto* blendTexMat = dynamic_cast<const osg::TexMat*>(
+                        passes[pass]->getTextureAttribute(1, osg::StateAttribute::TEXMAT)))
+                {
+                    const osg::Matrix& m = blendTexMat->getMatrix();
+                    layer.mHasCoverageTexMat = true;
+                    layer.mCoverageTexMat[0] = static_cast<float>(m(0, 0));
+                    layer.mCoverageTexMat[1] = static_cast<float>(m(0, 1));
+                    layer.mCoverageTexMat[2] = static_cast<float>(m(1, 0));
+                    layer.mCoverageTexMat[3] = static_cast<float>(m(1, 1));
+                    layer.mCoverageTexMat[4] = static_cast<float>(m(3, 0));
+                    layer.mCoverageTexMat[5] = static_cast<float>(m(3, 1));
+                }
+
+                // Real transparency rather than the cutout materialFor substitutes for blending. A cutout
+                // would quantise the coverage to on or off and reinstate hard edges in a new place -- the
+                // gradient between layers is the entire content of a blend map.
+                layer.mAlphaBlend = true;
+                layer.mPreferBlend = true;
+                layer.mAlphaTestReference = 0;
+
+                const unsigned long long layerMesh = mScene.submitGeometry(geometry, layer, nullptr);
+                if (layerMesh == 0)
+                    continue;
+
+                mScene.drawSubmitted(layerMesh, baseTransform, categories, true, nullptr, mInstances + 1);
+                ++mInstances;
+            }
         }
 
         unsigned int instances() const { return mInstances; }
         bool clamped() const { return mClamped; }
 
     private:
+        /// Writes an OSG matrix as the twelve floats Remix takes for an instance transform.
+        ///
+        /// OSG is row-vector (p * M); the Remix transform is applied as p' = M * p with translation in the
+        /// last column. Hence the transpose of the 3x3 and the translation read from OSG's fourth row. If
+        /// instances come out rotated or mirrored, this is the function to question.
+        static void writeTransform(const osg::Matrix& matrix, float (&out)[12])
+        {
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int col = 0; col < 3; ++col)
+                    out[row * 4 + col] = static_cast<float>(matrix(col, row));
+                out[row * 4 + 3] = static_cast<float>(matrix(3, row));
+            }
+        }
+
+        /// Rebuilds the per-copy rotation that groundcover.vert derives from its aRotation attribute.
+        ///
+        /// Transcribed from that shader's rotation() rather than derived independently, because the two
+        /// have to agree exactly or grass leans one way in the path-traced view and another in OpenMW's
+        /// own. GLSL's mat4 constructor takes columns and OSG applies matrices to row vectors, so each of
+        /// the shader's columns becomes a row here; that transpose is the whole of the conversion.
+        static osg::Matrix groundcoverRotation(const osg::Vec3f& angle)
+        {
+            const double sinX = std::sin(angle.x());
+            const double cosX = std::cos(angle.x());
+            const double sinY = std::sin(angle.y());
+            const double cosY = std::cos(angle.y());
+            const double sinZ = std::sin(angle.z());
+            const double cosZ = std::cos(angle.z());
+
+            osg::Matrix rotation;
+            rotation(0, 0) = cosZ * cosY + sinX * sinY * sinZ;
+            rotation(0, 1) = -sinZ * cosX;
+            rotation(0, 2) = cosZ * sinY + sinZ * sinX * cosY;
+            rotation(1, 0) = sinZ * cosY + cosZ * sinX * sinY;
+            rotation(1, 1) = cosZ * cosX;
+            rotation(1, 2) = sinZ * sinY - cosZ * sinX * cosY;
+            rotation(2, 0) = -sinY * cosX;
+            rotation(2, 1) = sinX;
+            rotation(2, 2) = cosX * cosY;
+            return rotation;
+        }
+
+        /// Hands over one Remix instance per groundcover copy.
+        ///
+        /// Returns false when \a geometry is not instanced, meaning the caller should submit it the
+        /// ordinary way. Returns true once it has taken responsibility for the geometry -- including when
+        /// grass is switched off, because the alternative is submitting the base blade, and a lone sprig
+        /// at each chunk's origin is worse than no grass at all.
+        ///
+        /// Per copy the local transform is scale, then rotation, then translation, matching
+        /// groundcover.vert:
+        ///     position = aOffset.xyz;  scale = aOffset.w;  rotation = rotation(aRotation);
+        ///     displacedVertex = rotation * scale * gl_Vertex;  displacedVertex.xyz += position;
+        /// The offsets are chunk-relative and the accumulated path matrix carries the chunk into the
+        /// world, so composing the two is the whole placement.
+        ///
+        /// What is deliberately not reproduced is groundcoverDisplacement, the wind sway. That is a
+        /// per-vertex displacement with no equivalent in an instance transform, so path-traced grass
+        /// stands still. Animating it would mean rebuilding every blade's vertices every frame, which is
+        /// the one thing this integration avoids everywhere else.
+        bool submitGroundcoverCopies(
+            const osg::Geometry& geometry, unsigned long long mesh, unsigned int categories)
+        {
+            unsigned int copies = 0;
+            for (unsigned int i = 0; i < geometry.getNumPrimitiveSets(); ++i)
+            {
+                const osg::PrimitiveSet* set = geometry.getPrimitiveSet(i);
+                if (set != nullptr && set->getNumInstances() > 0)
+                    copies = std::max(copies, static_cast<unsigned int>(set->getNumInstances()));
+            }
+
+            // One instance is what every ordinary drawable reports, so this is the not-instanced exit.
+            if (copies <= 1)
+                return false;
+
+            const auto* offsets = dynamic_cast<const osg::Vec4Array*>(
+                geometry.getVertexAttribArray(kGroundcoverOffsetAttrib));
+            const auto* rotations = dynamic_cast<const osg::Vec3Array*>(
+                geometry.getVertexAttribArray(kGroundcoverRotationAttrib));
+
+            // Instanced by something other than groundcover, or by a future version of it that places its
+            // copies differently. Submitting the base geometry once is then the honest fallback: it is
+            // where it belongs, there is simply one of it.
+            if (offsets == nullptr || offsets->size() < copies)
+                return false;
+
+            static const bool enabled = envFlag("OPENMW_REMIX_GROUNDCOVER", true);
+            static const unsigned int budget
+                = envUInt("OPENMW_REMIX_GROUNDCOVER_BUDGET", kMaxGroundcoverCopies);
+            if (!enabled || budget == 0)
+                return true;
+
+            // The same distance the shader fades grass out at, so the path-traced extent matches
+            // OpenMW's own rather than being a second, unrelated draw distance. Zero means the setting
+            // imposes no limit, and then only the budget bounds this.
+            const float fadeEnd = static_cast<float>(Settings::groundcover().mRenderingDistance);
+
+            for (unsigned int i = 0; i < copies; ++i)
+            {
+                if (mInstances >= kMaxInstancesPerFrame)
+                {
+                    mClamped = true;
+                    break;
+                }
+                if (mGroundcoverCopies >= budget)
+                    break;
+
+                const osg::Vec4f& offset = (*offsets)[i];
+                const osg::Vec3f position(offset.x(), offset.y(), offset.z());
+                const float scale = offset.w();
+
+                osg::Matrix copyMatrix = osg::Matrix::scale(scale, scale, scale);
+                if (rotations != nullptr && i < rotations->size())
+                    copyMatrix = copyMatrix * groundcoverRotation((*rotations)[i]);
+                copyMatrix = copyMatrix * osg::Matrix::translate(position);
+
+                const osg::Matrix world = copyMatrix * mMatrix;
+                const osg::Vec3f at(static_cast<float>(world(3, 0)), static_cast<float>(world(3, 1)),
+                    static_cast<float>(world(3, 2)));
+
+                if (fadeEnd > 0.0f && (at - mEye).length() > fadeEnd)
+                    continue;
+
+                float transform[12];
+                writeTransform(world, transform);
+
+                mScene.drawSubmitted(mesh, transform, categories, true, nullptr, mInstances + 1);
+                mScene.noteInstancePosition(world(3, 0), world(3, 1), world(3, 2));
+                ++mInstances;
+                ++mGroundcoverCopies;
+            }
+
+            return true;
+        }
+
         unsigned int currentCategories() const
         {
             return mCategoryStack.empty() ? 0u : mCategoryStack.back();
@@ -909,6 +1300,22 @@ namespace
         static void mergeCompositeLayer(
             const Terrain::CompositeMap& composite, MWRender::RemixScene::SurfaceState& surface)
         {
+            // The composited result when it is available, which is the whole point: it already carries every
+            // layer blended by OpenMW's own compositor, with the layer tiling and the half-texel nudge
+            // material.cpp applies to match vanilla. The base-layer path below is the fallback for a chunk
+            // that has not finished compositing yet, and it is what makes the ground look like flat
+            // rectangles with hard edges.
+            //
+            // No texture matrix goes with it. A composited chunk is drawn with a single UV set spanning the
+            // chunk exactly once, so the composite is sampled 1:1 and the sub-quad tiling correction below
+            // would be actively wrong here.
+            if (composite.mReadback != nullptr)
+            {
+                surface.mExplicitImage = composite.mReadback.get();
+                surface.mHasTexMat = false;
+                return;
+            }
+
             if (composite.mBaseLayerPass == nullptr)
                 return;
 
@@ -1032,6 +1439,9 @@ namespace
         std::vector<unsigned int> mCategoryStack;
         std::vector<MWRender::RemixScene::SurfaceState> mSurfaceStack;
         unsigned int mInstances = 0;
+        /// Groundcover copies submitted this frame, counted separately so grass is bounded by its own
+        /// allowance rather than by whatever is left of the general one.
+        unsigned int mGroundcoverCopies = 0;
         bool mClamped = false;
     };
 }
@@ -1069,6 +1479,38 @@ namespace MWRender
         Log(Debug::Info) << "Remix scene: alpha-blended surfaces are cut out at "
                          << static_cast<unsigned int>(mBlendCutout)
                          << "/255 (OPENMW_REMIX_BLEND_CUTOUT=0 leaves them solid)";
+
+        // Ask the terrain compositor to keep a CPU copy of what it composites.
+        //
+        // Off by default because it is pure cost for anyone only rasterising -- one glReadPixels and 1MB
+        // retained per chunk at the default 512x512. This is the only route to a real terrain albedo: the
+        // composited result exists solely as a render target, and taking the base layer instead is what
+        // made the ground read as flat rectangles with hard edges between chunks.
+        //
+        // Only chunks at or above Terrain/"composite map level" are composited at all, so that setting has
+        // to be low enough to cover near chunks or they keep the base-layer approximation.
+        // Off by default, because it is a trade rather than an improvement.
+        //
+        // Reading the composite back gives correctly blended ground: every layer combined by OpenMW's own
+        // compositor, no hard rectangles where neighbouring chunks pick different base layers. But the
+        // composite is one 512x512 texture for a whole chunk, where the base-layer path tiles its texture
+        // many times across the same chunk. At cell scale that is roughly 16 world units per texel against
+        // vanilla's 2, so the ground goes soft and low-frequency -- which reads worse than the wrong
+        // blending did, particularly on large-chunk terrain like Tamriel Rebuilt.
+        //
+        // Neither option is right. Sharpness needs the layers tiled, correctness needs them blended, and one
+        // baked texture per chunk cannot do both at any resolution that fits in memory: matching vanilla
+        // would take 4096x4096 a chunk. The real answer is Remix's own TerrainBaker, which composites
+        // multi-pass terrain at a resolution it manages -- see rtx_terrain_baker.cpp. Until that is wired to
+        // the API path this stays opt-in so it can be compared rather than assumed.
+        const bool terrainComposite = envFlag("OPENMW_REMIX_TERRAIN_COMPOSITE", false);
+        Terrain::CompositeMap::sReadbackEnabled = terrainComposite;
+        Log(Debug::Info) << "Remix scene: terrain composite readback "
+                         << (terrainComposite ? "ENABLED -- ground is correctly blended but softer, since a "
+                                                "chunk's whole albedo is one 512x512 composite"
+                                              : "off; ground uses the tiled base layer, which is sharp but "
+                                                "shows hard edges where chunks pick different layers "
+                                                "(OPENMW_REMIX_TERRAIN_COMPOSITE=1 to compare)");
 
         mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", kLightRadiusDefault);
         mLightIntensityFactor
@@ -1856,10 +2298,15 @@ namespace MWRender
         if (surface.mIsWater && mWaterMaterial != 0)
             return mWaterMaterial;
 
-        if (surface.mTexture == nullptr)
-            return mDefaultMaterial;
-
-        const osg::Image* image = surface.mTexture->getImage();
+        // An explicitly supplied image wins. Composited terrain arrives this way because its albedo only
+        // ever existed as a render target; mTexture for those chunks is that target and has no image.
+        const osg::Image* image = surface.mExplicitImage;
+        if (image == nullptr)
+        {
+            if (surface.mTexture == nullptr)
+                return mDefaultMaterial;
+            image = surface.mTexture->getImage();
+        }
         if (image == nullptr)
             return mDefaultMaterial;
 
@@ -2251,7 +2698,11 @@ namespace MWRender
         // this whole approach comes from. RigGeometry's copy constructor shares mSourceGeometry, so every
         // actor wearing the same body part or armour piece resolves to one Remix mesh, submitted once and
         // instanced with different bone transforms.
-        const void* key = &geometry;
+        // Injective over (geometry, layer) -- see mGeometryIdentities in the header for why this is a
+        // combination rather than a hash.
+        const std::uint64_t key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&geometry))
+                * 0x100000001B3ull
+            + surface.mCoverageLayer;
 
         const auto* positions = dynamic_cast<const osg::Vec3Array*>(geometry.getVertexArray());
         if (positions == nullptr || positions->empty())
@@ -2345,9 +2796,30 @@ namespace MWRender
                 vertex.mTexcoord[1] = 0.0f;
             }
 
-            // Opaque white. Vertex colours are ignored until materials are real; feeding them in now
-            // would tint the flat debug material and make it harder to read.
-            vertex.mColor = 0xFFFFFFFFu;
+            // Opaque white, except for a terrain layer, whose coverage rides in the alpha.
+            //
+            // Sampled from the raw texcoord rather than the one written above: that one has the diffuse
+            // tiling baked in and repeats many times across the chunk, while the blend map is stretched
+            // once over it. Using the wrong one would tile the coverage along with the diffuse.
+            unsigned int alpha = 0xFFu;
+            if (surface.mCoverageImage != nullptr && texcoords != nullptr
+                && texcoords->size() == positions->size())
+            {
+                const float s = (*texcoords)[i].x();
+                const float t = (*texcoords)[i].y();
+                float cs = s;
+                float ct = t;
+                if (surface.mHasCoverageTexMat)
+                {
+                    cs = s * surface.mCoverageTexMat[0] + t * surface.mCoverageTexMat[2]
+                        + surface.mCoverageTexMat[4];
+                    ct = s * surface.mCoverageTexMat[1] + t * surface.mCoverageTexMat[3]
+                        + surface.mCoverageTexMat[5];
+                }
+                alpha = sampleImageAlpha(*surface.mCoverageImage, cs, ct);
+            }
+
+            vertex.mColor = 0x00FFFFFFu | (alpha << 24);
         }
 
         // Identity from content. This value is what Remix knows the mesh as and what a USD replacement is

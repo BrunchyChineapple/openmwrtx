@@ -350,9 +350,16 @@ namespace RemixRT
         ///        which also diverts alpha testing to the legacy draw call an API host does not have.
         ///        Needed for particles: a cutout leaves smoke as hard-edged blobs, and the runtime only
         ///        treats an instance as a particle at all when its blending is enabled.
+        /// @param maskTextureHash optional terrain layer coverage mask, uploaded through a *linear*
+        ///        format. Carried in the material's height slot, which nothing here otherwise writes and
+        ///        which the runtime only reads when displacement is enabled -- see the implementation.
+        ///        Only the terrain baker consumes it. It exists because a terrain layer needs its diffuse
+        ///        tiled many times across the chunk and its coverage stretched once over it, and a single
+        ///        albedo slot cannot express both frequencies.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
-            unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1);
+            unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1,
+            unsigned long long maskTextureHash = 0);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

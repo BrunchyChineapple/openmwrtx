@@ -926,7 +926,7 @@ namespace RemixRT
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
         unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
-        int blendType)
+        int blendType, unsigned long long maskTextureHash)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -940,6 +940,10 @@ namespace RemixRT
         wchar_t normalPath[32] = {};
         if (normalTextureHash != 0)
             std::swprintf(normalPath, std::size(normalPath), L"0x%llx", normalTextureHash);
+
+        wchar_t maskPath[32] = {};
+        if (maskTextureHash != 0)
+            std::swprintf(maskPath, std::size(maskPath), L"0x%llx", maskTextureHash);
 
         remixapi_MaterialInfoOpaqueEXT opaque = {};
         opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -964,6 +968,21 @@ namespace RemixRT
             // (ONE_MINUS_SRC_ALPHA as the source), which nothing here produces.
             opaque.invertedBlend = 0;
         }
+
+        // The terrain layer coverage mask rides in the height slot.
+        //
+        // A terrain layer needs two textures at different frequencies -- the diffuse tiled many times
+        // across the chunk, the coverage mask stretched once -- and the API's opaque material has exactly
+        // one albedo. The height slot is the honest place to put the second one: nothing on this
+        // integration writes it, and the runtime only reads it when displaceIn or displaceOut is non-zero,
+        // which neither this function nor anything downstream sets. The terrain baker picks it up from
+        // there and composites the layer; every other consumer ignores it.
+        //
+        // Deliberately not smuggled through a scalar such as anisotropy, which is read elsewhere. If this
+        // ever needs to carry more than one texture it should become a proper terrain-layer extension
+        // struct rather than claiming a second slot.
+        if (maskTextureHash != 0)
+            opaque.heightTexture = maskPath;
 
         remixapi_MaterialInfo material = {};
         material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;

@@ -36,6 +36,25 @@ namespace Terrain
         /// Null for a chunk composited from nothing, which should not happen but is not worth asserting.
         osg::ref_ptr<osg::StateSet> mBaseLayerPass;
         float mBaseLayerTiling = 1.f;
+
+        /// CPU copy of the composited result, filled once when the map finishes compositing.
+        ///
+        /// This is what mBaseLayerPass above was a stand-in for. Taking the base layer alone gives each
+        /// chunk one flat texture, so the ground comes out as hard-edged rectangles wherever neighbouring
+        /// chunks pick different base layers -- the blend that makes terrain read as terrain is exactly the
+        /// part being discarded. OpenMW already computes it correctly here, into a render target, so reading
+        /// that back is far better than reproducing the blend by hand: it inherits the layer tiling, the
+        /// blend maps, and the half-texel nudge material.cpp applies to match vanilla.
+        ///
+        /// Null until composited, and null entirely unless sReadbackEnabled -- see there for the cost.
+        osg::ref_ptr<osg::Image> mReadback;
+
+        /// Whether composited maps are copied back to the CPU.
+        ///
+        /// Off by default because it is pure cost for anyone who only rasterises: one glReadPixels per
+        /// chunk, and the result kept for as long as the chunk lives. At the default 512x512 RGBA8 that is
+        /// 1MB a chunk. Enabled by the Remix backend, which has no other way to obtain a real albedo.
+        static bool sReadbackEnabled;
     };
 
     /**

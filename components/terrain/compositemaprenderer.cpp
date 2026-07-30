@@ -1,6 +1,7 @@
 #include "compositemaprenderer.hpp"
 
 #include <osg/FrameBufferObject>
+#include <osg/Image>
 #include <osg/RenderInfo>
 #include <osg/Texture2D>
 
@@ -123,7 +124,50 @@ namespace Terrain
             compositeMap.mDrawables[i] = nullptr;
         }
         if (compositeMap.mCompiled == compositeMap.mDrawables.size())
+        {
+            // Read the finished composite back before the FBO goes away. This is the only moment it is
+            // available: the attachment is bound right now, and mDrawables is about to be released.
+            //
+            // Bound again as READ_FRAMEBUFFER because apply() above bound it for drawing only, and
+            // glReadPixels reads from the read binding. Reading a colour attachment that was just rendered
+            // into needs no explicit barrier in GL -- the pipeline orders it.
+            if (CompositeMap::sReadbackEnabled && compositeMap.mReadback == nullptr)
+            {
+                const int width = compositeMap.mTexture->getTextureWidth();
+                const int height = compositeMap.mTexture->getTextureHeight();
+                if (width > 0 && height > 0)
+                {
+                    mFBO->apply(state, osg::FrameBufferObject::READ_FRAMEBUFFER);
+
+                    osg::ref_ptr<osg::Image> image = new osg::Image;
+                    image->allocateImage(width, height, 1, GL_RGBA, GL_UNSIGNED_BYTE);
+
+                    // Read from the colour attachment explicitly. The read buffer is not implied by binding
+                    // the FBO, and leaving it unset can read from whatever was current instead.
+                    glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
+                    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, image->data());
+
+                    // Force alpha opaque. The composite target is GL_RGB -- it has no alpha channel at all
+                    // (see ChunkManager::createCompositeMapRTT) -- so what GL returns for alpha when asked
+                    // for RGBA is driver-dependent: 1.0 by the spec's reading, but 0 or uninitialised in
+                    // practice. Terrain has no use for alpha, and a terrain albedo that arrives partially
+                    // transparent renders as washed-out lighter patches with straight chunk edges, which is
+                    // exactly what this produced before. Overwriting it removes the dependency rather than
+                    // hoping the driver is generous.
+                    unsigned char* pixels = image->data();
+                    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+                    for (std::size_t i = 0; i < count; ++i)
+                        pixels[i * 4 + 3] = 255;
+
+                    // Named so a consumer can tell chunks apart in a log, and so the texture identity
+                    // derived from it is stable for a given chunk rather than depending on load order.
+                    image->setFileName("terrain_composite");
+                    compositeMap.mReadback = image;
+                }
+            }
+
             compositeMap.mDrawables = std::vector<osg::ref_ptr<osg::Drawable>>();
+        }
 
         state.haveAppliedAttribute(osg::StateAttribute::VIEWPORT);
 
@@ -169,7 +213,9 @@ namespace Terrain
         return mCompileSet.size();
     }
 
-    CompositeMap::CompositeMap()
+    bool CompositeMap::sReadbackEnabled = false;
+
+CompositeMap::CompositeMap()
         : mCompiled(0)
     {
     }
