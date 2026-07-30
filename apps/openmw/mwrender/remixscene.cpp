@@ -107,8 +107,19 @@ namespace
     /// How often the scene handover summary is repeated, in frames.
     ///
     /// Slow enough not to fill the log over a session, often enough that a walk between two areas produces
-    /// several samples to compare.
-    constexpr std::uint64_t kSceneLogInterval = 600;
+    /// several samples to compare. Overridable because 600 frames is 20-40 seconds at path-traced frame
+    /// times, which is too coarse to catch a transient state -- holding third person for fifteen seconds
+    /// produced no sample at all, and the camera values in that line were the whole point of looking.
+    std::uint64_t sceneLogInterval()
+    {
+        if (const char* value = std::getenv("OPENMW_REMIX_SCENE_LOG_FRAMES"); value != nullptr)
+        {
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed > 0)
+                return static_cast<std::uint64_t>(parsed);
+        }
+        return 600;
+    }
 
     /// Game-state store keys the runtime publishes live light tuning on.
     ///
@@ -1494,14 +1505,16 @@ namespace MWRender
         // reported the main menu -- one instance, one mesh -- and then never again for the whole session,
         // so the counts that actually matter were never visible.
         const bool populated = mLastInstanceCount > 0;
-        if (!mLoggedFirstSubmit || populated != mWasPopulated || mFrame % kSceneLogInterval == 0)
+        static const std::uint64_t logInterval = sceneLogInterval();
+        if (!mLoggedFirstSubmit || populated != mWasPopulated || mFrame % logInterval == 0)
         {
             mLoggedFirstSubmit = true;
             mWasPopulated = populated;
             Log(Debug::Info) << "Remix scene: handed over " << mLastInstanceCount << " instances from "
                              << mMeshes.size() << " meshes (" << mMeshesShared
                              << " geometries shared an existing mesh), " << mLastLightCount << " lights and "
-                             << mTexturesUploaded << " textures; " << mSkinnedInstances
+                             << mTexturesUploaded << " textures (" << mTexturesShared
+                             << " uploads avoided, content already present); " << mSkinnedInstances
                              << " instances were skinned and " << mSkinnedDropped
                              << " skins were not ready; " << mLastParticleCount << " particles from "
                              << mParticleMeshes.size() << " systems"
@@ -1764,6 +1777,27 @@ namespace MWRender
         }
         hash = RemixRT::AssetHash::avoidZero(hash);
 
+        // Already uploaded under this identity, so there is nothing to upload.
+        //
+        // Two distinct osg::Image objects routinely hold the same file -- 127 of 1388 over a long walk --
+        // because OpenMW's resource system reaches the same texture by more than one path. The identity is
+        // the content, so both resolve here, and calling CreateTexture again would hand the runtime a
+        // duplicate hash: at best a wasted staging copy and a second VkImage the fork never releases, at
+        // worst it replaces the image a live material is already pointing at.
+        //
+        // A handful of these are genuinely different filenames holding identical bytes -- a mod shipping a
+        // copy of another mod's texture, or one texture serving both genders of an outfit. Collapsing those
+        // is correct rather than merely tolerable: Remix hashes pixels for D3D9 games too, so a replacement
+        // authored against one of them is meant to apply to the other.
+        if (mUploadedTextures.find(hash) != mUploadedTextures.end())
+        {
+            cached.mHash = hash;
+            cached.mUsable = true;
+            mTextures.emplace(key, cached);
+            ++mTexturesShared;
+            return hash;
+        }
+
         if (mRuntime.createTexture(hash, static_cast<unsigned int>(width),
                 static_cast<unsigned int>(height), mipLevels, format, uploadData, uploadSize)
             == 0)
@@ -1771,6 +1805,7 @@ namespace MWRender
             mTextures.emplace(key, cached);
             return 0;
         }
+        mUploadedTextures.insert(hash);
 
         cached.mHash = hash;
         cached.mUsable = true;

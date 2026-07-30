@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <osg/Matrixf>
@@ -374,6 +375,16 @@ namespace MWRender
         unsigned int mLastInstanceCount = 0;
         unsigned int mLastLightCount = 0;
         unsigned int mTexturesUploaded = 0;
+
+        /// Identities already handed to CreateTexture, so the same content is never uploaded twice.
+        ///
+        /// Separate from mTextures because that map is keyed per osg::Image and several images can share one
+        /// identity. Never evicted, for the same reason mTextures is not: the set is bounded by how many
+        /// distinct textures the game has.
+        std::unordered_set<unsigned long long> mUploadedTextures;
+
+        /// How many uploads were avoided because the content was already present.
+        unsigned int mTexturesShared = 0;
 
         /// How many times a geometry resolved to a mesh that already existed with identical content.
         ///
