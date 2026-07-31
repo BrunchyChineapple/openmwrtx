@@ -97,6 +97,23 @@ namespace
         }();
         return value;
     }
+
+    /// True when Remix presents into a window of its own rather than into OpenMW's.
+    ///
+    /// The distinction matters for what should happen when OpenMW's window is not visible. With a separate
+    /// window there is still something on screen to keep rendering for, and OpenMW's window is expected to
+    /// be inactive -- clicking the other one is how you reach the Remix menu. With Remix's surface parented
+    /// to OpenMW's window there is only one window, so it not being visible means nothing is: the game
+    /// should pause like any other, and presenting has to stop, because a minimised window has a zero-sized
+    /// surface and presenting into one hangs.
+    bool remixPresentsToSeparateWindow()
+    {
+        static const bool value = []() -> bool {
+            const char* env = std::getenv("OPENMW_REMIX_WINDOW");
+            return env != nullptr && *env != '\0' && *env != '0';
+        }();
+        return remixPresentsToScreen() && value;
+    }
 }
 
 #include "mwrender/vismask.hpp"
@@ -246,19 +263,22 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             ScopedProfile<UserStatsType::Sound> profile(frameStart, frameNumber, *timer, *stats);
 
-            // Not when Remix is presenting, because then OpenMW's window is not what anyone is looking at.
+            // Stood down only when Remix presents into a window of its own.
             //
-            // A fullscreen window is minimised by Windows the moment it loses focus, so clicking Remix's
-            // window to reach the developer menu made this fire and stopped the frame outright -- the scene
-            // submission with it, which froze the image in the window the user was actually watching. The
-            // game appeared to pause because it genuinely did.
+            // That case needs it gone: a fullscreen window is minimised the moment it loses focus, so
+            // clicking Remix's window to reach the developer menu made this fire and stop the frame -- the
+            // scene submission with it -- freezing the image in the window being watched.
             //
-            // The MyGUI leak the check exists for is still real, so this is not free: widget textures that
-            // change while the window is minimised will leak RenderItems. Acceptable here because OpenMW's
-            // GUI is not visible in this mode at all, and a leak is a better failure than the renderer
-            // stopping. Revisit when the GUI is composited into Remix's frame, since that will make widget
-            // updates matter again.
-            if (!mWindowManager->isWindowVisible() && !remixPresentsToScreen())
+            // With Remix's surface parented to OpenMW's window the check has to stay, and removing it was a
+            // mistake that traded a pause for a hang. There is then only one window, so its not being
+            // visible means nothing is on screen, and continuing costs more than a wasted frame: a minimised
+            // window's surface has zero extent, and presenting into that blocks. Under DLFG the present runs
+            // on its own thread, so the game thread waits on a present that can never complete and the
+            // process stops responding rather than pausing.
+            //
+            // Keeping it also keeps the MyGUI RenderItem leak it was guarding against, which is why it
+            // exists at all.
+            if (!mWindowManager->isWindowVisible() && !remixPresentsToSeparateWindow())
             {
                 mSoundManager->pausePlayback();
                 return false;
@@ -1151,6 +1171,20 @@ void OMW::Engine::createWindow()
             Log(Debug::Warning) << "Warning: Framebuffer only has " << traits->depth << " bits of depth precision.";
 
         traits->alpha = 0; // set to 0 to stop ScreenCaptureHandler reading the alpha channel
+    }
+
+    // When Remix owns the screen, OpenMW renders but does not present.
+    //
+    // Remix path traces into a child window covering this window's whole client area. OpenMW's swap is a
+    // blit across that same area, so with both running the two alternate and the raytraced image is
+    // overwritten as fast as it arrives -- the symptom is simply seeing OpenMW, with no hint that anything
+    // else was drawn. Rendering has to continue regardless: the Remix submission rides on OpenMW's cull,
+    // which is also what keeps off-screen NPCs animating.
+    if (remixPresentsToScreen())
+    {
+        graphicsWindow->setSwapEnabled(false);
+        Log(Debug::Info) << "Remix: OpenMW will render without presenting -- Remix's child surface is what "
+                            "reaches the screen, and OpenMW's swap would paint over it every frame";
     }
 
     osg::ref_ptr<osg::Camera> camera = mViewer->getCamera();

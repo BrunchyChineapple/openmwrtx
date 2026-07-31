@@ -175,6 +175,23 @@ namespace
             ShowWindow(hwnd, SW_HIDE);
             return 0;
         }
+
+        // Be invisible to the mouse, so that as a child window this surface changes what is displayed
+        // without changing where input goes.
+        //
+        // This is what removes the need to forward input at all. The child covers OpenMW's entire client
+        // area, so without these two replies every click would land here: HTTRANSPARENT sends hit-testing
+        // to the parent, and MA_NOACTIVATE stops a click moving the keyboard focus off it. SDL therefore
+        // keeps receiving exactly what it received when this window did not exist.
+        //
+        // The Remix developer menu still works, because it never relied on this window's messages. It polls
+        // GetCursorPos against the host window and reads the buttons with GetAsyncKeyState, both of which
+        // are indifferent to hit-testing -- see fork_hooks::pollDevMenuMouse.
+        if (message == WM_NCHITTEST)
+            return HTTRANSPARENT;
+        if (message == WM_MOUSEACTIVATE)
+            return MA_NOACTIVATE;
+
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
@@ -198,7 +215,22 @@ namespace
     ///        that does not require a fork-side capture of the post-overlay image. DXVK subclasses
     ///        this HWND when it creates the swapchain, so once the window is visible and focused its
     ///        input reaches ImGui without any forwarding on our side.
-    HWND createPresentWindow(uint32_t width, uint32_t height, bool visible)
+    /// @param parent when non-null, create this as a child filling the parent's client area instead of a
+    ///        separate top-level window. Only meaningful together with @p visible.
+    ///
+    ///        This is how Remix's image gets on screen without a second window to manage. The objection
+    ///        recorded above -- two presenters fighting over one surface -- is about presenting onto
+    ///        OpenMW's HWND, and it still stands; a child has an HWND and a surface of its own, so the
+    ///        Vulkan swapchain and OpenMW's GL context never share one. What is shared is the top-level
+    ///        window, which is the point: there is one thing to focus, so nothing has to be forwarded, no
+    ///        window can be tabbed away from, and the fullscreen state belongs to OpenMW as it always did.
+    ///
+    ///        It also fixes the render resolution. A captioned top-level window asking for a 3840x2160
+    ///        client area needs about 2191 pixels of height in total, which exceeds a 2160 screen, so
+    ///        Windows clamped it and the client area came out at 3840x2141 -- and a Vulkan swapchain must
+    ///        match its surface, so Remix rendered 19 rows short. A child has no non-client area at all,
+    ///        making the client area exactly what is asked for.
+    HWND createPresentWindow(uint32_t width, uint32_t height, bool visible, HWND parent)
     {
         static bool classRegistered = false;
         if (!classRegistered)
@@ -238,12 +270,19 @@ namespace
         //
         // No thick frame or maximise box: a resize would change the client area, and the runtime
         // reacts to that by resetting the swapchain underneath us.
-        const DWORD style = visible ? (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) : WS_POPUP;
+        // As a child there is no non-client area at all, which is both why the clamping problem disappears
+        // and why the request must not be inflated: doing so would push the bottom rows past the parent.
+        const bool asChild = visible && parent != nullptr;
+        const DWORD style = asChild ? (WS_CHILD | WS_VISIBLE)
+                                    : (visible ? (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX)
+                                               : WS_POPUP);
         RECT rect = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
-        AdjustWindowRectEx(&rect, style, FALSE, 0);
+        if (!asChild)
+            AdjustWindowRectEx(&rect, style, FALSE, 0);
 
         const HWND hwnd = CreateWindowExW(0, kHiddenWindowClass, L"RTX Remix (OpenMW)", style,
-            CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr,
+            asChild ? 0 : CW_USEDEFAULT, asChild ? 0 : CW_USEDEFAULT, rect.right - rect.left,
+            rect.bottom - rect.top, asChild ? parent : nullptr,
             nullptr, GetModuleHandleW(nullptr), nullptr);
         if (hwnd == nullptr)
         {
@@ -251,7 +290,23 @@ namespace
             return nullptr;
         }
 
-        if (visible)
+        if (asChild)
+        {
+            // Keep OpenMW's GL out of the child's pixels.
+            //
+            // OpenMW's context still renders and still swaps, and its swap is a blit across the whole client
+            // area which would otherwise paint straight over this window every frame -- Remix's image and
+            // OpenMW's alternating, which reads as a flicker rather than as a Z-order problem.
+            // WS_CLIPCHILDREN excludes child regions from the parent's drawing, so the swap lands only
+            // where this window is not. It is set here rather than at window creation because the window
+            // belongs to SDL.
+            if (const LONG_PTR parentStyle = GetWindowLongPtrW(parent, GWL_STYLE))
+            {
+                if ((parentStyle & WS_CLIPCHILDREN) == 0)
+                    SetWindowLongPtrW(parent, GWL_STYLE, parentStyle | WS_CLIPCHILDREN);
+            }
+        }
+        else if (visible)
         {
             // SHOWNOACTIVATE so OpenMW keeps keyboard focus at startup: its own menu is what starts a
             // game, and there is no 3D scene to look at until one is running. Click this window when
@@ -395,10 +450,15 @@ namespace RemixRT
             return false;
         }
 
-        // Size Remix's render resolution from OpenMW's window, but present into our own.
+        // OpenMW's window is needed in three places from here on: it sizes the render resolution, it is
+        // what the present surface is parented to, and it is what the developer menu measures and
+        // hit-tests against. Resolved once rather than re-fetched per use.
+        const HWND gameWindow = nativeHandle(window);
+
+        // Size Remix's render resolution from OpenMW's window, but present into our own surface.
         uint32_t width = 0;
         uint32_t height = 0;
-        if (const HWND gameWindow = nativeHandle(window))
+        if (gameWindow != nullptr)
         {
             RECT client = {};
             GetClientRect(gameWindow, &client);
@@ -436,8 +496,16 @@ namespace RemixRT
         // The present window must be visible when Remix presents to the screen, since it is then the only
         // place its image appears. OPENMW_REMIX_WINDOW keeps working on its own for the diagnostic case of
         // watching Remix's raw output beside a composited OpenMW frame.
-        const bool showPresentWindow = envFlag("OPENMW_REMIX_WINDOW") || envFlag("OPENMW_REMIX_PRESENT");
-        mImpl->mPresentWindow = createPresentWindow(width, height, showPresentWindow);
+        //
+        // Presenting to the screen parents that surface to OpenMW's window, so there is one window to
+        // focus and nothing to tab between. OPENMW_REMIX_WINDOW forces the old separate top-level window
+        // even in present mode, which is worth keeping: it is the only way to see Remix's output and
+        // OpenMW's own frame at the same time, and it is the fallback if parenting misbehaves.
+        const bool standaloneWindow = envFlag("OPENMW_REMIX_WINDOW");
+        const bool presentsToScreen = envFlag("OPENMW_REMIX_PRESENT");
+        const bool showPresentWindow = standaloneWindow || presentsToScreen;
+        const HWND presentParent = (presentsToScreen && !standaloneWindow) ? gameWindow : nullptr;
+        mImpl->mPresentWindow = createPresentWindow(width, height, showPresentWindow, presentParent);
         if (mImpl->mPresentWindow == nullptr)
         {
             unloadModule();
@@ -502,7 +570,7 @@ namespace RemixRT
         // positions its raw-input sink over it, hit-testing the cursor against that rectangle. Left
         // pointing at our present window -- which is hidden and somewhere else entirely -- keyboard
         // still works, because keystrokes carry no coordinates, but the mouse silently does nothing.
-        if (const HWND gameWindow = nativeHandle(window))
+        if (gameWindow != nullptr)
         {
             if (mImpl->mApi.dxvk_SetDevMenuWindow != nullptr)
             {
@@ -518,7 +586,9 @@ namespace RemixRT
         Log(Debug::Info) << "Remix: runtime initialised from " << runtimePath << " (API "
                          << REMIXAPI_VERSION_MAJOR << "." << REMIXAPI_VERSION_MINOR << "."
                          << REMIXAPI_VERSION_PATCH << ", " << width << "x" << height << ", presenting to "
-                         << (showPresentWindow ? "its own visible window" : "an offscreen window") << ")";
+                         << (presentParent != nullptr ? "a child surface filling OpenMW's window"
+                                 : (showPresentWindow ? "its own visible window" : "an offscreen window"))
+                         << ")";
 
         // No longer conditional on the window being visible. The runtime now draws its menu into the
         // output image that copyOutputSynced copies, so the menu arrives through OpenMW's own frame
@@ -1595,6 +1665,27 @@ namespace RemixRT
     {
         if (!mImpl->mStarted || mImpl->mApi.Present == nullptr)
             return false;
+
+        // Never present into a zero-sized surface.
+        //
+        // A minimised window has a 0x0 client area, and a Vulkan swapchain must match its surface, so
+        // presenting then does not fail cleanly -- it blocks. Under DLFG that block is on the runtime's own
+        // present thread with the caller waiting on it, so the process stops responding rather than pausing,
+        // which is what tabbing out of the child-window arrangement produced.
+        //
+        // The caller stops before reaching this, and should; this exists because that decision rests on
+        // SDL's visibility events, which arrive a frame or two after the window has actually changed. Cheap
+        // to check per frame, and it converts a hang into a skipped present.
+        if (mImpl->mPresentWindow != nullptr)
+        {
+            RECT client = {};
+            if (GetClientRect(mImpl->mPresentWindow, &client) == 0 || client.right - client.left <= 0
+                || client.bottom - client.top <= 0)
+            {
+                return false;
+            }
+        }
+
         remixapi_PresentInfo info = {};
         info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
         info.hwndOverride = nullptr;

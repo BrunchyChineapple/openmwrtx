@@ -2,6 +2,8 @@
 
 #include <SDL_video.h>
 
+#include <osg/GL> // glFlush, when the swap is skipped
+
 #ifdef OPENMW_GL4ES_MANUAL_INIT
 #include "gl4esinit.h"
 #endif
@@ -230,7 +232,22 @@ namespace SDLUtil
         if (!mRealized)
             return;
 
+        // Something else may own what the window displays -- see setSwapEnabled.
+        if (!mSwapEnabled)
+        {
+            // Still flush. The frame's GL work has been issued and skipping the swap removes the only
+            // implicit flush in the loop, so without this the driver is free to accumulate queued work
+            // for a window nobody is presenting.
+            glFlush();
+            return;
+        }
+
         SDL_GL_SwapWindow(mWindow);
+    }
+
+    void GraphicsWindowSDL2::setSwapEnabled(bool enabled)
+    {
+        mSwapEnabled = enabled;
     }
 
     void GraphicsWindowSDL2::setSyncToVBlank(bool on)

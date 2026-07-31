@@ -19,6 +19,7 @@ namespace SDLUtil
         bool mRealized;
         bool mOwnsWindow;
         VSyncMode mVSyncMode;
+        bool mSwapEnabled = true;
 
         void init();
 
@@ -35,6 +36,20 @@ namespace SDLUtil
         const char* className() const override { return "GraphicsWindowSDL2"; }
 
         bool valid() const override { return mValid; }
+
+        /// Stop presenting this window's rendering, while continuing to render it.
+        ///
+        /// For when something other than this context owns what the window shows. RTX Remix path traces the
+        /// scene into a child window covering the whole client area, and OpenMW's swap is a blit across that
+        /// same area, so the two alternate and the child is overwritten as fast as it is presented -- what
+        /// you see is OpenMW, and the raytraced image never survives a frame. WS_CLIPCHILDREN on the parent
+        /// does not help: OpenGL wants that style in place when the pixel format is set, and the driver's
+        /// presentation path does not consult it afterwards.
+        ///
+        /// Rendering deliberately continues. The scene submission to Remix rides on OpenMW's cull, and its
+        /// cull is also what keeps distant NPCs animating, so skipping the draw would cost both. Only the
+        /// present is dropped, which is the one part nothing needs.
+        void setSwapEnabled(bool enabled);
 
         /** Realise the GraphicsContext.*/
         bool realizeImplementation() override;
