@@ -54,6 +54,7 @@
 #include <components/lua_ui/util.hpp>
 #include <components/lua_ui/widget.hpp>
 
+#include <components/remixrt/runtime.hpp>
 #include <components/settings/values.hpp>
 
 #include "../mwbase/environment.hpp"
@@ -808,6 +809,8 @@ namespace MWGui
                     mViewer->eventTraversal();
                     mViewer->updateTraversal();
                     mViewer->renderingTraversals();
+                    // Nothing else presents a frame this loop drew. See presentNestedFrame.
+                    RemixRT::presentNestedFrame();
                 }
                 // at the time this function is called we are in the middle of a frame,
                 // so out of order calls are necessary to get a correct frameNumber for the next frame.
@@ -2152,6 +2155,9 @@ namespace MWGui
                 mViewer->eventTraversal();
                 mViewer->updateTraversal();
                 mViewer->renderingTraversals();
+                // Nothing else presents a frame this loop drew, which is why the intro videos showed
+                // nothing. See presentNestedFrame.
+                RemixRT::presentNestedFrame();
             }
             // at the time this function is called we are in the middle of a frame,
             // so out of order calls are necessary to get a correct frameNumber for the next frame.

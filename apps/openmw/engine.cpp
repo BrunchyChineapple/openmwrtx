@@ -1565,6 +1565,28 @@ void OMW::Engine::prepareEngine()
             // flipV flag instead, set only for a shared image, since the uploaded overlay path is fed
             // top-down CPU pixels and must not be flipped.
 
+            // Let the loops that drive the viewer themselves present too.
+            //
+            // Loading screens, the modal message-box loop and video playback each pump their own
+            // traversals rather than going through Engine::frame, so the frames they draw were never
+            // presented and never appeared -- correctly rendered into the overlay image and then discarded.
+            //
+            // Only the present, deliberately: those loops submit no scene, so Remix repeats whatever
+            // geometry it last had, and the overlay drawn on top is what is meant to be looked at.
+            RemixRT::setNestedFramePresenter([this]() {
+                if (mRemix == nullptr || !mRemix->isReady())
+                    return;
+
+                // The camera has to be re-sent, not just the present issued. A frame with no camera is one
+                // Remix does not raytrace, and the screen-overlay composite is at the end of that path,
+                // after tone mapping -- so without this the interface those loops draw is composited by
+                // nothing. Geometry is deliberately not submitted: see RemixScene::resubmitCamera.
+                if (mRemixScene != nullptr)
+                    mRemixScene->resubmitCamera();
+
+                mRemix->present();
+            });
+
             if (mRemix != nullptr && mRemix->setOverlayEnabled(true, 1.0f))
             {
                 Log(Debug::Info) << "Remix: compositing OpenMW's interface over the path-traced frame";

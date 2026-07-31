@@ -2051,3 +2051,25 @@ namespace RemixRT
 }
 
 #endif
+
+// Outside the platform split on purpose. The call sites are in OpenMW's GUI code, which is built on every
+// platform, so these have to exist everywhere; on a platform with no Remix runtime nothing installs a
+// presenter and both functions are inert.
+namespace RemixRT
+{
+    namespace
+    {
+        std::function<void()> gNestedFramePresenter;
+    }
+
+    void setNestedFramePresenter(std::function<void()> present)
+    {
+        gNestedFramePresenter = std::move(present);
+    }
+
+    void presentNestedFrame()
+    {
+        if (gNestedFramePresenter)
+            gNestedFramePresenter();
+    }
+}

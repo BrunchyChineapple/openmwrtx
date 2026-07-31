@@ -206,6 +206,22 @@ namespace MWRender
             const osg::Matrixd& localToWorld, const osg::Vec3f& cameraRight, const osg::Vec3f& cameraUp,
             unsigned int categoryFlags);
 
+        /// Re-sends the camera from the last submit, without submitting any geometry.
+        ///
+        /// For the loops that drive the viewer themselves -- loading screens, the modal message box, video
+        /// playback. They present a frame but submit no scene, and a frame with no camera is one Remix does
+        /// not raytrace: it never reaches injectRTX, and the screen-overlay composite lives at the end of
+        /// that path, after tone mapping. So the interface those loops draw was composited by nothing. It
+        /// showed as a frozen picture during cell loads and a black screen during the intro videos, which
+        /// are the same fault seen with and without a previous frame to leave on screen.
+        ///
+        /// Only the camera. Submitting geometry here would mean walking a scene graph that a cell load is
+        /// in the middle of rebuilding, to draw a world that is deliberately not being shown. An empty
+        /// scene path-traces to black, which is the right backdrop for a loading screen and for a video.
+        ///
+        /// False when no camera has been submitted yet and none could be synthesised.
+        bool resubmitCamera();
+
     private:
         /// Submits a self-lit quad a fixed distance in front of the camera.
         ///
@@ -354,6 +370,19 @@ namespace MWRender
         void evictStaleMeshes();
 
         RemixRT::Runtime& mRuntime;
+
+        /// The last camera handed to the runtime, kept so resubmitCamera can repeat it. Plain floats in the
+        /// order the API takes them, rather than the OSG matrices they came from, so that repeating a frame
+        /// cannot re-derive them differently from the frame it is repeating.
+        float mLastCameraEye[3] = { 0.f, 0.f, 0.f };
+        float mLastCameraForward[3] = { 0.f, -1.f, 0.f };
+        float mLastCameraUp[3] = { 0.f, 0.f, 1.f };
+        float mLastCameraRight[3] = { 1.f, 0.f, 0.f };
+        float mLastCameraFov = 60.f;
+        float mLastCameraAspect = 1.7777f;
+        float mLastCameraNear = 1.f;
+        float mLastCameraFar = 6666.f;
+        bool mHaveLastCamera = false;
         unsigned long long mDefaultMaterial = 0;
         unsigned long long mWaterMaterial = 0;
         unsigned long long mProbeMaterial = 0;

@@ -18,6 +18,7 @@
 #include <components/resource/resourcesystem.hpp>
 #include <components/settings/values.hpp>
 #include <components/vfs/manager.hpp>
+#include <components/remixrt/runtime.hpp>
 #include <components/vfs/recursivedirectoryiterator.hpp>
 
 #include "../mwbase/environment.hpp"
@@ -351,6 +352,9 @@ namespace MWGui
         mViewer->eventTraversal();
         mViewer->updateTraversal();
         mViewer->renderingTraversals();
+        // This loop drives the viewer itself, so nothing else will present the frame it just drew. Without
+        // this the loading screen renders correctly into Remix's overlay image and is never shown.
+        RemixRT::presentNestedFrame();
         mViewer->advance(mViewer->getFrameStamp()->getSimulationTime());
 
         mLastRenderTime = mTimer.time_m();

@@ -1969,6 +1969,17 @@ namespace MWRender
 
         mRuntime.setupCameraParameterized(eyeF, forwardF, upF, rightF, fov, aspect, nearClip, farClip);
 
+        // Kept so the loops that present without submitting can repeat this camera. See resubmitCamera.
+        std::copy(std::begin(eyeF), std::end(eyeF), std::begin(mLastCameraEye));
+        std::copy(std::begin(forwardF), std::end(forwardF), std::begin(mLastCameraForward));
+        std::copy(std::begin(upF), std::end(upF), std::begin(mLastCameraUp));
+        std::copy(std::begin(rightF), std::end(rightF), std::begin(mLastCameraRight));
+        mLastCameraFov = fov;
+        mLastCameraAspect = aspect;
+        mLastCameraNear = nearClip;
+        mLastCameraFar = farClip;
+        mHaveLastCamera = true;
+
         // Off by default now that it has served its purpose. It answered the question it existed for --
         // whether the mesh, material, instance and camera path worked, separately from the world
         // transforms -- and the answer was yes, which localised the fault to the material's alpha test.
@@ -3071,5 +3082,35 @@ namespace MWRender
             else
                 ++it;
         }
+    }
+}
+
+namespace MWRender
+{
+    bool RemixScene::resubmitCamera()
+    {
+        // The defaults the members carry are used when nothing has been submitted yet, which is the intro
+        // video: it plays before a world exists, so there has never been a camera. Any valid camera will do
+        // there -- an empty scene path-traces to black whichever way it points, and black is what belongs
+        // behind a full-screen video. The point is only to give Remix a frame it will raytrace, so that the
+        // composite at the end of that path runs and the video reaches the screen.
+        const bool ok = mRuntime.setupCameraParameterized(mLastCameraEye, mLastCameraForward, mLastCameraUp,
+            mLastCameraRight, mLastCameraFov, mLastCameraAspect, mLastCameraNear, mLastCameraFar);
+
+        if (!ok && mHaveLastCamera)
+        {
+            // Worth one line: a camera the runtime accepted during the last submit and rejects now means
+            // something changed about the runtime's state, not about the camera.
+            static bool reported = false;
+            if (!reported)
+            {
+                reported = true;
+                Log(Debug::Warning) << "Remix: the runtime rejected a repeat of the last camera, so frames "
+                                       "presented outside the main loop will not be raytraced and the "
+                                       "interface drawn in them will not appear";
+            }
+        }
+
+        return ok;
     }
 }

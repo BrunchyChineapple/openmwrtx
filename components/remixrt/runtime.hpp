@@ -1,6 +1,7 @@
 #ifndef OPENMW_COMPONENTS_REMIXRT_RUNTIME_H
 #define OPENMW_COMPONENTS_REMIXRT_RUNTIME_H
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -536,6 +537,29 @@ namespace RemixRT
         struct Impl;
         std::unique_ptr<Impl> mImpl;
     };
+
+    /// Presents Remix's frame from a loop that drives the viewer itself.
+    ///
+    /// OpenMW has four places that pump their own traversals instead of going through Engine::frame:
+    /// loading screens, the modal message-box loop, video playback, and the screenshot manager. The first
+    /// three put something on screen and so need a present; the fourth renders to its own target and must
+    /// not have one.
+    ///
+    /// Without this they display nothing at all. The interface is drawn into Remix's overlay image
+    /// correctly -- renderingTraversals runs the GUI camera -- but the frame is never presented, so the
+    /// screen keeps whatever was last shown. It reads as the loading screen and the intro videos being
+    /// missing, when in fact they were rendered and never shown.
+    ///
+    /// A free function with a settable implementation, rather than a method on something those call sites
+    /// already hold, because none of them can reach the Runtime: two live in MyGUI's window manager and one
+    /// in the loading screen, and widening MWBase::WindowManager for a Remix-specific concern would put it
+    /// in a worse place than this. Does nothing until the engine installs a presenter, which it only does
+    /// when Remix is what reaches the screen.
+    void setNestedFramePresenter(std::function<void()> present);
+
+    /// Runs whatever setNestedFramePresenter installed. Safe to call when nothing is installed, and safe
+    /// to call when Remix is not in use at all -- both are no-ops.
+    void presentNestedFrame();
 }
 
 #endif
