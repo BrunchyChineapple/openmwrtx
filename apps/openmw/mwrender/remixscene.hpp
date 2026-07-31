@@ -486,7 +486,11 @@ namespace MWRender
         /// because Morrowind has thousands of textures and the interesting ones are all in the first few
         /// dozen the player walks into.
         unsigned int mMaterialsLogged = 0;
-        static constexpr unsigned int kMaterialLogLimit = 48;
+        // Raised from 48 to answer a specific question: how often is one texture used with more than one
+        // surface state? That decides whether a material can be identified by its albedo texture hash, the
+        // way Remix identifies a D3D9 material, without losing a distinction OpenMW currently makes. At 48
+        // the answer was "never in 45 samples", which is not an answer.
+        static constexpr unsigned int kMaterialLogLimit = 4096;
 
         /// Capped like the material log, but higher: the point of it is to be able to look up an arbitrary
         /// hash seen in Remix's texture list, so covering only the first few textures of a session would

@@ -2539,6 +2539,27 @@ namespace MWRender
                              << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
         }
 
+        // `key | 1` is this material's identity, and deliberately not the albedo texture hash.
+        //
+        // Worth recording, because the opposite looks obviously right and was tried. Remix's D3D9 path
+        // identifies a material by its albedo texture hash alone -- LegacyMaterialData::updateCachedHash is
+        // literally `colorTextures[0].getImageHash()` -- so a capture from MGE-XE names every material after
+        // its texture, and a pack is authored against those names. This host's key instead mixes the texture
+        // hash with alpha test, blend, normal map, roughness, metallic and emissive, so a capture taken here
+        // shares no material name with such a pack: 0 of 254 against the NVIDIA demo pack's 1282 keys, where
+        // MGE-XE scores 131 of 244.
+        //
+        // None of which stops replacements binding, because binding does not go through this name.
+        // fork_hooks::externalDrawMaterialReplacement tries the material hash first and then falls back to
+        // the albedo texture hash, which is exactly the capture-authored key -- see the comment there, which
+        // names this integration as the reason the fallback exists. Measured over two otherwise identical
+        // sessions at 600k material lookups: 397,971 replacements bound with the identity below swapped for
+        // the texture hash, and 396,753 with it as it is. A 0.3% difference, i.e. none.
+        //
+        // So switching would buy nothing and cost something: 12 of 762 textures in a session are used with
+        // two different surface states -- foliage and fabric, blended in one place and alpha-cutout at a
+        // specific threshold in another -- and keying on the texture alone collapses each pair onto whichever
+        // was created first.
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
             metallic, alphaTestReference, normalHash, emissive, blendType);
         if (handle == 0)
