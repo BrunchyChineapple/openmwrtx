@@ -21,6 +21,7 @@
 #include <components/vfs/registerarchives.hpp>
 
 #include <components/sdlutil/imagetosurface.hpp>
+#include <components/myguiplatform/myguirendermanager.hpp>
 #include <components/sdlutil/sdlgraphicswindow.hpp>
 
 #include <components/resource/resourcesystem.hpp>
@@ -1370,6 +1371,35 @@ void OMW::Engine::prepareEngine()
                 compositeCamera->addChild(new RemixRT::CompositeDrawable(mRemixComposite));
                 rootNode->addChild(compositeCamera);
 
+                // An image for OpenMW's interface, when Remix is what reaches the screen.
+                //
+                // Only then, because otherwise OpenMW's own frame is on screen and its interface is
+                // already in it; drawing it into a shared image as well would cost an allocation and a
+                // clear per frame to produce something nothing looks at.
+                //
+                // Sized to Remix's render resolution rather than the window's, since that is the image it
+                // composites over. The two are the same now the surface is a child window, but they were
+                // not when it was a captioned top-level window clamped to 3840x2141, and tying it to the
+                // wrong one would put the interface at the wrong scale.
+                if (remixPresentsToScreen())
+                {
+                    const RemixRT::Runtime::ExternalImage& output = mRemix->outputImage();
+                    if (mRemix->createOverlayImage(output.mWidth, output.mHeight))
+                    {
+                        // No semaphores. Passing an empty ExternalSync is deliberate rather than an
+                        // oversight: the handshake does not work on this driver in either direction, and
+                        // for an interface the cost of going without is a single frame of a half-drawn
+                        // menu, which is nothing like the torn world frame the output path risks.
+                        mRemixOverlayImport = new RemixRT::ImportOperation(mRemix->overlayImage(),
+                            RemixRT::Runtime::ExternalSync{},
+                            RemixRT::ImportOperation::Usage::OpenGLWrites);
+                        gc->add(mRemixOverlayImport);
+
+                        mRemixOverlayTarget = new RemixRT::GuiOverlayTarget(
+                            mRemixOverlayImport.get(), output.mWidth, output.mHeight);
+                    }
+                }
+
                 // Feeds OpenMW's scene graph to Remix. Without it the runtime has a camera and nothing
                 // else, never enters its raytracing path, and produces no output at all.
                 mRemixScene = std::make_unique<MWRender::RemixScene>(*mRemix);
@@ -1497,6 +1527,61 @@ void OMW::Engine::prepareEngine()
         mWorkQueue.get(), mCfgMgr.getLogPath(), mScriptConsoleMode, mTranslationDataStorage, mEncoding, mExportFonts,
         Version::getOpenmwVersionDescription(), mCfgMgr);
     mEnvironment.setWindowManager(*mWindowManager);
+
+    // Redirect the interface into Remix's overlay image, now that MyGUI's camera exists.
+    //
+    // Split from the allocation above because that happens right after the window is created, long before
+    // there is a WindowManager to ask. The camera is the one MyGUI draws everything under, so this catches
+    // menus, the HUD, inventory, dialogue and the console in one place.
+    //
+    // Bracketing the camera's drawing rather than giving OSG a render target: the target is a texture
+    // aliasing memory Vulkan allocated, and OSG would have to be told it owns a GL object it did not
+    // create. See GuiOverlayTarget.
+    if (mRemixOverlayTarget != nullptr)
+    {
+        // Through MyGUI's own singleton rather than by widening WindowManager's interface. The render
+        // manager is created by the WindowManager constructor that just ran, so it exists by now, and
+        // reaching it this way keeps a Remix-specific concern out of a class that has nothing to do with
+        // Remix.
+        MyGUIPlatform::RenderManager* guiRenderManager = MyGUIPlatform::RenderManager::getInstancePtr();
+        osg::Camera* guiCamera = guiRenderManager != nullptr ? guiRenderManager->getGuiCamera() : nullptr;
+        if (guiCamera != nullptr)
+        {
+            guiCamera->setPreDrawCallback(new RemixRT::GuiOverlayBegin(mRemixOverlayTarget.get()));
+            guiCamera->setPostDrawCallback(new RemixRT::GuiOverlayEnd(mRemixOverlayTarget.get()));
+
+            // The camera clears nothing by default, because it was drawing over OpenMW's frame. Into its
+            // own image it has to clear, or every frame accumulates on the last and closed windows linger
+            // as ghosts. Done inside GuiOverlayTarget::begin rather than through setClearMask so the clear
+            // colour is transparent black regardless of what OSG would have used.
+            guiCamera->setClearMask(GL_NONE);
+
+            // The vertical flip this needs is applied by Remix when it samples, not here.
+            //
+            // An OpenGL framebuffer's origin is bottom-left and Vulkan samples from top-left, so the
+            // interface arrives mirrored. Flipping the camera's projection was the obvious fix and does
+            // nothing: MyGUI's drawable emits vertices already in clip space and draws them through raw GL,
+            // so the camera's projection matrix never reaches them. Remix's compositing shader takes a
+            // flipV flag instead, set only for a shared image, since the uploaded overlay path is fed
+            // top-down CPU pixels and must not be flipped.
+
+            if (mRemix != nullptr && mRemix->setOverlayEnabled(true, 1.0f))
+            {
+                Log(Debug::Info) << "Remix: compositing OpenMW's interface over the path-traced frame";
+            }
+            else
+            {
+                Log(Debug::Error) << "Remix: could not enable interface compositing; the interface will "
+                                     "be drawn into the shared image but never shown";
+            }
+        }
+        else
+        {
+            Log(Debug::Error) << "Remix: MyGUI has no camera to redirect, so the interface cannot be "
+                                 "composited";
+            mRemixOverlayTarget = nullptr;
+        }
+    }
 
     mInputManager = std::make_unique<MWInput::InputManager>(mWindow, mViewer, mScreenCaptureHandler, keybinderUser,
         keybinderUserExists, userGameControllerdb, gameControllerdb, mGrab);

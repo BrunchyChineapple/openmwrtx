@@ -64,6 +64,14 @@ namespace MyGUIPlatform
         void initialise();
         void shutdown();
 
+        /// The camera the whole interface is drawn under. Valid after initialise().
+        ///
+        /// Exposed so a host can redirect the interface somewhere other than the window it would otherwise
+        /// land in -- RTX Remix draws it into a shared image and composites it over its path-traced frame.
+        /// A plain accessor rather than a render-target setter, because that keeps every decision about
+        /// what the target is and how it is bound outside this generic layer.
+        osg::Camera* getGuiCamera() { return mGuiRoot.get(); }
+
         void enableShaders(Shader::ShaderManager& shaderManager);
 
         static RenderManager& getInstance() { return *getInstancePtr(); }

@@ -104,6 +104,32 @@ namespace RemixRT
         /// Valid only after a successful createOutputSync().
         const ExternalSync& outputSync() const;
 
+        /// Asks Remix for an image to draw OpenMW's GUI into, which it then composites over the
+        /// path-traced frame.
+        ///
+        /// The opposite direction to createOutputTarget: there Remix produces and OpenGL consumes, here
+        /// OpenGL produces and Remix consumes. Same mechanism either way -- exportable Vulkan memory, one
+        /// allocation, two APIs addressing it.
+        ///
+        /// Remix allocates rather than OpenMW because the alternative is DrawScreenOverlay, which takes
+        /// CPU pixels: 33MB a frame at 4K, the same round trip that had to come out of the render loop to
+        /// make this playable.
+        ///
+        /// Unsynchronised, like the output path, and for the same measured reason -- glWaitSemaphoreEXT
+        /// fails on this driver under every condition tried. The consequence here is far milder: the worst
+        /// case is Remix compositing a GUI frame while it is being drawn, and interface elements move
+        /// rarely and slightly.
+        bool createOverlayImage(unsigned int width, unsigned int height);
+
+        /// Valid only after a successful createOverlayImage().
+        const ExternalImage& overlayImage() const;
+
+        /// Starts or stops Remix compositing the overlay image, and sets its opacity.
+        ///
+        /// Separate from allocation so compositing can stop without losing the image -- during a loading
+        /// screen, where the GUI is not being drawn and the last frame would otherwise stay on screen.
+        bool setOverlayEnabled(bool enabled, float opacity = 1.0f);
+
         /// Hands Remix the camera for this frame.
         ///
         /// Both matrices are 16 floats in OSG's layout, which is row-major with the row-vector

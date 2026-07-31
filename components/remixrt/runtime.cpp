@@ -337,6 +337,11 @@ namespace RemixRT
         ExternalImage mOutputImage;
         bool mHaveOutput = false;
 
+        /// The image OpenMW draws its GUI into for Remix to composite. No surface member beside it,
+        /// unlike the output above: Remix allocates this one itself, so there is nothing on this side to
+        /// own or release.
+        ExternalImage mOverlayImage;
+
         /// Split cost of the last readback. Plain members rather than atomics: written and read on the
         /// same thread, since readOutputPixels is only ever called from the frame loop.
         unsigned long long mReadbackQueueNanoseconds = 0;
@@ -742,6 +747,56 @@ namespace RemixRT
     const Runtime::ExternalImage& Runtime::outputImage() const
     {
         return mImpl->mOutputImage;
+    }
+
+    bool Runtime::createOverlayImage(unsigned int width, unsigned int height)
+    {
+        if (!mImpl->mStarted)
+            return false;
+
+        if (mImpl->mApi.dxvk_CreateScreenOverlayImage == nullptr)
+        {
+            Log(Debug::Error) << "Remix: this runtime predates dxvk_CreateScreenOverlayImage. Rebuild the "
+                                 "runtime from the matching branch, or OpenMW's interface cannot be drawn "
+                                 "into Remix's frame.";
+            return false;
+        }
+
+        remixapi_dxvk_ExternalMemoryInfo info = {};
+        const remixapi_ErrorCode status = mImpl->mApi.dxvk_CreateScreenOverlayImage(width, height, &info);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+        {
+            Log(Debug::Error) << "Remix: dxvk_CreateScreenOverlayImage failed: " << describe(status);
+            return false;
+        }
+
+        mImpl->mOverlayImage.mHandle = info.handle;
+        mImpl->mOverlayImage.mMemorySize = info.memorySize;
+        mImpl->mOverlayImage.mMemoryOffset = info.memoryOffset;
+        mImpl->mOverlayImage.mHandleType = info.handleType;
+        mImpl->mOverlayImage.mFormat = info.format;
+        mImpl->mOverlayImage.mWidth = info.width;
+        mImpl->mOverlayImage.mHeight = info.height;
+        mImpl->mOverlayImage.mOptimalTiling = info.optimalTiling != 0;
+
+        Log(Debug::Info) << "Remix: overlay image " << info.width << "x" << info.height << ", "
+                         << (info.memorySize >> 10) << " KiB, format " << info.format << ", "
+                         << (info.optimalTiling ? "optimal" : "linear") << " tiling";
+        return true;
+    }
+
+    const Runtime::ExternalImage& Runtime::overlayImage() const
+    {
+        return mImpl->mOverlayImage;
+    }
+
+    bool Runtime::setOverlayEnabled(bool enabled, float opacity)
+    {
+        if (!mImpl->mStarted || mImpl->mApi.dxvk_SetScreenOverlayEnabled == nullptr)
+            return false;
+
+        return mImpl->mApi.dxvk_SetScreenOverlayEnabled(enabled ? 1 : 0, opacity)
+            == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
     bool Runtime::setupCamera(const float* view, const float* projection)
@@ -1829,6 +1884,7 @@ namespace RemixRT
     {
         std::string mLoadedFrom;
         ExternalImage mOutputImage;
+        ExternalImage mOverlayImage;
         ExternalSync mOutputSync;
     };
 
@@ -1925,6 +1981,21 @@ namespace RemixRT
     }
 
     bool Runtime::copyOutput()
+    {
+        return false;
+    }
+
+    bool Runtime::createOverlayImage(unsigned int, unsigned int)
+    {
+        return false;
+    }
+
+    const Runtime::ExternalImage& Runtime::overlayImage() const
+    {
+        return mImpl->mOverlayImage;
+    }
+
+    bool Runtime::setOverlayEnabled(bool, float)
     {
         return false;
     }

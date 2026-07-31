@@ -123,6 +123,7 @@ namespace RemixRT
     class Runtime;
     class ImportOperation;
     class CompositeCallback;
+    class GuiOverlayTarget;
 }
 
 namespace MWRender
@@ -147,6 +148,13 @@ namespace OMW
         osg::ref_ptr<RemixRT::ImportOperation> mRemixImport;
         // Draws the imported image over OpenMW's frame. Held so compositing can be toggled.
         osg::ref_ptr<RemixRT::CompositeCallback> mRemixComposite;
+        // Imports the image OpenMW draws its interface into, for Remix to composite. Separate from
+        // mRemixImport because it runs the other way round: that one imports what Remix produced, this one
+        // imports what OpenMW is about to produce.
+        osg::ref_ptr<RemixRT::ImportOperation> mRemixOverlayImport;
+        // Binds that image around the interface camera's drawing. Held so the engine can see whether the
+        // framebuffer ever came up and stop asking Remix to composite an image nothing is drawing into.
+        osg::ref_ptr<RemixRT::GuiOverlayTarget> mRemixOverlayTarget;
         // Walks OpenMW's scene graph and hands the geometry to Remix. Declared after mRemix so it is
         // destroyed first: its destructor releases meshes through the runtime.
         std::unique_ptr<MWRender::RemixScene> mRemixScene;

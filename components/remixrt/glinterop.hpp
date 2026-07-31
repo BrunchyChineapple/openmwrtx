@@ -36,7 +36,22 @@ namespace RemixRT
     class ImportOperation : public osg::GraphicsOperation
     {
     public:
-        ImportOperation(const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync);
+        /// Which side of the shared allocation writes, which decides whether the readback guard applies.
+        enum class Usage
+        {
+            /// Remix writes, OpenGL samples. Remix's rendering output.
+            RemixWrites,
+            /// OpenGL writes, Remix samples. OpenMW's interface overlay.
+            ///
+            /// Exempt from the readback guard below. That guard exists because a GL texture aliasing memory
+            /// Remix writes every frame, unsynchronised, faulted the GPU -- and every part of that reasoning
+            /// is about Remix being the writer. Here Remix only reads, and it reads during its own frame,
+            /// so the worst case is compositing a half-drawn interface for one frame.
+            OpenGLWrites,
+        };
+
+        ImportOperation(const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync,
+            Usage usage = Usage::RemixWrites);
 
         void operator()(osg::GraphicsContext* context) override;
 
@@ -77,6 +92,7 @@ namespace RemixRT
     private:
         Runtime::ExternalImage mImage;
         Runtime::ExternalSync mSync;
+        Usage mUsage;
         unsigned int mMemoryObject = 0;
         unsigned int mTextureName = 0;
         unsigned int mWaitSemaphore = 0;
@@ -225,6 +241,86 @@ namespace RemixRT
         /// Diagnostic: drop the texture barrier from the semaphore operations, to tell a rejected
         /// semaphore apart from a rejected texture barrier. Read once at construction.
         bool mSkipTextureBarrier = false;
+    };
+
+    /// Points OpenMW's GUI camera at an image Remix composites over its path-traced frame.
+    ///
+    /// The reverse of the composite above. There, Remix produced and OpenGL consumed; here OpenGL produces
+    /// and Remix consumes. One exportable allocation either way.
+    ///
+    /// Implemented by binding a framebuffer object around the camera's drawing rather than by handing the
+    /// texture to OSG. Attaching it through osg::Camera::attach would need OSG to accept a GL texture it
+    /// did not create, which is the same obstacle recorded on ImportOperation, and the way round it -- a
+    /// hand-built osg::Texture::TextureObject -- means asserting ownership of a name OSG may then delete.
+    /// A framebuffer built with raw GL sidesteps the question: OSG never learns the texture exists.
+    ///
+    /// The GUI is drawn with straight alpha over a transparent-black clear, so the alpha channel carries
+    /// coverage and Remix's compositing pass blends on it. That is also why this cannot simply reuse
+    /// OpenMW's own framebuffer: engine.cpp sets traits->alpha = 0, so the window has no alpha channel to
+    /// carry coverage in.
+    ///
+    /// Unsynchronised, as everything crossing this boundary is on this driver. Remix may composite while a
+    /// frame is being drawn into the image. Unlike a torn world frame this is very hard to notice: interface
+    /// elements are static most frames, and a torn one costs a single frame of a half-updated menu.
+    class GuiOverlayTarget : public osg::Referenced
+    {
+    public:
+        GuiOverlayTarget(ImportOperation* import, unsigned int width, unsigned int height);
+
+        /// Binds the framebuffer and clears it. Call before the GUI camera draws.
+        ///
+        /// Creates the framebuffer on first use, because it has to happen on the thread holding the GL
+        /// context and this is the first point that is guaranteed to be on it.
+        void begin(osg::RenderInfo& renderInfo) const;
+
+        /// Restores the previous framebuffer binding and viewport. Call after the GUI camera draws.
+        void end(osg::RenderInfo& renderInfo) const;
+
+        /// True once framebuffer creation has failed, so the caller can stop asking Remix to composite
+        /// an image nothing is drawing into.
+        bool failed() const { return mFailed; }
+
+    private:
+        ImportOperation* mImport;
+        unsigned int mWidth;
+        unsigned int mHeight;
+        mutable unsigned int mFramebuffer = 0;
+        mutable bool mFailed = false;
+        mutable bool mLoggedReady = false;
+        /// Saved across begin/end so the GUI camera's drawing does not leak its target into whatever OSG
+        /// draws next. Only valid between the two calls.
+        mutable int mSavedFramebuffer = 0;
+        mutable int mSavedViewport[4] = { 0, 0, 0, 0 };
+    };
+
+    /// Adapters that drive GuiOverlayTarget from a camera's pre- and post-draw callbacks.
+    ///
+    /// Two classes rather than one with a flag, because OSG identifies a callback by which slot it was
+    /// installed in and a single object in both slots could not tell which call it was serving.
+    class GuiOverlayBegin : public osg::Camera::DrawCallback
+    {
+    public:
+        explicit GuiOverlayBegin(GuiOverlayTarget* target)
+            : mTarget(target)
+        {
+        }
+        void operator()(osg::RenderInfo& renderInfo) const override { mTarget->begin(renderInfo); }
+
+    private:
+        osg::ref_ptr<GuiOverlayTarget> mTarget;
+    };
+
+    class GuiOverlayEnd : public osg::Camera::DrawCallback
+    {
+    public:
+        explicit GuiOverlayEnd(GuiOverlayTarget* target)
+            : mTarget(target)
+        {
+        }
+        void operator()(osg::RenderInfo& renderInfo) const override { mTarget->end(renderInfo); }
+
+    private:
+        osg::ref_ptr<GuiOverlayTarget> mTarget;
     };
 
     /// Scene-graph node that draws a CompositeCallback where it is placed in the render order.

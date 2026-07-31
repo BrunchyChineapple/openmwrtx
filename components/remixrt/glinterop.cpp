@@ -306,10 +306,11 @@ constexpr GLenum kHalfFloat = 0x140B;
 namespace RemixRT
 {
     ImportOperation::ImportOperation(
-        const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync)
+        const Runtime::ExternalImage& image, const Runtime::ExternalSync& sync, Usage usage)
         : osg::GraphicsOperation("RemixImportOperation", false)
         , mImage(image)
         , mSync(sync)
+        , mUsage(usage)
     {
     }
 
@@ -328,7 +329,13 @@ namespace RemixRT
         // whole process down rather than anything catchable.
         //
         // Nothing samples it in this mode anyway: the composite uploads its own texture from the CPU copy.
-        if (readbackForced())
+        //
+        // Only for memory Remix writes. An import OpenGL writes into and Remix samples is not exposed to any
+        // of the above -- Remix reads it during its own frame and never writes it, so there is no
+        // unsynchronised write to alias. Skipping those too meant OpenMW's interface was never imported and
+        // so never drawn, silently, purely because the readback default was on for a path that no longer
+        // reads anything back.
+        if (mUsage == Usage::RemixWrites && readbackForced())
         {
             Log(Debug::Info) << "Remix GL interop: import skipped, readback path is forced. Importing would "
                                 "alias memory Remix writes with no synchronisation available to guard it.";
@@ -1327,5 +1334,122 @@ namespace RemixRT
     {
         if (mComposite != nullptr)
             (*mComposite)(renderInfo);
+    }
+}
+
+namespace
+{
+    // Framebuffer object tokens. Core since OpenGL 3.0, but <GL/gl.h> on Windows stops at 1.1, so they
+    // are spelled out here for the same reason kBgra and kRgba16f are further up this file.
+    constexpr GLenum kFramebuffer = 0x8D40;
+    constexpr GLenum kFramebufferBinding = 0x8CA6;
+    constexpr GLenum kColorAttachment0 = 0x8CE0;
+    constexpr GLenum kFramebufferComplete = 0x8CD5;
+}
+
+namespace RemixRT
+{
+    GuiOverlayTarget::GuiOverlayTarget(ImportOperation* import, unsigned int width, unsigned int height)
+        : mImport(import)
+        , mWidth(width)
+        , mHeight(height)
+    {
+    }
+
+    void GuiOverlayTarget::begin(osg::RenderInfo& renderInfo) const
+    {
+        if (mFailed)
+            return;
+
+        osg::State* state = renderInfo.getState();
+        if (state == nullptr)
+            return;
+
+        osg::GLExtensions* ext = state->get<osg::GLExtensions>();
+        if (ext == nullptr || ext->glGenFramebuffers == nullptr || ext->glBindFramebuffer == nullptr
+            || ext->glFramebufferTexture2D == nullptr || ext->glCheckFramebufferStatus == nullptr)
+        {
+            Log(Debug::Error) << "Remix: the driver does not expose framebuffer objects, so OpenMW's "
+                                 "interface cannot be drawn into Remix's overlay image";
+            mFailed = true;
+            return;
+        }
+
+        const unsigned int texture = mImport != nullptr ? mImport->textureName() : 0u;
+        if (texture == 0)
+        {
+            // The import runs as a graphics operation and may not have executed yet. Not a failure --
+            // returning without binding leaves the GUI drawing where it would have anyway, and the next
+            // frame tries again.
+            return;
+        }
+
+        if (mFramebuffer == 0)
+        {
+            ext->glGenFramebuffers(1, &mFramebuffer);
+            if (mFramebuffer == 0)
+            {
+                Log(Debug::Error) << "Remix: could not create a framebuffer for the interface overlay";
+                mFailed = true;
+                return;
+            }
+
+            ext->glBindFramebuffer(kFramebuffer, mFramebuffer);
+            ext->glFramebufferTexture2D(kFramebuffer, kColorAttachment0, GL_TEXTURE_2D, texture, 0);
+
+            // Checked rather than assumed, because the attachment is a texture aliasing memory another API
+            // allocated. If the driver will not render to it, that shows up here as an incomplete
+            // framebuffer -- and finding out now is much better than a frame of undefined drawing.
+            const GLenum status = ext->glCheckFramebufferStatus(kFramebuffer);
+            if (status != kFramebufferComplete)
+            {
+                Log(Debug::Error) << "Remix: the interface overlay framebuffer is incomplete (status 0x"
+                                  << std::hex << status << std::dec
+                                  << "); the imported image cannot be rendered into";
+                ext->glBindFramebuffer(kFramebuffer, 0);
+                ext->glDeleteFramebuffers(1, &mFramebuffer);
+                mFramebuffer = 0;
+                mFailed = true;
+                return;
+            }
+            ext->glBindFramebuffer(kFramebuffer, 0);
+        }
+
+        glGetIntegerv(kFramebufferBinding, &mSavedFramebuffer);
+        glGetIntegerv(GL_VIEWPORT, mSavedViewport);
+
+        ext->glBindFramebuffer(kFramebuffer, mFramebuffer);
+        glViewport(0, 0, static_cast<GLsizei>(mWidth), static_cast<GLsizei>(mHeight));
+
+        // Transparent black, every frame. The whole image is replaced rather than accumulated: the GUI is
+        // redrawn from scratch each frame, and anything left behind would persist as a ghost of a window
+        // that has since closed. Alpha zero is what makes Remix's blend leave the path-traced image alone
+        // wherever nothing was drawn.
+        glClearColor(0.f, 0.f, 0.f, 0.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        if (!mLoggedReady)
+        {
+            mLoggedReady = true;
+            Log(Debug::Info) << "Remix: OpenMW's interface is being drawn into Remix's overlay image ("
+                             << mWidth << "x" << mHeight << ", GL texture " << texture << ")";
+        }
+    }
+
+    void GuiOverlayTarget::end(osg::RenderInfo& renderInfo) const
+    {
+        if (mFailed || mFramebuffer == 0)
+            return;
+
+        osg::State* state = renderInfo.getState();
+        if (state == nullptr)
+            return;
+
+        osg::GLExtensions* ext = state->get<osg::GLExtensions>();
+        if (ext == nullptr || ext->glBindFramebuffer == nullptr)
+            return;
+
+        ext->glBindFramebuffer(kFramebuffer, static_cast<GLuint>(mSavedFramebuffer));
+        glViewport(mSavedViewport[0], mSavedViewport[1], mSavedViewport[2], mSavedViewport[3]);
     }
 }
