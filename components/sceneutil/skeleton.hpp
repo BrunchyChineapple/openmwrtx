@@ -43,6 +43,19 @@ namespace SceneUtil
         /// Request an update of bone matrices. May be a no-op if already updated in this frame.
         void updateBoneMatrices(unsigned int traversalNumber);
 
+        /// Recompute bone matrices for a consumer that is neither a cull nor an update traversal, at most
+        /// once per supplied frame.
+        ///
+        /// Needed because updateBoneMatrices is keyed on the traversal number and the active flag, both of
+        /// which belong to OpenMW's own render. A traversal that only reads the pose -- submitting it to an
+        /// external renderer, say -- has no traversal number of its own and would otherwise see whatever
+        /// was last computed for a different view, which looks like the animation freezing whenever that
+        /// view stops refreshing it.
+        ///
+        /// Kept separate from updateBoneMatrices rather than folded into it so it cannot disturb
+        /// mLastFrameNumber, which the cull and update paths rely on to decide whether work is needed.
+        void refreshBoneMatrices(unsigned int frame);
+
         enum ActiveType
         {
             Inactive = 0,
@@ -55,6 +68,8 @@ namespace SceneUtil
         void setActive(ActiveType active);
 
         bool getActive() const;
+
+
 
         void traverse(osg::NodeVisitor& nv) override;
 
@@ -78,6 +93,11 @@ namespace SceneUtil
 
         unsigned int mLastFrameNumber;
         unsigned int mLastCullFrameNumber;
+
+        /// Frame of the last refreshBoneMatrices call. Deliberately a separate counter from
+        /// mLastFrameNumber so a read-only consumer cannot convince the cull or update path that its work
+        /// is already done. Starts at a value no frame counter will produce so the first call always runs.
+        unsigned int mRefreshedFrame = ~0u;
     };
 
 }

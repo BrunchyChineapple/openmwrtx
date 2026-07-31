@@ -141,6 +141,22 @@ namespace RemixRT
         /// failed, so a broken handshake degrades to a correct-but-slower picture instead of a black
         /// one. The engine polls this to decide whether to pay for the read.
         bool readbackMode() const { return mForceReadback || mSyncFailed.load(std::memory_order_relaxed); }
+        /// True when the handshake is switched off outright rather than having failed. Deliberately not
+        /// folded into readbackMode(): the point is to reach the state where neither the readback nor the
+        /// semaphores are in play, which is exactly what those two flags being wired together prevented.
+        bool syncDisabled() const { return mSyncDisabled; }
+
+        /// True when the handshake runs one way: we signal that sampling is finished, and never wait for
+        /// the copy.
+        ///
+        /// On by default because it is the only form of it this driver accepts. glSignalSemaphoreEXT on an
+        /// imported semaphore succeeds; glWaitSemaphoreEXT on one returns GL_INVALID_OPERATION with a
+        /// texture barrier and without, on the importing thread and context, with the signal submitted a
+        /// full frame earlier, and with exactly one signal outstanding. Every one of those was measured.
+        ///
+        /// The engine must pair this with the wait-only copy so Remix stops signalling copyComplete: that
+        /// semaphore is binary, and one left signalled with no consumer makes the next signal invalid.
+        bool syncOneWay() const { return mSyncOneWay; }
 
         /// Hands over one frame of CPU-read pixels, tightly packed B8G8R8A8.
         ///
@@ -175,6 +191,12 @@ namespace RemixRT
         mutable bool mFailed = false;
         bool mEnabled = true;
         bool mForceReadback = false;
+        bool mSyncDisabled = false;
+
+        /// Signal but never wait. See syncOneWay().
+        bool mSyncOneWay = true;
+        /// Mutable for the same reason the other once-only log flags are: the compositing path is const.
+        mutable bool mLoggedOneWay = false;
         /// Vertical flip only: Remix's output has row 0 at the top, OpenGL samples v = 0 at the bottom.
         /// Confirmed on screen, not just derived. Overridable with OPENMW_REMIX_FLIP=none|v|h|both so a
         /// future source with a different convention does not need a rebuild to diagnose.
@@ -190,6 +212,9 @@ namespace RemixRT
         std::atomic<bool> mSyncArmed{ false };
         mutable std::atomic<bool> mSignalled{ false };
         mutable std::atomic<bool> mSyncFailed{ false };
+        /// Consecutive failed semaphore waits, counted so a startup race can be told from a permanent
+        /// ordering fault. Mutable for the same reason mSyncFailed is: the compositing path is const.
+        mutable unsigned int mSyncWaitFailures = 0;
         /// One-shot guard for the synchronisation state report.
         mutable bool mLoggedSyncState = false;
         /// Nanoseconds accumulated in glTexSubImage2D, and how many uploads that covers. Integer

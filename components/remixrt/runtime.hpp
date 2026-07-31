@@ -148,6 +148,24 @@ namespace RemixRT
         /// image that is never produced.
         bool copyOutputSynced(bool consumerSignalledSinceLastCall);
 
+        /// As copyOutputSynced, but Remix does not signal that the copy finished -- it only waits for us to
+        /// finish sampling before it overwrites the image.
+        ///
+        /// This is the handshake that actually works from OpenGL. glSignalSemaphoreEXT on an imported
+        /// semaphore succeeds; glWaitSemaphoreEXT on one returns GL_INVALID_OPERATION no matter how long ago
+        /// the matching signal was submitted, whether a texture barrier is supplied, or whether exactly one
+        /// signal is outstanding -- all of which were measured rather than assumed.
+        ///
+        /// One direction is enough for the hazard that matters. The damaging race is Remix overwriting the
+        /// image while we are still reading it, and our own signal closes that. What is given up is knowing
+        /// when the copy finished, so we may sample an image one copy behind -- which is already the case,
+        /// because the copy is deferred past the draw for exactly this reason.
+        ///
+        /// @param consumerSignalledSinceLastCall carries the same requirement as copyOutputSynced: false
+        ///        unless we really did signal since the previous call, or Remix's render thread waits on a
+        ///        signal that never comes.
+        bool copyOutputWaitOnly(bool consumerSignalledSinceLastCall);
+
         /// Drives a Remix frame. Required: the raytracing output that copyOutput() reads is only
         /// produced as part of presenting.
         bool present();

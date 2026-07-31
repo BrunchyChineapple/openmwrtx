@@ -97,6 +97,21 @@ namespace SceneUtil
         ///         in which case \a boneMatrices is untouched.
         bool getBoneMatrices(std::vector<osg::Matrixf>& boneMatrices) const;
 
+        /// Brings the pose getBoneMatrices reads up to date from a traversal that is neither a cull nor an
+        /// update visit.
+        ///
+        /// accept() only refreshes anything for those two visitor types; anything else falls through to a
+        /// plain apply() and the pose stays as whatever the last cull or update left behind. Both halves
+        /// matter here -- the bone matrices themselves, and the skin-to-skeleton transform that
+        /// skinTransform() folds into every one of them -- so refreshing only the bones would still leave
+        /// the skin anchored to a stale place.
+        ///
+        /// Safe to call every frame per rig: the skeleton collapses repeat calls for the same frame, so
+        /// several skins sharing one skeleton cost one recomputation between them.
+        void refreshPose(const osg::NodePath& nodePath, unsigned int frame);
+
+
+
         void accept(osg::NodeVisitor& nv) override;
         bool supports(const osg::PrimitiveFunctor&) const override { return true; }
         void accept(osg::PrimitiveFunctor&) const override;

@@ -180,6 +180,21 @@ namespace OMW
         /// it is further from the thing it describes.
         double mRemixOsgUpdateMs = 0.0;
         double mRemixRenderMs = 0.0;
+
+        /// Whether the most recent copy into the shared image succeeded.
+        ///
+        /// A member rather than a local because on the synchronised path the copy is deferred past the draw
+        /// traversal, so within a frame the composite samples what the *previous* copy left. That makes this
+        /// the honest answer to "is there anything to composite", and it starts false so the first frame
+        /// shows OpenMW's own image rather than an empty one.
+        bool mRemixCopyOk = false;
+
+        /// Whether a copyComplete signal has been submitted that the composite has not yet consumed.
+        ///
+        /// The pair is binary, so signalling one that is already signalled is invalid and unrecoverable. This
+        /// enforces at most one in flight: while it is set, the copy is issued through the unsynchronised
+        /// entry point so the image still updates without adding a second signal.
+        bool mRemixSignalOutstanding = false;
         // Whether the Remix developer menu currently owns the mouse. Tracked so the pointer is released
         // on transitions only; doing it every frame re-warps the cursor and pins it again.
         bool mRemixMenuHasMouse = false;

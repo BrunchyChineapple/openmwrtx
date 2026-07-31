@@ -14,6 +14,7 @@
 #include <osg/Geometry>
 #include <osg/MatrixTransform>
 #include <osg/NodeVisitor>
+#include <osg/Polytope>
 #include <osg/TriangleIndexFunctor>
 
 #include <osg/AlphaFunc>
@@ -684,13 +685,24 @@ namespace
     {
     public:
         SubmitVisitor(MWRender::RemixScene& scene, unsigned int skipMask, const osg::Vec3f& eye,
-            const osg::Vec3f& right, const osg::Vec3f& up)
+            const osg::Vec3f& right, const osg::Vec3f& up, const osg::Polytope& frustum)
             : osg::NodeVisitor(osg::NodeVisitor::TRAVERSE_ACTIVE_CHILDREN)
             , mScene(scene)
             , mEye(eye)
             , mRight(right)
             , mUp(up)
+            , mFrustum(frustum)
         {
+            // Tunable without a rebuild, because the right value is a judgement about how much off-screen
+            // geometry the lighting needs rather than something derivable. Raise it if shadows or
+            // reflections lose contributors at the edge of view; lower it to cull harder.
+            if (const char* value = std::getenv("OPENMW_REMIX_CULL_MARGIN");
+                value != nullptr && *value != '\0')
+            {
+                const double parsed = std::atof(value);
+                if (parsed >= 0.0)
+                    mCullMargin = static_cast<float>(parsed);
+            }
             // The traversal mask is the whole mask mechanism as far as this visitor is concerned. OSG
             // tests traversalMask & nodeMask in Node::accept, so a subgraph masked exclusively as GUI or
             // render-to-texture is excluded here, while ordinary geometry with the default all-bits mask
@@ -802,6 +814,35 @@ namespace
         // all while the traversal otherwise looked healthy.
         void apply(osg::Drawable& drawable) override
         {
+            // Frustum reject first, ahead of every other cost in this function: state merging, material
+            // resolution, mesh cache lookup and the handover itself.
+            //
+            // Particle systems are exempt. Their bounds are rebuilt as the particles move and are not
+            // dependable enough to reject on, and there are only tens of systems, so the saving would not
+            // pay for a flame that vanishes.
+            if (!mFrustum.getPlaneList().empty() && dynamic_cast<osgParticle::ParticleSystem*>(&drawable) == nullptr)
+            {
+                const osg::BoundingSphere& local = drawable.getBound();
+                if (local.valid())
+                {
+                    // Largest row length, so a non-uniform scale inflates the radius rather than shrinking
+                    // it. Erring large here keeps geometry that should not have been culled.
+                    const double sx = osg::Vec3d(mMatrix(0, 0), mMatrix(0, 1), mMatrix(0, 2)).length();
+                    const double sy = osg::Vec3d(mMatrix(1, 0), mMatrix(1, 1), mMatrix(1, 2)).length();
+                    const double sz = osg::Vec3d(mMatrix(2, 0), mMatrix(2, 1), mMatrix(2, 2)).length();
+                    const double scale = std::max(sx, std::max(sy, sz));
+
+                    const osg::Vec3f center = local.center() * mMatrix;
+                    const float radius = static_cast<float>(local.radius() * scale) + mCullMargin;
+
+                    if (!mFrustum.contains(osg::BoundingSphere(center, radius)))
+                    {
+                        ++mCulled;
+                        return;
+                    }
+                }
+            }
+
             osg::Geometry* geometry = drawable.asGeometry();
 
             // Skinned geometry arrives as a RigGeometry, which is a Drawable and not a Geometry, so
@@ -811,7 +852,20 @@ namespace
             // goes over once and only the bone transforms are resubmitted per frame.
             auto* rig = dynamic_cast<SceneUtil::RigGeometry*>(&drawable);
             if (rig != nullptr)
+            {
                 geometry = rig->getSourceGeometry().get();
+
+                // Bring the pose up to date before anything reads it.
+                //
+                // RigGeometry::accept only refreshes the skin for a cull or an update visitor; every other
+                // visitor, this one included, falls through to a plain apply() that touches nothing. So the
+                // bone matrices read later in the frame were whatever OpenMW's own render last computed --
+                // and it stops computing them for a skeleton it has marked inactive, or one its cull did
+                // not reach. The symptom is an actor whose animation runs only while OpenMW's camera
+                // happens to be refreshing it and freezes the moment it does not, which tracks camera
+                // angle and distance rather than anything the animation is doing.
+                rig->refreshPose(getNodePath(), static_cast<unsigned int>(mScene.frameNumber()));
+            }
 
             // Particles, the third Drawable that is not a Geometry, and the last of the invisible ones.
             //
@@ -1141,6 +1195,7 @@ namespace
 
         unsigned int instances() const { return mInstances; }
         bool clamped() const { return mClamped; }
+        unsigned int culled() const { return mCulled; }
 
     private:
         /// Writes an OSG matrix as the twelve floats Remix takes for an instance transform.
@@ -1436,6 +1491,20 @@ namespace
         osg::Vec3f mRight;
         osg::Vec3f mUp;
         osg::Matrix mMatrix;
+
+        /// World-space view frustum, empty when culling is switched off. Planes point inward.
+        osg::Polytope mFrustum;
+
+        /// Slack added to every bounding radius before the frustum test, which is arithmetically the same as
+        /// pushing all of the frustum's planes outward by this distance.
+        ///
+        /// A path tracer legitimately needs some geometry that is not directly visible: it casts shadows into
+        /// view and shows up in reflections. Rejecting strictly on the frustum would take those with it, so
+        /// the default keeps a wide band of off-screen geometry and still discards everything behind the
+        /// camera, which is where most of the saving is. In OpenMW units, where a cell is 8192 across.
+        float mCullMargin = 2048.0f;
+
+        unsigned int mCulled = 0;
         std::vector<unsigned int> mCategoryStack;
         std::vector<MWRender::RemixScene::SurfaceState> mSurfaceStack;
         unsigned int mInstances = 0;
@@ -1848,6 +1917,12 @@ namespace MWRender
         mLastInstanceCount = 0;
         mLastLightCount = 0;
         mSkinnedInstances = 0;
+        mCulled = 0;
+        // Reset per frame, unlike mMeshes.size() which is the cache's population. The distinction is the
+        // whole point of the counter: 500 cached meshes reused every frame is nearly free, and 500 rebuilt
+        // every frame is 500 acceleration structure builds. Those are indistinguishable from the cache
+        // size alone, and the difference is the dominant term in the frame.
+        mMeshesCreated = 0;
         mSkinnedDropped = 0;
         mLastParticleCount = 0;
         mParticleInstances = 0;
@@ -1914,17 +1989,48 @@ namespace MWRender
         // Mask_SimpleWater is excluded as well: it is a second, flat-shaded copy of the water quad that
         // exists only for the local map, so submitting it puts a million-unit duplicate surface in the
         // world coincident with the real one.
-        const unsigned int skipMask
-            = Mask_GUI | Mask_RenderToTexture | Mask_FirstPerson | Mask_Debug | Mask_SimpleWater;
+        //
+        // Mask_FirstPerson is deliberately NOT excluded. It was, without a stated reason, and the effect
+        // was that the player's own arms and weapon never reached the path tracer at all -- invisible in
+        // first person while everything else rendered. The viewmodel is ordinary skinned geometry with
+        // ordinary world transforms as far as this traversal is concerned.
+        //
+        // Worth knowing if it looks wrong rather than missing: OpenMW draws the viewmodel through a
+        // separate camera with its own narrower projection so it cannot clip into walls. Nothing here
+        // reproduces that, so the geometry is placed by its world transform like any other actor. If it
+        // intersects nearby scenery, that projection difference is the reason, not the transform.
+        const unsigned int skipMask = Mask_GUI | Mask_RenderToTexture | Mask_Debug | Mask_SimpleWater;
+
+        // Frustum culling, and the clamp warning below is what asked for it: this traversal submitted every
+        // instance in the loaded world every frame, roughly 12,000 outdoors against 860 indoors. That cost
+        // lands twice -- CPU here building and handing over instances, GPU in the runtime building and
+        // tracing them -- and it is the only reason the instance ceiling was ever reachable.
+        //
+        // Built from the same camera that is handed to the runtime, so no disagreement between the two can
+        // cull something that is on screen.
+        //
+        // Near and far planes are left out deliberately. Far would impose a view distance this traversal has
+        // no business choosing, since OpenMW already limits it; near would drop geometry pressed against the
+        // camera, which is exactly where the first-person viewmodel sits.
+        static const bool cullEnabled = envFlag("OPENMW_REMIX_CULL", true);
+
+        osg::Polytope frustum;
+        if (cullEnabled)
+        {
+            frustum.setToUnitFrustum(false, false);
+            frustum.transformProvidingInverse(camera.getViewMatrix() * camera.getProjectionMatrix());
+        }
 
         SubmitVisitor visitor(*this, skipMask,
             osg::Vec3f(static_cast<float>(eye.x()), static_cast<float>(eye.y()),
                 static_cast<float>(eye.z())),
             osg::Vec3f(static_cast<float>(right.x()), static_cast<float>(right.y()),
                 static_cast<float>(right.z())),
-            osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())));
+            osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())),
+            frustum);
         sceneRoot->accept(visitor);
         mLastInstanceCount = visitor.instances();
+        mCulled = visitor.culled();
 
         if (visitor.clamped() && !mLoggedClamp)
         {
@@ -1953,11 +2059,13 @@ namespace MWRender
             mLoggedFirstSubmit = true;
             mWasPopulated = populated;
             Log(Debug::Info) << "Remix scene: handed over " << mLastInstanceCount << " instances from "
-                             << mMeshes.size() << " meshes (" << mMeshesShared
+                             << mMeshes.size() << " cached meshes, " << mMeshesCreated
+                             << " BUILT THIS FRAME (" << mMeshesShared
                              << " geometries shared an existing mesh), " << mLastLightCount << " lights and "
                              << mTexturesUploaded << " textures (" << mTexturesShared
                              << " uploads avoided, content already present); " << mSkinnedInstances
-                             << " instances were skinned and " << mSkinnedDropped
+                             << " instances were skinned, " << mCulled
+                             << " drawables outside the frustum were culled, and " << mSkinnedDropped
                              << " skins were not ready; " << mLastParticleCount << " particles from "
                              << mParticleMeshes.size() << " systems"
                              << "; camera eye " << eye.x() << ", " << eye.y()
@@ -2573,6 +2681,7 @@ namespace MWRender
         // previous mesh is still queued for destruction would alias the two.
         const unsigned long long hash
             = ((reinterpret_cast<unsigned long long>(key) * 0x9E3779B97F4A7C15ull) ^ (mFrame << 1)) | 1ull;
+        ++mMeshesCreated;
         const unsigned long long mesh = mRuntime.createMesh(hash, mVertexScratch.data(),
             static_cast<unsigned int>(mVertexScratch.size()), mIndexScratch.data(),
             static_cast<unsigned int>(mIndexScratch.size()), material);
@@ -2902,6 +3011,7 @@ namespace MWRender
             skinning.mBoneIndices = mBoneIndexScratch.data();
         }
 
+        ++mMeshesCreated;
         const unsigned long long handle = mRuntime.createMesh(hash, mVertexScratch.data(), vertexCount,
             mIndexScratch.data(), static_cast<unsigned int>(mIndexScratch.size()), material,
             skinning.mBonesPerVertex > 0 ? &skinning : nullptr);

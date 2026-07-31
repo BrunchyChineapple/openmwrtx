@@ -115,6 +115,18 @@ namespace SceneUtil
         return mData ? mData->mBones.size() : 0;
     }
 
+    void RigGeometry::refreshPose(const osg::NodePath& nodePath, unsigned int frame)
+    {
+        // No skeleton yet means the skin has not been initialised against one, which needs a NodeVisitor
+        // this entry point does not have. getBoneMatrices reports that as not-ready and the caller drops
+        // the instance for the frame; OpenMW's own traversal resolves it shortly after a cell loads.
+        if (!mSkeleton || !mData)
+            return;
+
+        mSkeleton->refreshBoneMatrices(frame);
+        updateSkinToSkelMatrix(nodePath);
+    }
+
     bool RigGeometry::getBoneMatrices(std::vector<osg::Matrixf>& boneMatrices) const
     {
         if (!mSkeleton || !mData)

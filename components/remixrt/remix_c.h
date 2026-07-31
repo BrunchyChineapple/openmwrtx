@@ -1113,6 +1113,25 @@ extern "C" {
     remixapi_dxvk_CopyRenderingOutputType type,
     remixapi_Bool                         waitForConsumer);
 
+  // As dxvk_CopyRenderingOutputSynced, but does not signal 'copyComplete' -- it only waits on
+  // 'consumerDone' before copying.
+  //
+  // For consumers that cannot wait, which is every OpenGL consumer on the current NVIDIA driver:
+  // glSignalSemaphoreEXT on an imported semaphore works, while glWaitSemaphoreEXT on the same kind of
+  // imported semaphore returns GL_INVALID_OPERATION regardless of texture barrier, thread, context, how
+  // long ago the signal was submitted, or how many signals are outstanding. All measured.
+  //
+  // One direction covers the hazard that matters -- Remix overwriting the surface while the consumer is
+  // still reading it. What is given up is knowing when the copy finished, so the consumer may sample a
+  // surface one copy behind.
+  //
+  // Signalling 'copyComplete' anyway would be harmful rather than merely useless: it is binary, so a
+  // signal nobody waits on leaves it signalled and makes the next signal invalid.
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CopyRenderingOutputWaitOnly)(
+    IDirect3DSurface9*                    destination,
+    remixapi_dxvk_CopyRenderingOutputType type,
+    remixapi_Bool                         waitForConsumer);
+
   // NOTE: If adding a new function, append it at the END of the struct.
   //       Reordering or inserting in the middle breaks backwards compatibility.
   typedef struct remixapi_Interface {
@@ -1179,6 +1198,7 @@ extern "C" {
     PFN_remixapi_dxvk_GetOutputSyncSemaphores   dxvk_GetOutputSyncSemaphores;
     PFN_remixapi_dxvk_CopyRenderingOutputSynced dxvk_CopyRenderingOutputSynced;
     PFN_remixapi_dxvk_SetDevMenuWindow          dxvk_SetDevMenuWindow;
+    PFN_remixapi_dxvk_CopyRenderingOutputWaitOnly dxvk_CopyRenderingOutputWaitOnly;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(

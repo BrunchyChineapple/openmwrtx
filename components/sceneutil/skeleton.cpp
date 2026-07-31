@@ -111,6 +111,23 @@ namespace SceneUtil
         }
     }
 
+    void Skeleton::refreshBoneMatrices(unsigned int frame)
+    {
+        if (frame == mRefreshedFrame)
+            return;
+
+        mRefreshedFrame = frame;
+
+        // Unconditional, unlike updateBoneMatrices: there is no active-flag test here on purpose. An
+        // inactive skeleton is one OpenMW has decided not to animate for its own render, which says nothing
+        // about whether another consumer still needs the current pose.
+        if (mRootBone.get())
+        {
+            for (const auto& child : mRootBone->mChildren)
+                child->update(nullptr);
+        }
+    }
+
     void Skeleton::setActive(ActiveType active)
     {
         mActive = active;

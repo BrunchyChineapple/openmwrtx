@@ -420,28 +420,38 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const bool presentOk = mRemix->present();
         const auto afterPresent = std::chrono::steady_clock::now();
 
-        // Report whether the composite signalled Remix since the previous copy. Remix may only wait on
-        // that semaphore when a matching signal genuinely happened: the pair is binary, so an unmatched
-        // wait stalls Remix's render thread with no way to recover. The composite runs during
-        // renderingTraversals below, so this reads last frame's result, which is exactly the frame
-        // whose sampling the upcoming copy has to avoid overwriting.
-        const bool consumerSignalled
-            = mRemixComposite != nullptr && mRemixComposite->takeConsumerSignalled();
-
         // Skip the synchronised copy entirely when nothing is going to consume the semaphores: either
         // the GL side already reported a failure, or the readback path is in use and reads the surface
         // through D3D9 instead. Signalling a binary semaphore nobody waits on is not free -- it leaves
         // the pair unbalanced -- and the synced entry point is the more complex path of the two.
+        // syncDisabled() belongs in this list for the reason the comment above gives: it is the case where
+        // nothing will consume the semaphores because the handshake was switched off on purpose. Leaving it
+        // out would submit a signal with no waiter and unbalance the pair.
         const bool syncPointless = mRemixComposite == nullptr || mRemixComposite->syncFailed()
-            || mRemixComposite->readbackMode();
-        const bool copyOk
-            = syncPointless ? mRemix->copyOutput() : mRemix->copyOutputSynced(consumerSignalled);
-        const auto afterCopy = std::chrono::steady_clock::now();
+            || mRemixComposite->readbackMode() || mRemixComposite->syncDisabled();
+        // Where the copy happens depends on whether the handshake is live, and this is the whole fix for the
+        // wait that kept failing.
+        //
+        // The unsynchronised copy stays here, ahead of the readback below, because that readback reads the
+        // image this call fills and would otherwise be reading a frame behind.
+        //
+        // The synchronised copy is deferred until after renderingTraversals -- see the deferred block near
+        // the end of this function. It has to be. The composite's wait happens inside that traversal, so
+        // issuing the copy first means the wait races a signal that EmitCs has queued but the CS thread may
+        // not have run yet, which is exactly the GL_INVALID_OPERATION this path hit on its first armed
+        // frame. Waiting before signalling removes the race, and because these are binary semaphores it is
+        // also the only ordering that keeps exactly one signal outstanding at a time.
+        //
+        // Deferring costs one frame of latency: the composite samples the image the previous copy left. At
+        // the framerates involved that is invisible, and it buys the readback's entire cost.
+        if (syncPointless)
+        {
+            mRemixCopyOk = mRemix->copyOutput();
 
-        // And symmetrically: the composite may only wait if a synchronised copy really was issued for
-        // this frame, because waiting on an unsignalled semaphore is undefined in its own right.
-        if (mRemixComposite != nullptr)
-            mRemixComposite->setSyncArmed(copyOk && !syncPointless);
+            if (mRemixComposite != nullptr)
+                mRemixComposite->setSyncArmed(false);
+        }
+        const auto afterCopy = std::chrono::steady_clock::now();
 
         // Only overwrite OpenMW's frame when Remix actually has something in it.
         //
@@ -452,7 +462,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // upstream of the compositor must not take the whole game down with it.
         if (mRemixComposite != nullptr)
         {
-            const bool haveContent = copyOk && (useTestScene || cameraOk);
+            // The most recent copy rather than this frame's, because on the synchronised path the copy has
+            // not happened yet at this point and the composite is about to sample what the previous one
+            // left. On the first frame there is no copy yet, so compositing stays off and OpenMW's own
+            // frame is shown, which is the intended behaviour rather than a black one.
+            const bool haveContent = mRemixCopyOk && (useTestScene || cameraOk);
             if (haveContent != mRemixComposite->enabled())
             {
                 mRemixComposite->setEnabled(haveContent);
@@ -677,7 +691,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             Log(Debug::Info) << "Remix pump: " << (useTestScene ? "test scene" : "OpenMW scene")
                              << " submit=" << cameraOk << " present=" << presentOk
-                             << " copyOutput=" << copyOk
+                             << " copyOutput=" << mRemixCopyOk
                              << (mRemixScene != nullptr
                                         ? " instances=" + std::to_string(mRemixScene->lastInstanceCount())
                                             + " meshes=" + std::to_string(mRemixScene->cachedMeshCount())
@@ -722,6 +736,93 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     mRemixRenderMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeRender)
               .count();
+
+    // The deferred synchronised copy. See the ordering note where syncPointless is computed above.
+    //
+    // The composite has now run: it waited on the previous copy's signal, sampled the image, and signalled
+    // consumerDone back. Remix waits on that before it overwrites the image, so the signal submitted here
+    // cannot land until the consumer has finished reading -- which is what keeps a binary pair balanced
+    // across two APIs without any CPU synchronisation between them. A CPU sync here is not merely
+    // unnecessary but unsafe: it was tried, it did not fix the wait, and it deadlocked against the overlay
+    // thread's window management.
+    if (mRemix != nullptr && mRemix->isReady() && mRemixComposite != nullptr
+        && !mRemixComposite->syncFailed() && !mRemixComposite->readbackMode()
+        && !mRemixComposite->syncDisabled())
+    {
+        const auto beforeDeferredCopy = std::chrono::steady_clock::now();
+
+        // Read after the traversal deliberately. It reports whether the composite signalled during the draw
+        // that just finished, so it describes the sampling this copy must not overwrite.
+        const bool consumerSignalled = mRemixComposite->takeConsumerSignalled();
+
+        if (consumerSignalled)
+            mRemixSignalOutstanding = false;
+
+        // At most one signal outstanding, ever, and this is the invariant the earlier attempts broke.
+        //
+        // These are binary semaphores: signalling one that is already signalled, with no wait in between, is
+        // invalid and leaves it in a state no later wait can recover from. It is not enough to check that the
+        // handshake is healthy -- the question is whether anything is actually going to consume this signal.
+        // It was not, and the failure looked nothing like the cause: the copy ran every frame from startup
+        // while the composite stayed disabled through the whole main menu, because compositing only switches
+        // on once a copy has succeeded. Dozens of unconsumed signals accumulated, and the first real wait
+        // then failed with GL_INVALID_OPERATION -- which is exactly the error this path has been showing all
+        // along, on a semaphore that was corrupt long before the wait was reached.
+        //
+        // So while a signal is still outstanding, copy without signalling. The image still updates; only the
+        // semaphore traffic stops. Whenever the consumer does catch up it finds one pending signal, submitted
+        // frames ago, and the handshake establishes itself from there without any special first-frame case.
+        if (mRemixSignalOutstanding)
+        {
+            mRemixCopyOk = mRemix->copyOutput();
+        }
+        else
+        {
+            // One-way mode: Remix waits for us but does not signal back, because the composite cannot wait
+            // on a GL-imported semaphore. Nothing would consume a copyComplete signal, and an unconsumed
+            // binary semaphore stays signalled and poisons the next signal -- so it must be suppressed at
+            // the source rather than ignored here.
+            if (mRemixComposite->syncOneWay())
+            {
+                // Never armed, and never asking Remix to wait. This mode is unsynchronised, and the naming
+                // is now the only thing "one-way" about it.
+                //
+                // Both directions of the GL/Vulkan semaphore handshake are broken on this driver, and they
+                // fail differently. glWaitSemaphoreEXT rejects the wait outright with GL_INVALID_OPERATION
+                // under every condition measured. glSignalSemaphoreEXT *accepts* the signal and returns
+                // GL_NO_ERROR -- but Vulkan never observes it: arming the signal so that Remix's copy waited
+                // on consumerDone hung the queue submission and the driver reset the device within a frame,
+                // every single launch. GL_NO_ERROR meant the call was well-formed, nothing more.
+                //
+                // So the image is sampled with no ordering against Remix's copy. What makes that tolerable
+                // rather than reckless is the deferral above: the composite samples during the draw
+                // traversal and the copy is not issued until that traversal has returned, so the two are
+                // separated by the whole of OpenMW's draw dispatch rather than racing inside one call. It is
+                // a narrow window, not a guarantee, and it is a deliberate tradeoff for the readback's cost.
+                //
+                // The robust fix does not involve semaphores at all: two shared surfaces, Remix copying
+                // into one while GL samples the other, alternating per frame. That removes the race by
+                // construction instead of trying to order around it.
+                mRemixCopyOk = mRemix->copyOutputWaitOnly(false);
+                mRemixComposite->setSyncArmed(false);
+            }
+            else
+            {
+                mRemixCopyOk = mRemix->copyOutputSynced(consumerSignalled);
+
+                if (mRemixCopyOk)
+                    mRemixSignalOutstanding = true;
+
+                // Armed when there is a signal to consume, rather than when a copy happened. Those came
+                // apart during the menu and that difference was the bug.
+                mRemixComposite->setSyncArmed(mRemixSignalOutstanding);
+            }
+        }
+
+        mRemixTiming.mCopyMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - beforeDeferredCopy)
+                                    .count();
+    }
 
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
 

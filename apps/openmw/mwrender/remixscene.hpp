@@ -410,6 +410,13 @@ namespace MWRender
         /// unlike the node address, which is reused as cells page in and out.
         std::unordered_map<int, CachedLight> mLights;
         std::uint64_t mFrame = 0;
+
+    public:
+        /// The scene's own frame counter, exposed so the traversal can key per-frame work to the same clock
+        /// the submission uses rather than inventing a second one.
+        std::uint64_t frameNumber() const { return mFrame; }
+
+    private:
         unsigned int mLastInstanceCount = 0;
         unsigned int mLastLightCount = 0;
         unsigned int mTexturesUploaded = 0;
@@ -483,12 +490,22 @@ namespace MWRender
         /// their skin was not usable. Reported together: skinned actors going missing is otherwise
         /// indistinguishable from the traversal not reaching them.
         unsigned int mSkinnedInstances = 0;
+        /// Meshes handed to the runtime this frame, which is one acceleration structure build each.
+        ///
+        /// Separate from mMeshes.size(), the cache population, because that number cannot distinguish a
+        /// warm cache from rebuilding everything every frame -- and the two differ by the cost of hundreds
+        /// of BLAS builds. Particle systems are expected to appear here every frame by construction; static
+        /// geometry appearing here every frame is a fault.
+        unsigned int mMeshesCreated = 0;
         unsigned int mSkinnedDropped = 0;
         /// Bones per vertex of the mesh the last submitGeometry resolved to, so the caller can tell
         /// whether the instance it is about to queue needs bone transforms. Carried on the object rather
         /// than returned because a mesh that failed its skinning is still a usable static mesh, and the
         /// two answers -- handle, and whether it is skinned -- come from the same lookup.
         unsigned int mLastMeshBonesPerVertex = 0;
+        /// Drawables the frustum test rejected this frame. Reported so the saving is visible: without it the
+        /// only evidence culling is working is an instance count that went down for unstated reasons.
+        unsigned int mCulled = 0;
         bool mLoggedFirstSubmit = false;
         bool mLoggedClamp = false;
         /// Whether the last submission found anything, so the transition can be reported rather than

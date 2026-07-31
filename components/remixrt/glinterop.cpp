@@ -1,6 +1,18 @@
 #include "glinterop.hpp"
 
+// For wglGetCurrentContext and GetCurrentThreadId, used only by the interop diagnostics. NOMINMAX and
+// WIN32_LEAN_AND_MEAN because windows.h otherwise defines min/max as macros and breaks OSG's headers
+// below, which is the usual reason this include is avoided in engine code.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 
@@ -263,6 +275,31 @@ constexpr GLenum kHalfFloat = 0x140B;
         Log(Debug::Info) << "Remix GL interop: imported sync semaphores as GL " << outWait
                          << " (wait for Remix's copy) and " << outSignal
                          << " (signal when sampling is done)";
+
+        // Thread recorded so the wait site can be compared against it: GL objects are context-scoped, and a
+        // name from another context simply does not exist at the wait. Measured equal, so that is ruled out.
+        Log(Debug::Info) << "Remix GL interop: semaphores imported on thread "
+                         << static_cast<unsigned long>(GetCurrentThreadId());
+
+        // No probe wait here, deliberately. One was tried and it was a bad test: waiting on a semaphore
+        // with no signal submitted is undefined by the spec -- see the comment at the wait site -- so its
+        // GL_INVALID_OPERATION was the correct answer to an invalid question and said nothing about why the
+        // real wait fails. A signal probe *is* meaningful, and it passed, which is what established that
+        // the imported objects themselves are valid.
+
+        // And a wait issued immediately, here, where the import demonstrably just succeeded. Zero barriers
+        // so nothing but the semaphore is under test. If this fails the object was never acceptable and
+        // context and threading are irrelevant; if it passes and the real wait still fails, they are the
+        // whole story. Either outcome removes a hypothesis rather than adding one.
+        while (glGetError() != GL_NO_ERROR) { }
+        fns.signalSemaphore(outSignal, 0, nullptr, 0, nullptr, nullptr);
+        const GLenum signalProbe = glGetError();
+        Log(Debug::Info) << "Remix GL interop: signal probe on a freshly imported semaphore returned 0x"
+                         << std::hex << signalProbe << std::dec
+                         << (signalProbe == GL_NO_ERROR
+                                 ? " -- the imported objects are valid, so a wait failure is about the wait's"
+                                   " preconditions rather than the import"
+                                 : " -- the import produced an unusable object");
     }
 }
 
@@ -639,6 +676,40 @@ namespace RemixRT
             Log(Debug::Info) << "Remix composite: readback path forced by OPENMW_REMIX_READBACK";
         }
 
+        // Measurement only: sample the shared image with no synchronisation of any kind. Not a display
+        // mode -- expect tearing or a half-drawn frame, because nothing orders Remix's writes against
+        // this read.
+        //
+        // It exists because "no readback and no semaphore" was otherwise unreachable. readbackMode() and
+        // syncPointless are wired together, so switching the handshake off switched the round trip back
+        // on, and the round trip is the thing under test. Every frame costs a GPU-to-CPU-to-GPU trip that
+        // stops the GPU running ahead, and that lost overlap does not show up as its own timing line --
+        // it inflates present. This separates the two so the readback's true cost is known before anyone
+        // invests in getting the semaphore handshake right.
+        //
+        // Safe with respect to the semaphores in a way the retry was not: syncDisabled() feeds
+        // syncPointless, so the unsynchronised copy is used and no signal is ever submitted. There is no
+        // unconsumed signal, and so no unbalanced binary semaphore.
+        if (const char* value = std::getenv("OPENMW_REMIX_SYNC_ONEWAY");
+            value != nullptr && *value != '\0' && *value == '0')
+        {
+            mSyncOneWay = false;
+            Log(Debug::Info) << "Remix composite: two-way handshake requested by "
+                                "OPENMW_REMIX_SYNC_ONEWAY=0 -- the composite will attempt to wait on "
+                                "Remix's copy, which has failed with GL_INVALID_OPERATION under every "
+                                "condition measured so far. Expect a fallback to readback.";
+        }
+
+        if (const char* value = std::getenv("OPENMW_REMIX_SYNC_NONE");
+            value != nullptr && *value != '\0' && *value != '0')
+        {
+            mSyncDisabled = true;
+            Log(Debug::Warning) << "Remix composite: synchronisation disabled outright by "
+                                   "OPENMW_REMIX_SYNC_NONE -- the shared image is sampled with nothing "
+                                   "ordering Remix's writes against it. Measurement only; tearing and "
+                                   "partially rendered frames are expected.";
+        }
+
         // Orientation. The default is the confirmed-correct vertical flip; the override exists so a
         // different source convention costs a relaunch rather than a rebuild.
         if (const char* value = std::getenv("OPENMW_REMIX_FLIP"); value != nullptr && *value != '\0')
@@ -884,15 +955,25 @@ namespace RemixRT
         if (!mLoggedSyncState)
         {
             mLoggedSyncState = true;
+            mLoggedOneWay = true;
             Log(Debug::Info) << "Remix composite: synchronisation " << (sync ? "ACTIVE" : "inactive")
-                             << " -- readback " << (readback ? "on" : "off") << ", semaphores "
+                             << (sync && mSyncOneWay ? " ONE-WAY" : "") << " -- readback "
+                             << (readback ? "on" : "off") << ", semaphores "
                              << (mImport->syncAvailable() ? "imported" : "MISSING") << ", armed "
                              << (mSyncArmed.load(std::memory_order_relaxed) ? "yes" : "no")
                              << ", previously failed "
-                             << (mSyncFailed.load(std::memory_order_relaxed) ? "yes" : "no");
+                             << (mSyncFailed.load(std::memory_order_relaxed) ? "yes" : "no")
+                             << (mSyncOneWay
+                                     ? ". One-way means we signal when sampling is done and never wait for "
+                                       "the copy: the wait is unavailable from GL on this driver. Remix "
+                                       "waits before overwriting, so the image cannot tear; it may be one "
+                                       "copy behind. OPENMW_REMIX_SYNC_ONEWAY=0 attempts the two-way form."
+                                     : "");
         }
 
-        if (sync)
+        // The wait half only. The signal half below runs on `sync` alone, because one-way mode keeps
+        // signalling -- that is the half that works and the half the ordering actually depends on.
+        if (sync && !mSyncOneWay)
         {
             // Clear anything OSG left behind first, so the check after the wait measures only the wait.
             drainGl("the Remix semaphore wait");
@@ -909,6 +990,19 @@ namespace RemixRT
             // separates "the semaphore is unacceptable" from "the texture barrier is unacceptable".
             // Correctness needs the barrier, so this is for isolating a fault, not for shipping.
             const bool skipBarrier = mSkipTextureBarrier;
+
+
+            // Logged once, to compare against the context and thread the import recorded. A mismatch is
+            // the whole explanation: a semaphore name from another context does not exist here.
+            static bool loggedWaitContext = false;
+            if (!loggedWaitContext)
+            {
+                loggedWaitContext = true;
+                Log(Debug::Info) << "Remix GL interop: waiting on thread "
+                                 << static_cast<unsigned long>(GetCurrentThreadId()) << ", semaphore "
+                                 << mImport->waitSemaphore();
+            }
+
             mResources->fns.waitSemaphore(static_cast<GLuint>(mImport->waitSemaphore()), 0, nullptr,
                 skipBarrier ? 0u : 1u, skipBarrier ? nullptr : &barrierTexture,
                 skipBarrier ? nullptr : &barrierLayout);
@@ -918,17 +1012,57 @@ namespace RemixRT
                                        "sampled image is not guaranteed visible or correctly laid out";
             if (!checkGl("glWaitSemaphoreEXT"))
             {
-                // Do not signal back after a failed wait, and do not try again on later frames: see
-                // syncFailed(). The engine falls back to the unsynchronised copy from here on.
+                // Latching on the first failure means the entire diagnosis rests on one sample, taken on
+                // the very first armed frame -- exactly where a startup race would land. A bounded retry
+                // separates "fails once then works" from "never works", and those need opposite fixes: the
+                // first says the signal had not reached the GPU yet and the answer is to wait a frame, the
+                // second says the submission ordering is genuinely wrong.
+                //
+                // Off by default, deliberately. Falling back releases the import, because holding an
+                // unsynchronised alias of memory Remix writes every frame faulted the device once already;
+                // retrying keeps that alias alive for the whole retry window. That is a reasonable risk to
+                // take on purpose while measuring, and not one to ship enabled.
+                static const unsigned int retryBudget = []() -> unsigned int {
+                    const char* value = std::getenv("OPENMW_REMIX_SYNC_RETRY");
+                    if (value == nullptr || *value == '\0')
+                        return 0u;
+                    const int parsed = std::atoi(value);
+                    return parsed > 0 ? static_cast<unsigned int>(parsed) : 0u;
+                }();
+
+                ++mSyncWaitFailures;
+                if (mSyncWaitFailures <= retryBudget)
+                {
+                    Log(Debug::Warning)
+                        << "Remix composite: semaphore wait failed on attempt " << mSyncWaitFailures
+                        << " of " << retryBudget << "; retrying next frame instead of falling back";
+                    return;
+                }
+
                 mSyncFailed.store(true, std::memory_order_relaxed);
-                Log(Debug::Error) << "Remix composite: the semaphore wait failed, so synchronisation is "
-                                     "disabled from here on and the readback path takes over.";
+                Log(Debug::Error) << "Remix composite: the semaphore wait failed"
+                                  << (retryBudget > 0
+                                          ? " on every one of the allowed retries, so it is not a startup"
+                                            " race -- the signal is never becoming visible to GL"
+                                          : " (retries off; set OPENMW_REMIX_SYNC_RETRY to tell a startup"
+                                            " race from a permanent ordering fault)")
+                                  << ", so synchronisation is disabled from here on and the readback path "
+                                     "takes over.";
 
                 // Release the import rather than leave it held. Without the handshake this texture aliases
                 // memory Remix writes every frame, and that state faulted the device even with nothing
                 // sampling it -- so falling back has to give the memory up, not just stop reading it.
                 mImport->release();
                 return;
+            }
+
+            // A success after earlier failures is the entire point of the retry: it proves the failures were
+            // timing rather than ordering, and that the fix is simply not to give up on the first frame.
+            if (mSyncWaitFailures > 0)
+            {
+                Log(Debug::Info) << "Remix composite: semaphore wait SUCCEEDED after " << mSyncWaitFailures
+                                 << " failed attempt(s) -- those were a startup race, not an ordering fault";
+                mSyncWaitFailures = 0;
             }
         }
 

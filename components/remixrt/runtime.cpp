@@ -1239,6 +1239,17 @@ namespace RemixRT
             == REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
+    bool Runtime::copyOutputWaitOnly(bool consumerSignalledSinceLastCall)
+    {
+        if (!mImpl->mHaveOutput || mImpl->mApi.dxvk_CopyRenderingOutputWaitOnly == nullptr)
+            return false;
+
+        return mImpl->mApi.dxvk_CopyRenderingOutputWaitOnly(mImpl->mOutputSurface,
+                   REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR,
+                   consumerSignalledSinceLastCall ? 1u : 0u)
+            == REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
     bool Runtime::readOutputPixels(
         std::vector<unsigned char>& out, unsigned int& outWidth, unsigned int& outHeight)
     {
