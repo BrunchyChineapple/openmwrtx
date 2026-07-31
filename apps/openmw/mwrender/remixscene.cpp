@@ -2316,10 +2316,21 @@ namespace MWRender
             // Exactly what Remix computes for a game texture: XXH3 over mip 0 alone, nothing folded in.
             // See D3D9CommonTexture::SetupForRtxFrom, which hashes the staging buffer of subresource 0.
             //
-            // Reproducing it bit for bit is the whole point. Measured over a Seyda Neen walk, 249 of 804
-            // textures came out equal to a mat_<hex> key in the NVIDIA demo pack authored from an MGE-XE
-            // capture -- so an existing pack's materials bind instead of having to be re-authored. Folding
-            // in dimensions or a colour flag, as an earlier revision did, moves every value off that.
+            // Verified rather than assumed, twice over. Every one of 399 textures sampled from this log
+            // reproduced exactly by hashing tightly packed mip 0 of the source .dds; and 177 of the 244
+            // material keys in an MGE-XE capture of the census office reproduce the same way, which is what
+            // establishes that this is the formula Remix uses for a D3D9 texture. Folding in dimensions or a
+            // colour flag, as an earlier revision did, moves every value off it.
+            //
+            // Be careful what this does and does not buy, because an earlier note here overstated it. 378 of
+            // 1826 of these hashes appear among the 1282 mat_ keys in the NVIDIA demo pack, so the textures
+            // are recognisable. The materials are not: createTexturedMaterial is handed `key | 1` as the
+            // material hash, and a capture therefore records mat_<that>, which shares nothing with the pack.
+            // Remix's own D3D9 path keys a material on its albedo texture hash, which is why an MGE-XE
+            // capture binds and ours does not. Nothing in the pack can attach until the material hash is the
+            // albedo texture hash -- with the consequence that surfaces differing only in roughness, blend
+            // or alpha test would collapse onto one material, which is exactly what Remix does for D3D9 but
+            // is not what this code currently assumes.
             hash = RemixRT::AssetHash::bytes(uploadData, mip0Size);
         }
         else
