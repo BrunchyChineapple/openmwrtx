@@ -1640,6 +1640,7 @@ namespace MWRender
                 mRuntime.destroyMaterial(handle);
         }
         mMaterials.clear();
+        mMaterialAlbedoHashes.clear();
         for (const auto& [key, cached] : mTextures)
         {
             if (cached.mUsable)
@@ -2570,6 +2571,8 @@ namespace MWRender
         }
 
         mMaterials.emplace(key, handle);
+        // Recorded for the mesh hash, which XORs the albedo texture hash the way Remix's D3D9 path does.
+        mMaterialAlbedoHashes[handle] = textureHash;
         return handle;
     }
 
@@ -2974,42 +2977,78 @@ namespace MWRender
             vertex.mColor = 0x00FFFFFFu | (alpha << 24);
         }
 
-        // Identity from content. This value is what Remix knows the mesh as and what a USD replacement is
-        // authored against, so an address-derived one meant no replacement could ever bind and every
-        // capture named its meshes differently.
+        // Identity as Remix's own D3D9 path would compute it, so that a replacement pack authored against a
+        // Morrowind capture binds to geometry submitted here. This value is what Remix knows the mesh as
+        // and what a USD replacement is keyed on, so an address-derived one meant no replacement could ever
+        // bind and every capture named its meshes differently.
         //
-        // Hashed over exactly what is submitted -- the built vertex buffer and index buffer -- so it covers
-        // positions, normals, texcoords and the baked texture matrix together. Note this is NOT yet the
-        // formulation Remix computes for a D3D9 draw, which hashes positions, indices and a geometry
-        // descriptor separately under rtx.geometryAssetHashRule. Matching that is the next step and is
-        // deliberately confined to this function: nothing else depends on how the number is made.
-        unsigned long long contentHash = RemixRT::AssetHash::bytes(
-            mVertexScratch.data(), mVertexScratch.size() * sizeof(RemixRT::Runtime::Vertex));
-        contentHash = RemixRT::AssetHash::bytesSeeded(
-            mIndexScratch.data(), mIndexScratch.size() * sizeof(unsigned int), contentHash);
-        unsigned long long hash = RemixRT::AssetHash::avoidZero(contentHash);
+        // AssetHash::d3d9Geometry documents the formulation and how each part of it was verified. The
+        // material is XORed in because the runtime does the same -- DrawCallState::getHash is the geometry
+        // hash for the active rule XOR the material hash -- and it uses the albedo texture hash for the
+        // latter, which is not this host's material handle. Hence the albedo lookup.
+        //
+        // An earlier attempt at this was abandoned, and the note explaining why claimed the difference was
+        // structural: that Morrowind draws sub-ranges of shared vertex buffers, so its vertexCount could
+        // never correspond to a standalone mesh's. That turned out to be wrong. The geometry descriptor,
+        // which is where vertexCount lands, reproduces from a capture's own point count 40 times out of 40.
+        // The real causes were a 16-bit index buffer and an opposite triangle winding, both handled in
+        // d3d9Geometry and neither visible from the runtime source alone.
+        unsigned long long hash = 0;
+        RemixRT::AssetHash::GeometryHashParts parts;
+        const unsigned long long geometryHash = RemixRT::AssetHash::d3d9GeometryParts(mVertexScratch.data(),
+            sizeof(RemixRT::Runtime::Vertex), vertexCount, mIndexScratch.data(),
+            static_cast<unsigned int>(mIndexScratch.size()), parts);
+        if (geometryHash != 0)
+        {
+            const auto albedo = mMaterialAlbedoHashes.find(material);
+            hash = RemixRT::AssetHash::avoidZero(
+                geometryHash ^ (albedo != mMaterialAlbedoHashes.end() ? albedo->second : 0ull));
 
-        // Note on matching mesh replacements authored elsewhere: reproducing Remix's own geometry hash here
-        // was tried and does not work. A faithful implementation of the runtime's formulation -- positions
-        // over the sorted unique index set, a flat hash of the index block, and the geometry descriptor,
-        // combined the way GeometryHashes does -- matched none of the 562 mesh_<hex> keys in a pack captured
-        // from Morrowind through MGE-XE, over 8192 meshes. (Removed afterwards rather than left unused; it is
-        // in the history if the premise ever changes.) The reason looks structural rather than arithmetic:
-        // the runtime
-        // hashes the index buffer's raw bytes and takes vertexCount straight from the draw call, so a game
-        // drawing from shared buffers with a base-vertex offset describes a sub-range of a batch, where this
-        // submits standalone meshes with 0-based indices. Materials are a different story -- see the texture
-        // hash above, which does match.
+            // Temporary, for diagnosing why no mesh replacement binds. The hash is one opaque number and
+            // the combiner chains its parts, so a mismatch says nothing about which part is wrong; the
+            // checksums let the same mesh be located in a capture and the two computations compared. Remove
+            // once mesh replacements bind.
+            if (mMeshHashesLogged < kMeshHashLogLimit)
+            {
+                ++mMeshHashesLogged;
+                const bool haveAlbedo = albedo != mMaterialAlbedoHashes.end();
+                Log(Debug::Info) << "Remix mesh hash " << std::hex << hash << ": verts " << std::dec
+                                 << vertexCount << " idx " << mIndexScratch.size() << std::hex
+                                 << "; positions " << parts.mPositions << " indices " << parts.mIndices
+                                 << " descriptor " << parts.mDescriptor << " combined " << parts.mCombined
+                                 << "; albedo " << (haveAlbedo ? albedo->second : 0ull)
+                                 << (haveAlbedo ? "" : " (MATERIAL NOT IN MAP)") << "; poschk "
+                                 << parts.mPositionChecksum << " idxchk " << parts.mIndexChecksum
+                                 << std::dec;
+            }
+        }
+        else
+        {
+            // Geometry Remix's D3D9 path could not have described -- too many vertices for a 16-bit index,
+            // or an index count that is not whole triangles. No pack entry can exist for it, so identity
+            // only has to be stable and collision-free, and hashing everything submitted gives that.
+            unsigned long long contentHash = RemixRT::AssetHash::bytes(
+                mVertexScratch.data(), mVertexScratch.size() * sizeof(RemixRT::Runtime::Vertex));
+            contentHash = RemixRT::AssetHash::bytesSeeded(
+                mIndexScratch.data(), mIndexScratch.size() * sizeof(unsigned int), contentHash);
+            hash = RemixRT::AssetHash::avoidZero(contentHash);
+        }
 
         // Identical content already submitted? Then share it -- one Remix mesh, one BLAS, however many
         // instances reference it.
         //
-        // The material has to match as well, and cannot be folded into the hash to force that: the whole
-        // point of hashing content alone is that the value agrees with what Remix would compute for this
-        // geometry. So the rare genuine collision -- the same geometry reused with a different material,
-        // which cannot share a mesh because the material is baked in -- is resolved by moving to a derived
-        // hash instead. The unperturbed value is always tried first, so the common case keeps the
-        // replacement-addressable identity and only the colliding variant gives it up.
+        // The material and texture matrix have to match as well, and the hash no longer distinguishes
+        // either on its own. It covers positions, indices and counts, plus the albedo texture via the XOR,
+        // because that is what Remix computes -- so it says nothing about surface state or texcoords, and
+        // the texture matrix is baked into the texcoords this builds. Two collisions therefore remain
+        // reachable: one geometry drawn with two materials that share an albedo texture but differ in alpha
+        // test or blend, which a session shows for 12 of 762 textures, and one geometry drawn with two
+        // different texture matrices.
+        //
+        // Both are resolved by moving to a derived hash rather than by widening the real one, since
+        // widening it would break the agreement with Remix that the whole change exists to establish. The
+        // unperturbed value is always tried first, so the common case keeps the replacement-addressable
+        // identity and only the colliding variant gives it up.
         bool reused = false;
         unsigned long long reusedHandle = 0;
         for (int attempt = 0; attempt < 8; ++attempt)
