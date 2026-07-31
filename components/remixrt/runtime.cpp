@@ -433,7 +433,10 @@ namespace RemixRT
                                    "target. Unset OPENMW_REMIX_WINDOW_SIZE to use the menu.";
         }
 
-        const bool showPresentWindow = envFlag("OPENMW_REMIX_WINDOW");
+        // The present window must be visible when Remix presents to the screen, since it is then the only
+        // place its image appears. OPENMW_REMIX_WINDOW keeps working on its own for the diagnostic case of
+        // watching Remix's raw output beside a composited OpenMW frame.
+        const bool showPresentWindow = envFlag("OPENMW_REMIX_WINDOW") || envFlag("OPENMW_REMIX_PRESENT");
         mImpl->mPresentWindow = createPresentWindow(width, height, showPresentWindow);
         if (mImpl->mPresentWindow == nullptr)
         {

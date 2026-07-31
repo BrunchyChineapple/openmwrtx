@@ -78,6 +78,27 @@
 #include "mwworld/datetimemanager.hpp"
 #include "mwworld/worldimp.hpp"
 
+namespace
+{
+    /// True when Remix presents to the screen itself and OpenMW must not move its image.
+    ///
+    /// The configuration frame generation requires. Interpolated frames are produced during Remix's present
+    /// and live only in its swapchain, so a host displaying rtOutput.m_finalOutput -- the path tracer's
+    /// target from before presentation -- throws all of them away. DLFG is not even brought up in a host
+    /// that never presents; rtx_fork_upscaler_ui.cpp records that, having crashed the developer menu by
+    /// reaching for DLFG's device pointer in exactly that situation.
+    ///
+    /// Read once. It cannot change within a run: it decides how the window and the swapchain are set up.
+    bool remixPresentsToScreen()
+    {
+        static const bool value = []() -> bool {
+            const char* env = std::getenv("OPENMW_REMIX_PRESENT");
+            return env != nullptr && *env != '\0' && *env != '0';
+        }();
+        return value;
+    }
+}
+
 #include "mwrender/vismask.hpp"
 
 #include "mwclass/classes.hpp"
@@ -225,7 +246,19 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             ScopedProfile<UserStatsType::Sound> profile(frameStart, frameNumber, *timer, *stats);
 
-            if (!mWindowManager->isWindowVisible())
+            // Not when Remix is presenting, because then OpenMW's window is not what anyone is looking at.
+            //
+            // A fullscreen window is minimised by Windows the moment it loses focus, so clicking Remix's
+            // window to reach the developer menu made this fire and stopped the frame outright -- the scene
+            // submission with it, which froze the image in the window the user was actually watching. The
+            // game appeared to pause because it genuinely did.
+            //
+            // The MyGUI leak the check exists for is still real, so this is not free: widget textures that
+            // change while the window is minimised will leak RenderItems. Acceptable here because OpenMW's
+            // GUI is not visible in this mode at all, and a leak is a better failure than the renderer
+            // stopping. Revisit when the GUI is composited into Remix's frame, since that will make widget
+            // updates matter again.
+            if (!mWindowManager->isWindowVisible() && !remixPresentsToScreen())
             {
                 mSoundManager->pausePlayback();
                 return false;
@@ -429,6 +462,33 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // out would submit a signal with no waiter and unbalance the pair.
         const bool syncPointless = mRemixComposite == nullptr || mRemixComposite->syncFailed()
             || mRemixComposite->readbackMode() || mRemixComposite->syncDisabled();
+        // Remix presents to the screen itself, and OpenMW stops moving its image at all.
+        //
+        // This is the configuration DLSS Frame Generation requires. Interpolated frames are produced during
+        // Remix's present and exist only in its swapchain, so a host that displays rtOutput.m_finalOutput --
+        // the path tracer's target from before presentation -- discards every one of them. Worse, DLFG is
+        // never even brought up: rtx_fork_upscaler_ui.cpp says so outright, having crashed the developer
+        // menu by reaching for DLFG's device pointer in a host where Remix never presents.
+        //
+        // So no copy and no composite here. Not merely unnecessary: leaving them on is what made the first
+        // attempt at this unusable. Remix presenting for real while we copied from its render target
+        // unsynchronised gave a static image with scanline tearing and crashed on cell load, because two
+        // configurations were fighting over the same surface.
+        //
+        // The scene submission, the update traversal and OpenMW's own draw all continue. The submission is
+        // what Remix renders, and OpenMW's cull is what keeps SemiActive skeletons animating.
+        const bool remixPresents = remixPresentsToScreen();
+
+        if (remixPresents)
+        {
+            if (mRemixComposite != nullptr && mRemixComposite->enabled())
+            {
+                mRemixComposite->setEnabled(false);
+                Log(Debug::Info) << "Remix: compositing disabled -- Remix presents to its own window, so "
+                                    "its image is not copied into OpenMW's frame. This is the only "
+                                    "arrangement in which frame generation reaches the screen.";
+            }
+        }
         // Where the copy happens depends on whether the handshake is live, and this is the whole fix for the
         // wait that kept failing.
         //
@@ -444,7 +504,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         //
         // Deferring costs one frame of latency: the composite samples the image the previous copy left. At
         // the framerates involved that is invisible, and it buys the readback's entire cost.
-        if (syncPointless)
+        if (syncPointless && !remixPresents)
         {
             mRemixCopyOk = mRemix->copyOutput();
 
@@ -460,7 +520,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // running and audible, no key does anything visible, and even the Remix menu is gone, because
         // that is drawn into the same output which is only produced when Remix raytraces. A failure
         // upstream of the compositor must not take the whole game down with it.
-        if (mRemixComposite != nullptr)
+        if (mRemixComposite != nullptr && !remixPresents)
         {
             // The most recent copy rather than this frame's, because on the synchronised path the copy has
             // not happened yet at this point and the composite is about to sample what the previous one
@@ -503,8 +563,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             // interact with and no visible way back. That is precisely what happened when the composite
             // was mis-ordered behind OpenMW's scene resolve: pressing Alt+X looked like a hard lock-up.
             // An overlay that cannot be shown does not get the pointer.
-            const bool menuWantsMouse
-                = mRemix->uiState() > 0 && mRemixComposite != nullptr && mRemixComposite->enabled();
+            // When Remix presents, the menu is on screen in Remix's own window and the composite is off by
+            // design, so the composite's state no longer says anything about whether the menu is visible.
+            const bool menuIsOnScreen
+                = remixPresents || (mRemixComposite != nullptr && mRemixComposite->enabled());
+            const bool menuWantsMouse = mRemix->uiState() > 0 && menuIsOnScreen;
             if (menuWantsMouse != mRemixMenuHasMouse)
             {
                 mRemixMenuHasMouse = menuWantsMouse;
@@ -547,7 +610,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // -- it has no way to see Remix's pixels on its own, so read them here and hand them over. This
         // is a GPU-to-CPU round trip on the main thread and it costs real frame time; it buys a
         // correct, visible image without depending on the cross-API synchronisation.
-        if (mRemixComposite != nullptr && mRemixComposite->readbackMode())
+        //
+        // Skipped when Remix presents, whatever the composite was configured for. Nothing consumes the
+        // pixels then, and this is the most expensive thing in the frame to do for no reason.
+        if (mRemixComposite != nullptr && mRemixComposite->readbackMode() && !remixPresents)
         {
             unsigned int readWidth = 0;
             unsigned int readHeight = 0;
@@ -746,8 +812,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // unnecessary but unsafe: it was tried, it did not fix the wait, and it deadlocked against the overlay
     // thread's window management.
     if (mRemix != nullptr && mRemix->isReady() && mRemixComposite != nullptr
-        && !mRemixComposite->syncFailed() && !mRemixComposite->readbackMode()
-        && !mRemixComposite->syncDisabled())
+        && !remixPresentsToScreen() && !mRemixComposite->syncFailed()
+        && !mRemixComposite->readbackMode() && !mRemixComposite->syncDisabled())
     {
         const auto beforeDeferredCopy = std::chrono::steady_clock::now();
 
