@@ -36,14 +36,6 @@ namespace RemixRT
         std::uint64_t d3d9Geometry(const void* positions, std::size_t positionStride,
             std::uint32_t vertexCount, const std::uint32_t* indices, std::uint32_t indexCount)
         {
-            GeometryHashParts ignored;
-            return d3d9GeometryParts(positions, positionStride, vertexCount, indices, indexCount, ignored);
-        }
-
-        std::uint64_t d3d9GeometryParts(const void* positions, std::size_t positionStride,
-            std::uint32_t vertexCount, const std::uint32_t* indices, std::uint32_t indexCount,
-            GeometryHashParts& parts)
-        {
             // Values from the Vulkan enums the runtime records in its geometry descriptor. Hard-coded
             // rather than included, because pulling vulkan headers into OpenMW for two integers is a poor
             // trade, and these two are the only combination a Morrowind draw ever used across the capture
@@ -96,25 +88,6 @@ namespace RemixRT
             std::uint64_t hash = positionsHash;
             hash = combine(indicesHash, hash);
             hash = combine(descriptorHash, hash);
-
-            parts.mPositions = positionsHash;
-            parts.mIndices = indicesHash;
-            parts.mDescriptor = descriptorHash;
-            parts.mCombined = hash;
-
-            // Join keys over the submitted buffers, packed tightly so they can be reproduced from a
-            // capture without depending on any of the choices the hash above makes.
-            std::vector<float> packed(static_cast<std::size_t>(vertexCount) * 3);
-            for (std::uint32_t v = 0; v < vertexCount; ++v)
-            {
-                const auto* p = reinterpret_cast<const float*>(base + static_cast<std::size_t>(v) * positionStride);
-                packed[v * 3 + 0] = p[0];
-                packed[v * 3 + 1] = p[1];
-                packed[v * 3 + 2] = p[2];
-            }
-            parts.mPositionChecksum = bytes(packed.data(), packed.size() * sizeof(float));
-            parts.mIndexChecksum = bytes(indices, static_cast<std::size_t>(indexCount) * sizeof(std::uint32_t));
-
             return hash;
         }
     }

@@ -79,29 +79,6 @@ namespace RemixRT
         std::uint64_t d3d9Geometry(const void* positions, std::size_t positionStride,
             std::uint32_t vertexCount, const std::uint32_t* indices, std::uint32_t indexCount);
 
-        /// The intermediate values d3d9Geometry produced, for diagnosing a hash that does not bind.
-        ///
-        /// A mesh hash that fails to match is a single opaque number, and the combiner chains its parts, so
-        /// a wrong result says nothing about which part was wrong. The two checksums are join keys rather
-        /// than hash components: they cover the submitted buffers tightly packed, independently of the
-        /// hash formulation, so the same mesh can be found in a capture and the two computations compared
-        /// directly. Without them a runtime value cannot be matched to a captured mesh at all, and vertex
-        /// and index counts alone are far from unique.
-        struct GeometryHashParts
-        {
-            std::uint64_t mPositions = 0;
-            std::uint64_t mIndices = 0;
-            std::uint64_t mDescriptor = 0;
-            std::uint64_t mCombined = 0;
-            std::uint64_t mPositionChecksum = 0; ///< XXH3 over vertexCount tightly packed float3
-            std::uint64_t mIndexChecksum = 0; ///< XXH3 over the index buffer as submitted, 32-bit
-        };
-
-        /// As d3d9Geometry, additionally reporting its intermediates.
-        std::uint64_t d3d9GeometryParts(const void* positions, std::size_t positionStride,
-            std::uint32_t vertexCount, const std::uint32_t* indices, std::uint32_t indexCount,
-            GeometryHashParts& parts);
-
         /// Zero is not a usable asset identity: the API rejects a null handle, and this code already
         /// treats a zero hash as "creation failed". Substituted rather than forced odd, because forcing a
         /// bit would perturb every hash and destroy any chance of matching a value captured elsewhere.

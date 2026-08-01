@@ -411,11 +411,6 @@ namespace MWRender
         /// Keyed by texture hash combined with the alpha-test threshold, since those two are all that
         /// currently distinguish one material from another.
         std::unordered_map<unsigned long long, unsigned long long> mMaterials;
-        /// Temporary, paired with the mesh hash diagnostic in buildMesh. Capped because the log is already
-        /// dense and a few dozen meshes is enough to compare against a capture.
-        static constexpr unsigned int kMeshHashLogLimit = 40;
-        unsigned int mMeshHashesLogged = 0;
-
         /// Material handle to the hash of its albedo texture.
         ///
         /// Needed because a mesh's identity is its geometry hash XOR its material's hash, and Remix's D3D9

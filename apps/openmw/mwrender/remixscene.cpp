@@ -2994,33 +2994,14 @@ namespace MWRender
         // The real causes were a 16-bit index buffer and an opposite triangle winding, both handled in
         // d3d9Geometry and neither visible from the runtime source alone.
         unsigned long long hash = 0;
-        RemixRT::AssetHash::GeometryHashParts parts;
-        const unsigned long long geometryHash = RemixRT::AssetHash::d3d9GeometryParts(mVertexScratch.data(),
+        const unsigned long long geometryHash = RemixRT::AssetHash::d3d9Geometry(mVertexScratch.data(),
             sizeof(RemixRT::Runtime::Vertex), vertexCount, mIndexScratch.data(),
-            static_cast<unsigned int>(mIndexScratch.size()), parts);
+            static_cast<unsigned int>(mIndexScratch.size()));
         if (geometryHash != 0)
         {
             const auto albedo = mMaterialAlbedoHashes.find(material);
             hash = RemixRT::AssetHash::avoidZero(
                 geometryHash ^ (albedo != mMaterialAlbedoHashes.end() ? albedo->second : 0ull));
-
-            // Temporary, for diagnosing why no mesh replacement binds. The hash is one opaque number and
-            // the combiner chains its parts, so a mismatch says nothing about which part is wrong; the
-            // checksums let the same mesh be located in a capture and the two computations compared. Remove
-            // once mesh replacements bind.
-            if (mMeshHashesLogged < kMeshHashLogLimit)
-            {
-                ++mMeshHashesLogged;
-                const bool haveAlbedo = albedo != mMaterialAlbedoHashes.end();
-                Log(Debug::Info) << "Remix mesh hash " << std::hex << hash << ": verts " << std::dec
-                                 << vertexCount << " idx " << mIndexScratch.size() << std::hex
-                                 << "; positions " << parts.mPositions << " indices " << parts.mIndices
-                                 << " descriptor " << parts.mDescriptor << " combined " << parts.mCombined
-                                 << "; albedo " << (haveAlbedo ? albedo->second : 0ull)
-                                 << (haveAlbedo ? "" : " (MATERIAL NOT IN MAP)") << "; poschk "
-                                 << parts.mPositionChecksum << " idxchk " << parts.mIndexChecksum
-                                 << std::dec;
-            }
         }
         else
         {
