@@ -56,26 +56,43 @@ namespace RemixRT
             // Positions, over the referenced vertices only and in ascending unique index order. The
             // runtime reaches this order via deduplicateSortIndices; an unreferenced vertex contributes
             // nothing, so a mesh carrying spare vertices still hashes the same.
-            std::vector<std::uint32_t> referenced(indices, indices + indexCount);
-            std::sort(referenced.begin(), referenced.end());
-            referenced.erase(std::unique(referenced.begin(), referenced.end()), referenced.end());
+            //
+            // Marked in a bitmap and walked in order rather than sorted and deduplicated. The result is
+            // identical -- ascending, each vertex once -- but the cost is O(indices + vertices) instead of
+            // O(indices log indices), with no copy of the index buffer. That matters because this runs for
+            // every new mesh during a cell load, and the per-vertex hash below already cannot be batched:
+            // the runtime chains each vertex into the previous result, so matching it means one call per
+            // vertex no matter what. Sorting a few million indices per cell on top of that was pure waste.
+            //
+            // The buffers are members reused across calls, so a cell load does not allocate per mesh.
+            thread_local std::vector<bool> mReferencedMask;
+            thread_local std::vector<std::uint16_t> mNarrowedIndices;
+
+            mReferencedMask.assign(vertexCount, false);
+            for (std::uint32_t i = 0; i < indexCount; ++i)
+            {
+                if (indices[i] >= vertexCount)
+                    return 0;
+                mReferencedMask[indices[i]] = true;
+            }
 
             const auto* base = static_cast<const std::uint8_t*>(positions);
             std::uint64_t positionsHash = 0;
-            for (const std::uint32_t index : referenced)
+            for (std::uint32_t index = 0; index < vertexCount; ++index)
             {
-                if (index >= vertexCount)
-                    return 0;
+                if (!mReferencedMask[index])
+                    continue;
                 positionsHash = bytesSeeded(
                     base + static_cast<std::size_t>(index) * positionStride, 3 * sizeof(float), positionsHash);
             }
 
             // Indices, narrowed to 16-bit and otherwise verbatim. This buffer already agrees with
             // Morrowind's; see the header for how that was established and why reversing it here was wrong.
-            std::vector<std::uint16_t> narrowed(indexCount);
+            mNarrowedIndices.resize(indexCount);
             for (std::uint32_t i = 0; i < indexCount; ++i)
-                narrowed[i] = static_cast<std::uint16_t>(indices[i]);
-            const std::uint64_t indicesHash = bytes(narrowed.data(), narrowed.size() * sizeof(std::uint16_t));
+                mNarrowedIndices[i] = static_cast<std::uint16_t>(indices[i]);
+            const std::uint64_t indicesHash
+                = bytes(mNarrowedIndices.data(), static_cast<std::size_t>(indexCount) * sizeof(std::uint16_t));
 
             std::uint64_t descriptorHash = bytesSeeded(&indexCount, sizeof(indexCount), 0);
             descriptorHash = bytesSeeded(&vertexCount, sizeof(vertexCount), descriptorHash);

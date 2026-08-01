@@ -3032,12 +3032,12 @@ namespace MWRender
         // identity and only the colliding variant gives it up.
         bool reused = false;
         unsigned long long reusedHandle = 0;
-        for (int attempt = 0; attempt < 8; ++attempt)
-        {
-            auto found = mMeshes.find(hash);
-            if (found == mMeshes.end())
-                break;
 
+        // Claims an identity: 0 free, 1 already ours and reusable, 2 held by different geometry.
+        const auto tryClaim = [&](unsigned long long candidate) -> int {
+            auto found = mMeshes.find(candidate);
+            if (found == mMeshes.end())
+                return 0;
             if (found->second.mMaterial == material
                 && std::equal(std::begin(found->second.mTexMat), std::end(found->second.mTexMat),
                     std::begin(surface.mTexMat)))
@@ -3046,10 +3046,50 @@ namespace MWRender
                 mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
                 reusedHandle = found->second.mHandle;
                 reused = true;
-                break;
+                return 1;
             }
+            return 2;
+        };
 
-            hash = RemixRT::AssetHash::avoidZero(RemixRT::AssetHash::combine(material, hash));
+        // A colliding variant takes a second identity derived from what it submits, never the next free
+        // slot in the cache.
+        //
+        // Searching for a free slot was a leak, and a bad one. The result depended on what the cache
+        // already held rather than on the geometry, so the same mesh landed on a different identity every
+        // frame -- the slot it took last frame was occupied by its own previous entry -- and each frame
+        // created another mesh. The cache grew without bound, cell loads slowed as it grew, and the process
+        // eventually died. Widening the search from eight probes to seventy-two made it nine times worse
+        // and produced the giveaway: "no free mesh identity after 72 attempts", which is impossible for
+        // genuine collisions and only makes sense if the search was walking its own leaked entries.
+        //
+        // Hashing everything submitted, plus the material and texture matrix, is fully determined by this
+        // draw. The same variant therefore resolves to the same identity on every frame and in every cell,
+        // which is what makes it cacheable at all. It is not the value Remix would compute, so this variant
+        // gives up being replacement-addressable -- the accepted trade, and the reason the parity hash is
+        // always tried first so that the common case keeps it.
+        if (tryClaim(hash) == 2)
+        {
+            unsigned long long variant = RemixRT::AssetHash::bytes(
+                mVertexScratch.data(), mVertexScratch.size() * sizeof(RemixRT::Runtime::Vertex));
+            variant = RemixRT::AssetHash::bytesSeeded(
+                mIndexScratch.data(), mIndexScratch.size() * sizeof(unsigned int), variant);
+            variant = RemixRT::AssetHash::combine(material, variant);
+            variant = RemixRT::AssetHash::bytesSeeded(
+                surface.mTexMat, sizeof(surface.mTexMat), variant);
+            hash = RemixRT::AssetHash::avoidZero(variant);
+
+            if (tryClaim(hash) == 2)
+            {
+                // Two different submissions agreeing on every vertex, index, the material and the texture
+                // matrix, yet not equal. Dropping the mesh is right: there is no identity left to give it,
+                // and aliasing it onto the other would corrupt the registry.
+                static unsigned int sHardCollisions = 0;
+                if (++sHardCollisions <= 4)
+                    Log(Debug::Warning) << "Remix: full-content mesh identity collision on a mesh of "
+                                        << vertexCount << " vertices; dropping it. This should be "
+                                        << "unreachable.";
+                return 0;
+            }
         }
 
         if (reused)
@@ -3066,6 +3106,24 @@ namespace MWRender
             return reusedHandle;
         }
 
+        // Never hand createMesh a hash that is already live for different geometry.
+        //
+        // The loop above gives up after eight perturbations, and before this guard existed it then fell
+        // through and created a mesh under a hash another mesh was still using. createMesh takes the hash
+        // as the handle verbatim, so those two geometries became one entry, and destroyMesh's contract --
+        // release a hash before reusing it for different geometry -- was broken. That corrupts the mesh
+        // registry, and it surfaces wherever geometry churns rather than at the point of the mistake:
+        // cell changes, teleports, menus.
+        //
+        // Reaching this point at all is a consequence of matching Remix's formulation. Hashing everything
+        // submitted, as this did before, made collisions unreachable because normals and texcoords
+        // separated variants that positions and indices alone do not. Agreement with Remix is worth more
+        // than that headroom, but it has to be paid for here rather than by corrupting state.
+        //
+        // Keeping the search going is the right response: a perturbed hash is as good as any other for a
+        // variant that has already given up being replacement-addressable, and each round is a hash and a
+        // map probe. Bailing out entirely is reserved for the case where even that fails, where dropping
+        // one mesh from the frame is plainly better than aliasing it onto another.
         RemixRT::Runtime::Skinning skinning;
         if (rig != nullptr)
         {
