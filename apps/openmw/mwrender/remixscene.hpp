@@ -8,6 +8,7 @@
 
 #include <osg/Matrixf>
 #include <osg/Node>
+#include <osg/observer_ptr>
 #include <osg/ref_ptr>
 
 #include <components/remixrt/runtime.hpp>
@@ -114,7 +115,11 @@ namespace MWRender
             /// Exists for composited terrain, whose real albedo is a render target with no image behind it
             /// -- so it is read back to the CPU and handed over this way. Takes precedence over mTexture
             /// when set, because for those chunks mTexture is the render target and unusable.
-            const osg::Image* mExplicitImage = nullptr;
+            /// Held by reference, not by pointer. This is a terrain chunk's readback image, produced on the
+            /// draw thread and released when its chunk goes away, and it is captured here well before the
+            /// upload that reads its pixels -- so a bare pointer only survives while the timing happens to
+            /// be kind.
+            osg::ref_ptr<const osg::Image> mExplicitImage;
 
             /// Per-vertex coverage for one terrain layer, taken from OpenMW's blend map and written into
             /// the vertex alpha.
@@ -297,7 +302,71 @@ namespace MWRender
             /// widened with alpha forced to 255 -- is silently a no-op, and that looks exactly like the
             /// cutout never having been requested.
             const char* mFormat = "none";
+            /// Frame this texture was last resolved for a drawable. Drives eviction: without it the cache
+            /// only ever grew, because destroyTexture was reachable solely from shutdown. Every other
+            /// cache in this class already carries the same stamp.
+            std::uint64_t mLastUsedFrame = 0;
+            /// The image this entry was built from, observed rather than held.
+            ///
+            /// Observed, so caching an image here does not keep it alive -- the point is to learn when
+            /// OpenMW frees it, which is the only trustworthy signal that this entry is garbage. An idle
+            /// timer cannot answer that question: a texture can go hundreds of frames without being
+            /// resolved and still belong to a cell the player is standing in.
+            ///
+            /// It also repairs a correctness hole. The map key is the image's address, and addresses are
+            /// reused once OpenMW frees an image, so a later image landing on a freed one's address used to
+            /// resolve to the *previous* image's texture. Comparing the observer against the image in hand
+            /// detects that. Nothing noticed before only because nothing was ever released.
+            osg::observer_ptr<const osg::Image> mImage;
+            /// Bytes handed to createTexture, so a release can subtract what an upload added. Zero for a
+            /// negative result and for an entry that shares another's identity.
+            std::size_t mBytes = 0;
         };
+
+        /// Ceiling on texture destroys in one frame.
+        ///
+        /// Textures and their materials were never released during play, so a session accumulated every
+        /// texture it had ever seen. That was survivable while little was replaced; once mesh replacements
+        /// bound and the active grid stopped batching, each cell load pulled in far more distinct materials
+        /// and their high-resolution replacement textures, and video memory ran out -- a long stall, then
+        /// VK_ERROR_DEVICE_LOST. Terrain made it worse still: with composite readback on, every terrain
+        /// chunk contributes one uncompressed RGBA8 composite, and a session measured 338 of them.
+        ///
+        /// A cell boundary orphans a whole cell's textures on one frame, and a texture destroy releases far
+        /// more memory than a mesh destroy, so the herd-arrival argument that budgets evictStaleMeshes
+        /// applies here with more force.
+        static constexpr unsigned int kTextureDestroysPerFrame = 32;
+
+        /// Frames an unclaimed identity is left alone before it is destroyed. See mOrphanedSince.
+        ///
+        /// Long enough that a surface which reappears shortly after vanishing -- a menu reopened, a cell
+        /// stepped back into -- re-claims its identity instead of being destroyed and rebuilt, and far longer
+        /// than the runtime can still be holding a queued destroy for the handle.
+        static constexpr std::uint64_t kTextureGraceFrames = 120;
+
+        /// Releases textures whose source image OpenMW has freed, and the materials naming them.
+        ///
+        /// Deliberately not an idle timer. An earlier attempt released textures unused for a fixed number
+        /// of frames, which destroyed textures out from under materials still drawing with them and turned
+        /// surfaces permanently white -- permanently, because the identity is the content hash, so the
+        /// re-upload is suppressed by the runtime's tombstone set, and because the dedupe record was never
+        /// cleared so no re-upload was even attempted. Liveness here is a fact taken from OpenMW's own
+        /// resource lifetime rather than inferred from a clock.
+        ///
+        /// Order is enforced by counting. A content hash can be named by several images, so a texture is
+        /// destroyed only once the last image naming it is gone, and the materials referencing that hash --
+        /// through either their albedo or their normal slot -- are destroyed first, because a material
+        /// outliving its texture refers to nothing.
+        void releaseOrphanedTextures();
+
+        /// Gives up one cache entry's claim on its uploaded identity, without destroying anything.
+        ///
+        /// Separate from the destroy on purpose. Dropping the claim is safe at any point in a frame;
+        /// destroying is not, because re-creating a hash the runtime still has queued for destruction is
+        /// suppressed rather than honoured. So claims are released as soon as they are known to be dead and
+        /// the destroy is left to the end-of-frame sweep, which also gives a re-claim within the same frame
+        /// the chance to make the destroy unnecessary.
+        void releaseTextureClaim(const CachedTexture& cached);
 
         struct CachedLight
         {
@@ -411,14 +480,25 @@ namespace MWRender
         /// Keyed by texture hash combined with the alpha-test threshold, since those two are all that
         /// currently distinguish one material from another.
         std::unordered_map<unsigned long long, unsigned long long> mMaterials;
-        /// Material handle to the hash of its albedo texture.
-        ///
-        /// Needed because a mesh's identity is its geometry hash XOR its material's hash, and Remix's D3D9
-        /// path takes the latter to be the albedo texture hash alone. This host's material handle
-        /// deliberately is not that value -- it mixes in surface state so two materials sharing a texture
-        /// stay distinct -- so the texture hash has to be carried alongside rather than recovered from the
-        /// handle. Recomputing it at mesh build time is not an option: it hashes the whole mip 0.
-        std::unordered_map<unsigned long long, unsigned long long> mMaterialAlbedoHashes;
+        /// Every texture a material references.
+        struct MaterialTextures
+        {
+            /// Needed because a mesh's identity is its geometry hash XOR its material's hash, and Remix's
+            /// D3D9 path takes the latter to be the albedo texture hash alone. This host's material handle
+            /// deliberately is not that value -- it mixes in surface state so two materials sharing a
+            /// texture stay distinct -- so the texture hash has to be carried alongside rather than
+            /// recovered from the handle. Recomputing it at mesh build time is not an option: it hashes the
+            /// whole mip 0.
+            unsigned long long mAlbedo = 0;
+            /// Recorded solely so a release can find this material from either of its textures. Nothing
+            /// reads it for rendering. Without it the reverse lookup is incomplete in exactly the case a
+            /// texture pack makes common -- every normal map is a texture that live materials name and that
+            /// an albedo-only index cannot enumerate, so releasing one would strand a material on a
+            /// destroyed texture with no way to notice.
+            unsigned long long mNormal = 0;
+        };
+        /// Material handle to the textures it references.
+        std::unordered_map<unsigned long long, MaterialTextures> mMaterialAlbedoHashes;
 
         /// One texture's classified surface response, memoised so the classification runs once per texture
         /// rather than once per drawable per frame.
@@ -458,12 +538,64 @@ namespace MWRender
         unsigned int mLastLightCount = 0;
         unsigned int mTexturesUploaded = 0;
 
-        /// Identities already handed to CreateTexture, so the same content is never uploaded twice.
+        /// Identities already handed to CreateTexture, so the same content is never uploaded twice, mapped
+        /// to how many mTextures entries currently name each one.
         ///
         /// Separate from mTextures because that map is keyed per osg::Image and several images can share one
-        /// identity. Never evicted, for the same reason mTextures is not: the set is bounded by how many
-        /// distinct textures the game has.
-        std::unordered_set<unsigned long long> mUploadedTextures;
+        /// identity -- a mod shipping a copy of another's texture, or one file serving both genders of an
+        /// outfit. The count is what makes releasing safe: reaching zero is the only proof that no live
+        /// image still resolves to this identity, and therefore that destroying it cannot strand a surface.
+        ///
+        /// An entry must be erased when its texture is destroyed. Leaving it behind is not a leak but
+        /// something worse: the lookup above would report the content as already present, hand back a hash
+        /// the runtime no longer holds, and never attempt the upload that would fix it.
+        std::unordered_map<unsigned long long, unsigned int> mUploadedTextures;
+        /// Bytes resident per uploaded identity, and the running total.
+        ///
+        /// Counts exist for textures but said nothing about memory -- a 2048-square composite and a
+        /// 64-square icon incremented the same counter -- so a cache that was visibly growing could not be
+        /// weighed against video memory at all. Keyed by identity rather than by image so the dedupe path
+        /// does not count the same upload twice.
+        std::unordered_map<unsigned long long, std::size_t> mTextureBytes;
+        /// Triangles per mesh identity, for the submission budget below.
+        std::unordered_map<unsigned long long, unsigned int> mMeshPrimitives;
+        /// Triangles admitted so far this frame, and how many instances the budget turned away.
+        unsigned int mPrimitivesSubmitted = 0;
+        unsigned int mInstancesOverBudget = 0;
+        /// Ceiling on triangles submitted in one frame.
+        ///
+        /// The runtime indexes primitives in 26 bits, so 67,108,863 is a hard limit: past it the index wraps
+        /// and the NEE cache and prefix-sum lookups read whatever the wrapped value lands on. That is not an
+        /// artefact, it is a GPU reset -- measured at 143,278,765 triangles, 2.14x over, arriving as an
+        /// AppHangTransient with three nvlddmkm resets behind it.
+        ///
+        /// A ceiling rather than a better cull because the distribution defeats culling. Rejecting geometry
+        /// too small to resolve removed 3,000 drawables and 0.03% of the triangles: the count is concentrated
+        /// in a few thousand merged distant chunks that are large on screen and enormously dense, not in many
+        /// small objects. Those need decimated meshes to fix properly -- ObjectPaging already substitutes a
+        /// `_dist` variant on the distant path, and none are installed -- and until they exist this is what
+        /// keeps the frame submittable.
+        ///
+        /// Set below the limit rather than at it, because this counts what this traversal hands over and the
+        /// runtime adds its own replacement geometry on top.
+        static constexpr unsigned int kPrimitiveBudget = 56000000u;
+        /// Frame each identity's last claim was dropped, for identities nothing claims any more.
+        ///
+        /// A grace period, not bookkeeping. A material handle is derived deterministically from surface
+        /// state, so destroying a material and later rebuilding the identical surface produces the *same*
+        /// handle -- and a create sharing a handle with a destroy the runtime still has queued is suppressed
+        /// rather than honoured. Destroying the moment a claim reaches zero therefore risks handing back a
+        /// handle the runtime has quietly refused, which is most likely exactly where transient surfaces
+        /// churn fastest: GUI textures being freed and rebuilt as a menu is opened and closed.
+        ///
+        /// Waiting also makes most of those destroys unnecessary rather than merely safe. A surface that
+        /// comes straight back re-claims its identity within the window and is never destroyed at all.
+        std::unordered_map<unsigned long long, std::uint64_t> mOrphanedSince;
+        std::size_t mTextureBytesResident = 0;
+        std::size_t mTextureBytesPeak = 0;
+        /// Textures and materials released since the last report, for the per-frame log.
+        unsigned int mTexturesReleased = 0;
+        unsigned int mMaterialsReleased = 0;
 
         /// How many uploads were avoided because the content was already present.
         unsigned int mTexturesShared = 0;

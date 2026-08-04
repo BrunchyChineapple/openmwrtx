@@ -49,7 +49,19 @@ namespace
     /// Generous on purpose. Terrain repaging and object paging bring geometry in and out constantly, and
     /// destroying a mesh the moment it leaves view would mean recreating it as soon as the player turns
     /// around -- and recreation is the expensive direction, since the API has no update path.
-    constexpr std::uint64_t kMeshEvictionFrames = 600;
+    // Short, because nothing legitimate idles in this cache. Culling currently rejects nothing, so every
+    // drawable in a loaded cell is resubmitted every frame and its mesh is refreshed every frame. What does
+    // go idle is geometry from an unloaded cell, and animation: a drawable whose vertices change fails the
+    // identity memo's modified-count gate, re-hashes to a different hash, and gets a new mesh, because the
+    // runtime offers createMesh with no update counterpart. The superseded mesh is unreachable the moment
+    // its successor exists, so holding it for hundreds of frames retains one acceleration structure per
+    // animated drawable per frame -- the population grows as drawables times the window, which is why it
+    // compounded with every cell entered.
+    constexpr std::uint64_t kMeshEvictionFrames = 30;
+
+    /// Ceiling on destroyMesh calls in one frame. See evictStaleMeshes for why a ceiling is needed at all.
+    constexpr unsigned int kMeshDestroysPerFrame = 64;
+
 
     /// Most instances handed over in a single frame.
     ///
@@ -109,7 +121,12 @@ namespace
     /// An earlier value of twenty units was far too large, and the failure is instructive: a sphere light
     /// is a volume, so an emitter that big placed against a wall has part of itself on the far side, and
     /// light pours through solid geometry into the next room.
-    constexpr float kLightRadiusDefault = 0.6435f;
+    ///
+    /// Set to one unit rather than that reproduced 0.6435, chosen by eye against this build's lighting.
+    /// Keep it in step with the rtx.externalLight.radius default in the runtime's rtx_light_manager.h: this
+    /// value is published into that option at startup, so the two disagreeing only shows up as the
+    /// developer menu's slider sitting somewhere other than where the lighting actually is.
+    constexpr float kLightRadiusDefault = 1.0f;
 
     /// Floor for the emitter radius, whatever the menu or environment asks for.
     ///
@@ -174,13 +191,18 @@ namespace
     /// a different range from lights the runtime converts itself.
     constexpr float kLightEndValue = 0.01f;
 
-    /// Default for OPENMW_REMIX_LIGHT_INTENSITY, mirroring rtx.lightConversionIntensityFactor.
+    /// Default for OPENMW_REMIX_LIGHT_INTENSITY, and the value published into
+    /// rtx.externalLight.intensityFactor at startup.
     ///
     /// Duplicated rather than read back from the runtime because the API still exposes no getter for an
-    /// option, which means the two can drift. Kept at the same default so they agree until someone changes
-    /// one. Note this is not the same knob as rtx.externalLight.intensityFactor below: that one tunes these
-    /// lights and is live, this one only records what the runtime's own conversion path defaults to.
-    constexpr float kLightIntensityFactorDefault = 0.65f;
+    /// option, which means the two can drift. Keep it in step with the rtx.externalLight.intensityFactor
+    /// default in the runtime's rtx_light_manager.h.
+    ///
+    /// No longer tracks rtx.lightConversionIntensityFactor, which it was originally set to mirror. That
+    /// option applies only to lights the runtime converts from legacy D3D9 draws and cannot reach lights
+    /// created through the API, so tying this to it was misleading -- this is the exposure knob for this
+    /// build's own lights, tuned by eye.
+    constexpr float kLightIntensityFactorDefault = 2.5f;
 
     /// The attenuation value a legacy light is considered to have faded out at, 1/255.
     ///
@@ -703,6 +725,16 @@ namespace
                 if (parsed >= 0.0)
                     mCullMargin = static_cast<float>(parsed);
             }
+            // Same reasoning for the sub-pixel test: the threshold is a judgement about how small is too
+            // small to resolve, and the honest way to settle it is to look. Zero switches the test off, which
+            // is the control to compare against.
+            if (const char* value = std::getenv("OPENMW_REMIX_MIN_ANGULAR_RADIUS");
+                value != nullptr && *value != '\0')
+            {
+                const double parsed = std::atof(value);
+                if (parsed >= 0.0)
+                    mMinAngularRadius = static_cast<float>(parsed);
+            }
             // The traversal mask is the whole mask mechanism as far as this visitor is concerned. OSG
             // tests traversalMask & nodeMask in Node::accept, so a subgraph masked exclusively as GUI or
             // render-to-texture is excluded here, while ordinary geometry with the default all-bits mask
@@ -839,6 +871,35 @@ namespace
                     {
                         ++mCulled;
                         return;
+                    }
+
+                    // Then reject on apparent size. Being inside the frustum says nothing about being
+                    // visible: at a far plane of 81920 units most of the world projects to less than a pixel
+                    // while still carrying every one of its triangles into the acceleration structure. A
+                    // measured session reached 143,316,362 primitives against a hard ceiling of 67,108,863 --
+                    // past that the runtime's primitive index wraps, the NEE cache and prefix-sum lookups
+                    // read garbage, and the result is a GPU reset rather than a visual artefact. That is the
+                    // AppHangTransient plus nvlddmkm reset pair, not a crash.
+                    //
+                    // Compared as an angular radius so no viewport is needed: one pixel at 1440p across a 90
+                    // degree field is roughly 0.0014 radians, so the default threshold is a little over one
+                    // pixel of radius. Geometry that small cannot be told apart from the pixel it occupies,
+                    // which is what makes this free in a way that shortening the far plane is not -- the
+                    // silhouette of the distant landscape is unchanged, only objects too small to resolve
+                    // stop being traced.
+                    //
+                    // The cull margin is deliberately excluded from this test. It exists to retain
+                    // off-screen geometry for reflections, and something under a pixel contributes nothing
+                    // to a reflection either.
+                    if (mMinAngularRadius > 0.0f)
+                    {
+                        const float distance = (center - mEye).length();
+                        if (distance > 1.0f
+                            && static_cast<float>(local.radius() * scale) / distance < mMinAngularRadius)
+                        {
+                            ++mCulled;
+                            return;
+                        }
                     }
                 }
             }
@@ -1364,9 +1425,11 @@ namespace
             // No texture matrix goes with it. A composited chunk is drawn with a single UV set spanning the
             // chunk exactly once, so the composite is sampled 1:1 and the sub-quad tiling correction below
             // would be actively wrong here.
-            if (composite.mReadback != nullptr)
+            // Taken as a reference under the composite's lock. The image is published from the draw thread,
+            // and holding a reference is what stops its chunk releasing it out from under the upload below.
+            if (osg::ref_ptr<osg::Image> readback = composite.readback())
             {
-                surface.mExplicitImage = composite.mReadback.get();
+                surface.mExplicitImage = readback;
                 surface.mHasTexMat = false;
                 return;
             }
@@ -1503,6 +1566,12 @@ namespace
         /// the default keeps a wide band of off-screen geometry and still discards everything behind the
         /// camera, which is where most of the saving is. In OpenMW units, where a cell is 8192 across.
         float mCullMargin = 2048.0f;
+
+        /// Smallest angular radius a drawable may subtend before it is rejected as too small to resolve.
+        ///
+        /// Roughly one pixel of radius at 1440p across a 90 degree field. Raise it to cull harder, set it to
+        /// zero to switch the test off entirely as a control.
+        float mMinAngularRadius = 0.0015f;
 
         unsigned int mCulled = 0;
         std::vector<unsigned int> mCategoryStack;
@@ -1641,11 +1710,15 @@ namespace MWRender
         }
         mMaterials.clear();
         mMaterialAlbedoHashes.clear();
-        for (const auto& [key, cached] : mTextures)
-        {
-            if (cached.mUsable)
-                mRuntime.destroyTexture(cached.mHash);
-        }
+        // Walked by identity rather than by cache entry, because mTextures is keyed per image and several
+        // images can name one identity -- iterating it destroyed a shared texture once per image that
+        // referenced it. Harmless at process exit, but this loop is the obvious model for anyone adding a
+        // mid-session sweep, and there it would not be.
+        for (const auto& [hash, claims] : mUploadedTextures)
+            mRuntime.destroyTexture(hash);
+        mUploadedTextures.clear();
+        mTextureBytes.clear();
+        mTextureBytesResident = 0;
         mTextures.clear();
         if (mProbeMaterial != 0)
             mRuntime.destroyMaterial(mProbeMaterial);
@@ -1924,6 +1997,8 @@ namespace MWRender
         // every frame is 500 acceleration structure builds. Those are indistinguishable from the cache
         // size alone, and the difference is the dominant term in the frame.
         mMeshesCreated = 0;
+        mPrimitivesSubmitted = 0;
+        mInstancesOverBudget = 0;
         mSkinnedDropped = 0;
         mLastParticleCount = 0;
         mParticleInstances = 0;
@@ -2056,6 +2131,10 @@ namespace MWRender
         evictStaleMeshes();
         releaseStaleLights();
         releaseStaleParticleMeshes();
+        // Runs after the traversal, never during it. A destroy issued mid-traversal could be followed by a
+        // create of the same hash in the same frame, which the runtime's tombstone set suppresses rather
+        // than honours -- that is why the previous attempt at this turned surfaces permanently white.
+        releaseOrphanedTextures();
 
         // Log the first submission, and then again whenever the scene goes from empty to populated or
         // back. A one-shot on frame 1 was actively misleading: the first frame happens before the world
@@ -2080,6 +2159,22 @@ namespace MWRender
                              << " drawables outside the frustum were culled, and " << mSkinnedDropped
                              << " skins were not ready; " << mLastParticleCount << " particles from "
                              << mParticleMeshes.size() << " systems"
+                             // Bytes, not counts. A count could not be weighed against video memory at all:
+                             // one 2048-square terrain composite is 16.8 MB and an icon is a few kilobytes,
+                             // and both moved this number by one. Resident is what the runtime is holding
+                             // now; peak is the high-water mark, so the two diverging is the proof that
+                             // release is working rather than merely that growth has slowed.
+                             << "; textures resident " << (mTextureBytesResident >> 20) << " MiB (peak "
+                             << (mTextureBytesPeak >> 20) << " MiB) over " << mUploadedTextures.size()
+                             << " identities, " << mTexturesReleased << " released and " << mMaterialsReleased
+                             << " materials with them"
+                             // The number that decides whether the runtime's 26-bit primitive index holds.
+                             // Instances turned away being non-zero means the budget is binding and geometry
+                             // is missing from the frame; it staying zero means the scene fits and this cost
+                             // nothing.
+                             << "; " << mPrimitivesSubmitted << " triangles submitted of "
+                             << kPrimitiveBudget << " budgeted, " << mInstancesOverBudget
+                             << " instances turned away"
                              << "; camera eye " << eye.x() << ", " << eye.y()
                              << ", " << eye.z() << " looking " << forward.x() << ", " << forward.y()
                              << ", " << forward.z() << " up " << up.x() << ", " << up.y() << ", "
@@ -2115,11 +2210,43 @@ namespace MWRender
         const unsigned long long key
             = (reinterpret_cast<unsigned long long>(&image) << 1) | (colour ? 1ull : 0ull);
         if (auto found = mTextures.find(key); found != mTextures.end())
-            return found->second.mUsable ? found->second.mHash : 0ull;
+        {
+            // A hit is only trustworthy if this entry was built from the image in hand. The key is the
+            // image's address, and OpenMW reuses addresses once it frees an image, so a hit can be a new
+            // image wearing a dead one's address -- which would silently return the previous image's
+            // texture. Nothing caught this before because nothing was ever released, so the dead entry
+            // stayed correct for as long as it existed.
+            osg::ref_ptr<const osg::Image> alive;
+            if (!found->second.mImage.lock(alive) || alive.get() != &image)
+            {
+                // Give up this entry's claim on the identity, but do not destroy anything here. The sweep at
+                // the end of the frame destroys identities nothing claims, which matters: if this new image
+                // holds the same content, the branch below re-claims the identity and the destroy correctly
+                // never happens. Destroying mid-frame and re-creating the same hash immediately afterwards
+                // is the pattern the runtime's tombstone set turns into a permanently missing texture.
+                releaseTextureClaim(found->second);
+                mTextures.erase(found);
+            }
+            else
+            {
+                // Stamped on every hit, so "unused" means no drawable resolved this texture recently rather
+                // than merely that it was uploaded a while ago. This runs per drawable per frame, hence the
+                // stamp going inside the existing lookup rather than adding a second one.
+                found->second.mLastUsedFrame = mFrame;
+                return found->second.mUsable ? found->second.mHash : 0ull;
+            }
+        }
 
         // Cached even on failure, so an unsupported format is diagnosed once rather than per drawable
         // per frame. Written before every early return below.
         CachedTexture cached;
+        // Stamped here so it applies to every path below, including the negative results cached for
+        // unusable formats. A texture uploaded this frame must not be eligible for eviction immediately.
+        cached.mLastUsedFrame = mFrame;
+        // Recorded on every path for the same reason, and observed rather than held so that caching an
+        // image does not extend its life. This is what release is decided on: OpenMW freeing the image is
+        // the only dependable evidence that the entry is garbage.
+        cached.mImage = &image;
 
         const int width = image.s();
         const int height = image.t();
@@ -2362,10 +2489,18 @@ namespace MWRender
         // copy of another mod's texture, or one texture serving both genders of an outfit. Collapsing those
         // is correct rather than merely tolerable: Remix hashes pixels for D3D9 games too, so a replacement
         // authored against one of them is meant to apply to the other.
-        if (mUploadedTextures.find(hash) != mUploadedTextures.end())
+        if (auto shared = mUploadedTextures.find(hash); shared != mUploadedTextures.end())
         {
+            // One more image naming this identity. Counted, because the count is what release is gated on:
+            // the identity must outlive every image that resolves to it, not just the first.
+            ++shared->second;
+            // Re-claimed inside its grace window, so the pending destroy is cancelled outright. This is the
+            // case the window exists for: a surface that goes away and comes straight back never pays for a
+            // destroy and a re-upload, and never risks a create being refused for sharing a queued handle.
+            mOrphanedSince.erase(hash);
             cached.mHash = hash;
             cached.mUsable = true;
+            // Left at zero: this entry added no memory, so releasing it must subtract none.
             mTextures.emplace(key, cached);
             ++mTexturesShared;
             return hash;
@@ -2378,10 +2513,16 @@ namespace MWRender
             mTextures.emplace(key, cached);
             return 0;
         }
-        mUploadedTextures.insert(hash);
+        // First image to name this identity, so the count starts at one and the bytes are charged here --
+        // once per upload rather than once per image, which is why the total is keyed by identity.
+        mUploadedTextures.emplace(hash, 1u);
+        mTextureBytes[hash] = static_cast<std::size_t>(uploadSize);
+        mTextureBytesResident += static_cast<std::size_t>(uploadSize);
+        mTextureBytesPeak = std::max(mTextureBytesPeak, mTextureBytesResident);
 
         cached.mHash = hash;
         cached.mUsable = true;
+        cached.mBytes = static_cast<std::size_t>(uploadSize);
         mTextures.emplace(key, cached);
         ++mTexturesUploaded;
 
@@ -2431,7 +2572,7 @@ namespace MWRender
 
         // An explicitly supplied image wins. Composited terrain arrives this way because its albedo only
         // ever existed as a render target; mTexture for those chunks is that target and has no image.
-        const osg::Image* image = surface.mExplicitImage;
+        const osg::Image* image = surface.mExplicitImage.get();
         if (image == nullptr)
         {
             if (surface.mTexture == nullptr)
@@ -2572,7 +2713,10 @@ namespace MWRender
 
         mMaterials.emplace(key, handle);
         // Recorded for the mesh hash, which XORs the albedo texture hash the way Remix's D3D9 path does.
-        mMaterialAlbedoHashes[handle] = textureHash;
+        // The normal hash is recorded alongside purely so a release can find this material from either
+        // texture. An albedo-only index cannot enumerate the materials that name a normal map, so releasing
+        // one would leave a live material pointing at a destroyed texture with nothing to detect it.
+        mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash };
         return handle;
     }
 
@@ -2580,6 +2724,19 @@ namespace MWRender
         unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig,
         unsigned int pickingValue)
     {
+        // Weighed against the frame's triangle budget before anything is handed over. Unknown identities --
+        // particle meshes, the probe quad -- are admitted unweighed: they are individually tiny and the point
+        // of this is the merged distant chunks, which are always in the map because this traversal built them.
+        if (const auto primitives = mMeshPrimitives.find(mesh); primitives != mMeshPrimitives.end())
+        {
+            if (mPrimitivesSubmitted + primitives->second > kPrimitiveBudget)
+            {
+                ++mInstancesOverBudget;
+                return;
+            }
+            mPrimitivesSubmitted += primitives->second;
+        }
+
         if (rig == nullptr)
         {
             mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided, nullptr, 0, pickingValue);
@@ -2725,6 +2882,12 @@ namespace MWRender
 
         // Hashed from the address and the frame, because the handle *is* the hash: reusing one while the
         // previous mesh is still queued for destruction would alias the two.
+        //
+        // Holding this hash stable across frames was tried, on the theory that creating under a live hash is
+        // an in-place update the way it is for lights. It is not, for meshes: the runtime keeps the original
+        // contents and ignores the new ones, so every particle system froze on the geometry it had when it
+        // was first seen -- fires and torch flames stopped moving. Whatever the per-frame cost of rebuilding
+        // these, it cannot be avoided this way.
         const unsigned long long hash
             = ((reinterpret_cast<unsigned long long>(key) * 0x9E3779B97F4A7C15ull) ^ (mFrame << 1)) | 1ull;
         ++mMeshesCreated;
@@ -2738,7 +2901,40 @@ namespace MWRender
         entry.mHandle = mesh;
         entry.mMaterial = material;
         entry.mLastUsedFrame = mFrame;
-        mParticleMeshes.emplace(key, entry);
+
+        // Retire the previous frame's mesh for this system, then record the new one.
+        //
+        // emplace() was silently doing nothing here. The key is the system's address, which is the same
+        // every frame, so from the second frame onward the insert failed and the map kept last frame's
+        // handle with last frame's timestamp. releaseStaleParticleMeshes then found that timestamp stale,
+        // destroyed the old handle and erased the key -- leaving the mesh created *this* frame untracked
+        // and therefore never destroyed. The pattern alternated, so almost exactly half of every frame's
+        // particle meshes leaked inside the runtime: around 45 a frame, a thousand a second, each holding
+        // vertex and index buffers and an acceleration structure.
+        //
+        // It was invisible in the scene accounting because particle meshes are counted here, not in
+        // mMeshes, so the cached-mesh figure looked healthy while GPU memory drained. The symptom was a
+        // fifteen second stall and VK_ERROR_DEVICE_LOST after a few minutes or a few cell changes,
+        // whichever came first.
+        //
+        // The handle now comes back identical every frame, because the hash is stable and the handle is the
+        // hash, so the guard below finds nothing to retire and the entry is simply restamped. That is the
+        // whole point: the destroy that used to run here every frame for every system is gone, and with it
+        // the queued-destruction traffic that made a stable hash unusable in the first place.
+        //
+        // The destroy is kept for the case that still needs it -- a handle that genuinely changed, meaning
+        // the runtime issued a different one rather than updating the mesh in place. Retiring the old one
+        // then is correct and cannot tombstone the new one, since the two differ.
+        if (auto existing = mParticleMeshes.find(key); existing != mParticleMeshes.end())
+        {
+            if (existing->second.mHandle != mesh)
+                mRuntime.destroyMesh(existing->second.mHandle);
+            existing->second = entry;
+        }
+        else
+        {
+            mParticleMeshes.emplace(key, entry);
+        }
 
         // Identity transform: the quads were built in world space, both so that the camera basis could be
         // used directly and because world-space particle systems have no node transform to apply anyway.
@@ -2753,6 +2949,115 @@ namespace MWRender
         mRuntime.drawInstance(
             mesh, identity, categoryFlags, true, nullptr, 0, kMaxInstancesPerFrame + mParticleInstances);
         mLastParticleCount += static_cast<unsigned int>(mVertexScratch.size() / 4);
+    }
+
+    void RemixScene::releaseTextureClaim(const CachedTexture& cached)
+    {
+        if (!cached.mUsable || cached.mHash == 0)
+            return;
+
+        const auto claimed = mUploadedTextures.find(cached.mHash);
+        if (claimed != mUploadedTextures.end() && claimed->second > 0)
+            --claimed->second;
+    }
+
+    void RemixScene::releaseOrphanedTextures()
+    {
+        // Pass one: drop the claims of entries whose image OpenMW has freed. No destroys here, so a cell
+        // that pages back in during this same frame can re-claim its identities and pay nothing.
+        for (auto it = mTextures.begin(); it != mTextures.end();)
+        {
+            if (it->second.mImage.valid())
+            {
+                ++it;
+                continue;
+            }
+
+            const unsigned long long orphaned = it->second.mUsable ? it->second.mHash : 0ull;
+            releaseTextureClaim(it->second);
+            it = mTextures.erase(it);
+
+            // Start the clock the first time an identity is left unclaimed. Recorded here rather than in
+            // pass two so the window is measured from when the last image actually went away.
+            if (orphaned != 0)
+            {
+                if (const auto claimed = mUploadedTextures.find(orphaned);
+                    claimed != mUploadedTextures.end() && claimed->second == 0)
+                {
+                    mOrphanedSince.emplace(orphaned, mFrame);
+                }
+            }
+        }
+
+        // Pass two: destroy the identities nothing claims any more, newest work first budgeted. Reaching a
+        // count of zero is the whole safety argument -- it means no live image resolves to this identity, so
+        // no live surface can be drawing with it and no lookup can produce it again without re-uploading.
+        unsigned int destroyed = 0;
+        for (auto it = mUploadedTextures.begin();
+             it != mUploadedTextures.end() && destroyed < kTextureDestroysPerFrame;)
+        {
+            if (it->second > 0)
+            {
+                ++it;
+                continue;
+            }
+
+            // Unclaimed, but not yet for long enough. Destroying now would risk the runtime refusing a later
+            // create that shares the handle, and would throw away an identity a returning surface is about
+            // to ask for again.
+            const auto since = mOrphanedSince.find(it->first);
+            if (since == mOrphanedSince.end() || mFrame - since->second < kTextureGraceFrames)
+            {
+                ++it;
+                continue;
+            }
+
+            const unsigned long long hash = it->first;
+
+            // Materials naming this texture go first, through either slot, or they would be left pointing at
+            // a texture that no longer exists. mMaterials is keyed by surface state rather than by handle, so
+            // it has to be searched by value; mDefaultMaterial is deliberately never matched here because it
+            // is stored as the value for every material the runtime refused, and destroying it mid-session
+            // would take every one of those surfaces with it.
+            for (auto mat = mMaterialAlbedoHashes.begin(); mat != mMaterialAlbedoHashes.end();)
+            {
+                if (mat->second.mAlbedo != hash && mat->second.mNormal != hash)
+                {
+                    ++mat;
+                    continue;
+                }
+
+                const unsigned long long handle = mat->first;
+                if (handle == mDefaultMaterial)
+                {
+                    ++mat;
+                    continue;
+                }
+
+                for (auto key = mMaterials.begin(); key != mMaterials.end();)
+                    key = (key->second == handle) ? mMaterials.erase(key) : std::next(key);
+
+                mRuntime.destroyMaterial(handle);
+                mat = mMaterialAlbedoHashes.erase(mat);
+                ++mMaterialsReleased;
+            }
+
+            mRuntime.destroyTexture(hash);
+
+            if (const auto bytes = mTextureBytes.find(hash); bytes != mTextureBytes.end())
+            {
+                mTextureBytesResident -= std::min(mTextureBytesResident, bytes->second);
+                mTextureBytes.erase(bytes);
+            }
+
+            // Erased in the same breath as the destroy. Leaving it would be worse than a leak: the upload
+            // path would report this content as already present, hand back a hash the runtime no longer
+            // holds, and never attempt the re-upload that would put it right.
+            it = mUploadedTextures.erase(it);
+            mOrphanedSince.erase(hash);
+            ++mTexturesReleased;
+            ++destroyed;
+        }
     }
 
     void RemixScene::releaseStaleParticleMeshes()
@@ -3001,7 +3306,7 @@ namespace MWRender
         {
             const auto albedo = mMaterialAlbedoHashes.find(material);
             hash = RemixRT::AssetHash::avoidZero(
-                geometryHash ^ (albedo != mMaterialAlbedoHashes.end() ? albedo->second : 0ull));
+                geometryHash ^ (albedo != mMaterialAlbedoHashes.end() ? albedo->second.mAlbedo : 0ull));
         }
         else
         {
@@ -3132,7 +3437,28 @@ namespace MWRender
             skinning.mBoneIndices = mBoneIndexScratch.data();
         }
 
+        // Bounded per frame for a different reason than destroys are. This is not a startup cost that
+        // settles once a cell is resident: animated geometry fails the identity memo's modified-count gate
+        // every frame, re-hashes to a new identity every frame, and arrives here every frame. So this is a
+        // standing workload of one acceleration structure build per animated drawable per frame -- measured
+        // at a mean of 124 builds a frame against 152 skinned instances, roughly 3100 builds a second with
+        // no end. A device that cannot retire that fails its fence sync, which is reported as a bare
+        // device loss with no fault behind it, because nothing invalid happened; the work simply never
+        // finished.
+        //
+        // Deferring costs the overflow one frame of freshness. Nothing is destroyed, no memo is written,
+        // and the next frame retries, so the visible effect is that new geometry appears a frame or two
+        // late and animation updates at a reduced rate while under load.
+        //
+        // This bounds a symptom. The standing cost exists because rigged geometry submits OpenMW's
+        // CPU-deformed vertices while also submitting bone weights for the runtime to skin -- so the
+        // content hash moves every frame even though the runtime is being handed everything it needs to
+        // skin a static bind pose itself. Submitting the source pose makes the hash stable, the memo hit,
+        // and this ceiling unnecessary.
         ++mMeshesCreated;
+        // Recorded so the submission budget can weigh an instance without re-deriving its geometry. Keyed by
+        // identity, which is also the handle the runtime returns, so the submit path can look it up.
+        mMeshPrimitives[hash] = static_cast<unsigned int>(mIndexScratch.size() / 3);
         const unsigned long long handle = mRuntime.createMesh(hash, mVertexScratch.data(), vertexCount,
             mIndexScratch.data(), static_cast<unsigned int>(mIndexScratch.size()), material,
             skinning.mBonesPerVertex > 0 ? &skinning : nullptr);
@@ -3168,18 +3494,34 @@ namespace MWRender
         if (mFrame < kMeshEvictionFrames)
             return;
 
-        for (auto it = mMeshes.begin(); it != mMeshes.end();)
+        // Destroys are budgeted per frame because staleness arrives in a herd rather than a trickle. Every
+        // mesh a cell contributed stops being submitted on the same frame that cell unloads, so they all
+        // fall due together kMeshEvictionFrames later -- thousands of them, on one frame. Each destroyMesh
+        // releases an acceleration structure, and releasing thousands without submitting a frame in between
+        // stalls the device long enough for the watchdog to reset it, which arrives as a bare
+        // VK_ERROR_DEVICE_LOST with nothing logged ahead of it. Spreading the same work across consecutive
+        // frames retires the herd in comparable wall time while leaving every individual frame presentable.
+        unsigned int destroyed = 0;
+        for (auto it = mMeshes.begin(); it != mMeshes.end() && destroyed < kMeshDestroysPerFrame;)
         {
             if (mFrame - it->second.mLastUsedFrame > kMeshEvictionFrames)
             {
                 mRuntime.destroyMesh(it->second.mHandle);
+                mMeshPrimitives.erase(it->first);
                 it = mMeshes.erase(it);
+                ++destroyed;
             }
             else
             {
                 ++it;
             }
         }
+
+        // Logged only while the budget is saturated, which is the state worth knowing about: a backlog is
+        // draining, and its size is the number this was silently doing in one frame before.
+        if (destroyed == kMeshDestroysPerFrame && mFrame % 30 == 0)
+            Log(Debug::Info) << "Remix scene: retiring stale meshes at the " << kMeshDestroysPerFrame
+                             << "-per-frame budget; " << mMeshes.size() << " still cached.";
 
         // The identity memos are evicted on the same schedule rather than alongside their mesh, because
         // the mapping is many-to-one now: several geometries can name the same mesh, so a mesh going away
