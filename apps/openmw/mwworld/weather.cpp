@@ -835,16 +835,14 @@ namespace MWWorld
         else
             mNightDayMode = Default;
 
-        if (!isExterior)
-        {
-            mRendering.setSkyEnabled(false);
-            stopSounds();
-            mWindSpeed = 0.f;
-            mCurrentWindSpeed = 0.f;
-            mNextWindSpeed = 0.f;
-            return;
-        }
-
+        // No longer returns early for interiors. The simulation runs in every cell so the sky, the sun and
+        // both moons follow world time wherever the player is, and so weather carries across a doorway
+        // instead of being suspended and resumed.
+        //
+        // Weather continuity indoors falls out of this rather than needing to be arranged: the region lookup
+        // above is keyed on the cell's region, a true interior usually declares none, the lookup misses, no
+        // transition is queued, and the weather simply stays as whatever it was outside. Time is global
+        // already, so sun and moon positions need nothing at all.
         calculateWeatherResult(time.getHour(), duration, paused);
 
         if (!paused)
@@ -852,6 +850,24 @@ namespace MWWorld
             mWindSpeed = mResult.mWindSpeed;
             mCurrentWindSpeed = mResult.mCurrentWindSpeed;
             mNextWindSpeed = mResult.mNextWindSpeed;
+        }
+
+        // What does not carry indoors is the part of weather that only means anything under open air.
+        // Precipitation would fall through a ceiling, and an ambient wind or rain loop would play over a room
+        // that cannot hear it. Cleared here, at the one point between the simulation and everything that
+        // reads it, so the sky submission, both audio paths and the gameplay flags below all see nothing to
+        // do rather than each needing its own interior test.
+        //
+        // Deliberately narrower than the early return this replaces: sun, moons, clouds, fog, ambient and sun
+        // colour all still apply, which is the whole point. Interiors with a sightline out get a real sky and
+        // the light that comes with it; sealed ones get the lighting without rain indoors.
+        if (!isExterior)
+        {
+            mResult.mParticleEffect.clear();
+            mResult.mRainEffect.clear();
+            mResult.mAmbientLoopSoundID = ESM::RefId();
+            mResult.mRainLoopSoundID = ESM::RefId();
+            mResult.mIsStorm = false;
         }
 
         mIsStorm = mResult.mIsStorm;

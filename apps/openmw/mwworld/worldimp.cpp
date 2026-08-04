@@ -177,12 +177,22 @@ namespace MWWorld
 
     void World::adjustSky()
     {
-        if (mSky && (isCellExterior() || isCellQuasiExterior()))
-        {
-            mRendering->setSkyEnabled(true);
-        }
-        else
-            mRendering->setSkyEnabled(false);
+        // Every cell gets the sky, interiors included. Vanilla gates this on the cell being an exterior or a
+        // quasi-exterior, which is right for Morrowind's own art -- a sealed interior has no sightline out,
+        // so a sky behind it would only be lighting a room from something nothing can see. Two things make
+        // it wrong here.
+        //
+        // The Interiors Project puts distant land inside interiors to fake a seamless world, so those cells
+        // do have sightlines out and need something behind them. And under path tracing the sky is not a
+        // backdrop, it is the scene's dominant area light: switching it off indoors removes the source every
+        // material response was tuned against, which is why interiors read flat rather than merely skyless.
+        //
+        // Quasi-exterior was the flag Morrowind used to opt individual large interiors back in -- Vivec's
+        // cantons, Mournhold -- and it is what the MGE-XE build leaned on for the same purpose. Answering
+        // unconditionally supersedes that mechanism rather than fighting it, since a quasi-exterior cell was
+        // already answering true. It also explains why Mournhold showed no sky here while other interiors
+        // did: nothing was flagged on this side.
+        mRendering->setSkyEnabled(mSky);
     }
 
     World::World(Resource::ResourceSystem* resourceSystem, int activationDistanceOverride, const std::string& startCell,

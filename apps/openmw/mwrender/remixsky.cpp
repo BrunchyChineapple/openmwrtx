@@ -133,42 +133,34 @@ namespace MWRender
                    "them.";
         }
 
-        // Interiors, and cells that only behave as interiors, are gated rather than simply left alone.
+        // The atmosphere runs in every cell, interiors included. There is deliberately no interior branch
+        // here any more.
         //
-        // Doing nothing is not neutral. The sun keeps whatever elevation it had on the last exterior
-        // frame, and Remix's atmosphere goes on lighting from it, so a high afternoon sun bleeds through
-        // every crack and seam in an interior cell. Morrowind's interiors are not sealed volumes -- they
-        // are assembled from pieces with gaps -- so this is immediately visible rather than theoretical.
-        if (!exterior)
-        {
-            pushFloat("rtx.atmosphere.sunElevation", -90.0f, mSunElevation);
-            pushFloat("rtx.atmosphere.sunIntensity", 0.0f, mSunIntensity);
-            pushFloat("rtx.atmosphere.starBrightness", 0.0f, mStarBrightness);
-            pushFloat("rtx.atmosphere.nightSkyBrightness", 0.0f, mNightSkyBrightness);
-            pushBool("rtx.atmosphere.cloudEnabled", false, mCloudEnabled);
-            pushBool("rtx.atmosphere.moon0.enabled0", false, mMoonEnabled[0]);
-            pushBool("rtx.atmosphere.moon1.enabled1", false, mMoonEnabled[1]);
+        // What was here drove the sun to -90 degrees elevation at zero intensity, zeroed the stars and the
+        // night sky, switched off the clouds and both moons, thinned the fog medium to nothing and parked
+        // the weather blender. That was carried over from the MGE-XE build, where it earned its place: a
+        // sun left at its last exterior elevation goes on lighting through every crack and seam, and
+        // Morrowind's interiors are assembled from pieces rather than sealed volumes, so the leak was
+        // immediately visible.
+        //
+        // Three things changed. This engine's occlusion is good enough that the leak is no longer the
+        // dominant artefact it was there. The Interiors Project places distant land inside interiors to
+        // fake a seamless world, so those cells need a real sky behind that geometry rather than a black
+        // void. And under path tracing the sky is the scene's dominant area light, not a backdrop -- with
+        // it switched off, an interior is lit only by whatever point lights the cell happens to carry,
+        // which is why interiors read as flat and stage-lit and why the material response looked wrong
+        // indoors.
+        //
+        // It also explains Mournhold showing no sky while some other interiors did. Morrowind's
+        // quasi-exterior flag is what opted individual large interiors back in, and the MGE-XE build
+        // relied on that flag being set on its side; nothing sets it here, so every interior took this
+        // branch regardless of size or whether it had a sightline out.
+        //
+        // The parameter is retained rather than removed so the caller and the sky state it passes stay
+        // untouched, but nothing reads it now. It should come out of the signature on a tidying pass.
+        static_cast<void>(exterior);
 
-            // Fog is cleared by thinning the medium, not by switching volumetrics off.
-            // rtx.volumetrics.enable is flagged UserSetting -- it is the player's quality choice and
-            // appears in the user menu -- so writing it here would both override their preference and
-            // persist ours into their config. A measurement distance this long is the same statement made
-            // in the medium's own terms and leaves the feature under their control.
-            pushFloat("rtx.volumetrics.transmittanceMeasurementDistanceMeters", 100000.0f, mFogDistance);
-
-            // Park the blender. Left pointed at an exterior preset it keeps interpolating and writing its
-            // blended values, which would overwrite the gating above from underneath.
-            if (mWeatherTarget != -1)
-            {
-                mWeatherTarget = -1;
-                mRuntime.setGameValue("__weather.target", "");
-            }
-            mExterior = 0;
-            return;
-        }
-
-        // Coming back outside has to restore what the interior branch drove down. The sun's own position
-        // is written below; these are the switches that branch turned off.
+        // Runs once, and now only to establish the initial state rather than to undo an interior branch.
         if (mExterior != 1)
         {
             mExterior = 1;
