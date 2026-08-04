@@ -131,7 +131,7 @@ namespace Terrain
             // Bound again as READ_FRAMEBUFFER because apply() above bound it for drawing only, and
             // glReadPixels reads from the read binding. Reading a colour attachment that was just rendered
             // into needs no explicit barrier in GL -- the pipeline orders it.
-            if (CompositeMap::sReadbackEnabled && compositeMap.mReadback == nullptr)
+            if (CompositeMap::sReadbackEnabled && compositeMap.readback() == nullptr)
             {
                 const int width = compositeMap.mTexture->getTextureWidth();
                 const int height = compositeMap.mTexture->getTextureHeight();
@@ -162,7 +162,10 @@ namespace Terrain
                     // Named so a consumer can tell chunks apart in a log, and so the texture identity
                     // derived from it is stable for a given chunk rather than depending on load order.
                     image->setFileName("terrain_composite");
-                    compositeMap.mReadback = image;
+                    // Published last, under the lock, after the pixels are in. Ordering matters as much as
+                    // the mutual exclusion: the consumer must not be able to see this pointer before it can
+                    // see the data glReadPixels just wrote.
+                    compositeMap.setReadback(std::move(image));
                 }
             }
 

@@ -47,7 +47,35 @@ namespace Terrain
         /// blend maps, and the half-texel nudge material.cpp applies to match vanilla.
         ///
         /// Null until composited, and null entirely unless sReadbackEnabled -- see there for the cost.
+        ///
+        /// Published from the draw thread and consumed from the thread that submits the scene, so both ends
+        /// go through readback() rather than touching this directly. OpenMW never calls setThreadingModel,
+        /// which leaves osgViewer on AutomaticSelection and gives a separate draw thread on any machine with
+        /// cores to spare -- so this is a genuine cross-thread handoff, not a formality. A ref_ptr assignment
+        /// is neither atomic nor ordered, so a reader could see a torn pointer, or a pointer whose pixels are
+        /// not yet visible to it.
         osg::ref_ptr<osg::Image> mReadback;
+
+        /// Guards mReadback for the handoff described above.
+        mutable std::mutex mReadbackMutex;
+
+        /// A strong reference to the readback image, or null.
+        ///
+        /// Returns a reference rather than a raw pointer deliberately. The consumer holds the result across a
+        /// texture upload, and this image belongs to a chunk that can be released as the player moves, so a
+        /// bare pointer is a use-after-free waiting for the timing to line up.
+        osg::ref_ptr<osg::Image> readback() const
+        {
+            std::lock_guard<std::mutex> lock(mReadbackMutex);
+            return mReadback;
+        }
+
+        /// Publishes the readback image. Draw thread only.
+        void setReadback(osg::ref_ptr<osg::Image> image)
+        {
+            std::lock_guard<std::mutex> lock(mReadbackMutex);
+            mReadback = std::move(image);
+        }
 
         /// Whether composited maps are copied back to the CPU.
         ///
