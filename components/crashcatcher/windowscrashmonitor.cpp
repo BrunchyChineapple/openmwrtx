@@ -328,7 +328,14 @@ namespace Crash
     void CrashMonitor::showFreezeMessageBox()
     {
         std::thread messageBoxThread([&]() {
-            SDL_MessageBoxButtonData button = { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Abort" };
+            // Not the return-key default, deliberately. This is a one-button dialog whose button runs
+            // TerminateProcess on the game, and it appears whenever the main window stops answering messages
+            // for long enough -- which under a path-traced renderer is a routine cell load, not a fault. With
+            // Enter bound to it, any keypress that lands while it has focus kills the session outright, and
+            // the freeze it was reporting would have cleared on its own a moment later. The box still says
+            // "OpenMW may unfreeze if you wait", and it still closes itself when the app answers again; this
+            // only stops the keyboard from making that decision by accident.
+            SDL_MessageBoxButtonData button = { 0, 0, "Abort" };
             SDL_MessageBoxData messageBoxData = { SDL_MESSAGEBOX_ERROR, nullptr, "OpenMW has frozen",
                 "OpenMW has frozen. This should never happen. Press Abort to terminate it and generate a crash dump to "
                 "help diagnose the problem.\nOpenMW may unfreeze if you wait, and this message box will disappear "
