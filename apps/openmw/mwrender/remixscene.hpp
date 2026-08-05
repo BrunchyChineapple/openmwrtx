@@ -323,6 +323,22 @@ namespace MWRender
             std::size_t mBytes = 0;
         };
 
+        /// Whether identities are computed the way Remix's D3D9 path would, so that a replacement pack
+        /// authored against a Morrowind capture binds to geometry submitted here.
+        ///
+        /// This is the whole emulation, not one piece of it: mesh identity reproduces Remix's D3D9 geometry
+        /// hash XORed with the albedo texture hash, and texture identity reproduces Remix's D3D9 texture
+        /// hash so that a pack's mat_ overrides attach. OPENMW_REMIX_PACK_MATCH=0 turns both off together
+        /// and replaces them with identities that are merely stable and distinct, which nothing authored
+        /// against a Morrowind capture can match.
+        ///
+        /// Everything else is untouched. Remix still renders, replacement assets are still loaded and still
+        /// able to bind, and the mod layer is still consulted -- what changes is only which identity a
+        /// surface is offered under. That distinction matters because it makes this the mode an offline
+        /// converter targets: a pack re-keyed to the identities this produces binds with the emulation off,
+        /// and the emulation can then be deleted rather than merely disabled.
+        bool mPackMatching = true;
+
         /// Ceiling on texture destroys in one frame.
         ///
         /// Textures and their materials were never released during play, so a session accumulated every

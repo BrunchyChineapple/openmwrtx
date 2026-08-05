@@ -1650,6 +1650,17 @@ namespace MWRender
                                                 "shows hard edges where chunks pick different layers "
                                                 "(OPENMW_REMIX_TERRAIN_COMPOSITE=1 to compare)");
 
+        // Logged rather than silent because it changes what a capture contains and what binds. Two captures
+        // of the same cell are only comparable if it is recorded which mode each was taken in.
+        mPackMatching = envFlag("OPENMW_REMIX_PACK_MATCH", true);
+        Log(Debug::Info) << "Remix scene: identities use "
+                         << (mPackMatching
+                                 ? "Remix's D3D9 formulation for both meshes and textures, so a pack "
+                                   "authored against a Morrowind capture can bind"
+                                 : "native stable identities -- PACK MATCHING OFF, nothing authored against "
+                                   "a Morrowind capture can bind, though Remix and replacement loading are "
+                                   "unaffected (OPENMW_REMIX_PACK_MATCH=1 to restore)");
+
         mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", kLightRadiusDefault);
         mLightIntensityFactor
             = envFloat("OPENMW_REMIX_LIGHT_INTENSITY", kLightIntensityFactorDefault);
@@ -2439,7 +2450,7 @@ namespace MWRender
         // legitimately different textures: one image bound as sRGB albedo and as a linear normal map must
         // not collapse to a single entry, which is the distinction the old cache key spent its low bit on.
         unsigned long long hash = 0;
-        if (colour && mip0Size != 0)
+        if (mPackMatching && colour && mip0Size != 0)
         {
             // Exactly what Remix computes for a game texture: XXH3 over mip 0 alone, nothing folded in.
             // See D3D9CommonTexture::SetupForRtxFrom, which hashes the staging buffer of subresource 0.
@@ -3299,9 +3310,14 @@ namespace MWRender
         // The real causes were a 16-bit index buffer and an opposite triangle winding, both handled in
         // d3d9Geometry and neither visible from the runtime source alone.
         unsigned long long hash = 0;
-        const unsigned long long geometryHash = RemixRT::AssetHash::d3d9Geometry(mVertexScratch.data(),
-            sizeof(RemixRT::Runtime::Vertex), vertexCount, mIndexScratch.data(),
-            static_cast<unsigned int>(mIndexScratch.size()));
+        // Half of what OPENMW_REMIX_PACK_MATCH=0 switches off; the texture identity in textureFor is the
+        // other half. With it off this falls through to the content-hash branch below, which no pack entry
+        // can match. Textures and materials are still uploaded and the scene still renders -- only the
+        // identity a surface is offered under changes.
+        const unsigned long long geometryHash = mPackMatching
+            ? RemixRT::AssetHash::d3d9Geometry(mVertexScratch.data(), sizeof(RemixRT::Runtime::Vertex),
+                vertexCount, mIndexScratch.data(), static_cast<unsigned int>(mIndexScratch.size()))
+            : 0ull;
         if (geometryHash != 0)
         {
             const auto albedo = mMaterialAlbedoHashes.find(material);
