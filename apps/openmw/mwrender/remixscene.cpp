@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -320,7 +321,16 @@ namespace
     ///
     /// Zero is honoured rather than rejected: for a budget it is the meaningful "submit none of this"
     /// value, which is the same reason envByte exists alongside envFloat.
-    unsigned int envUInt(const char* name, unsigned int fallback)
+    ///
+    /// \a maximum is explicit at every call site and has no default, deliberately. It used to be
+    /// hardcoded to kMaxInstancesPerFrame, which was right for the one caller that existed -- a
+    /// groundcover *instance* budget -- and silently wrong for the next one. A triangle budget in the
+    /// tens of millions read back as 20,000, which turned away 85% of the scene's instances and looked
+    /// exactly like a rendering bug. Worse, it only bit when the variable was *set*: unset took this
+    /// function's fallback path and returned the correct value unclamped, so the default was fine and
+    /// writing the default down explicitly broke it. A clamp whose bound belongs to one caller must not
+    /// be reachable by another without saying so.
+    unsigned int envUInt(const char* name, unsigned int fallback, unsigned int maximum)
     {
         const char* value = std::getenv(name);
         if (value == nullptr || *value == '\0')
@@ -329,7 +339,7 @@ namespace
         const long long parsed = std::strtoll(value, &end, 10);
         if (end == value || parsed < 0)
             return fallback;
-        return static_cast<unsigned int>(std::min<long long>(parsed, kMaxInstancesPerFrame));
+        return static_cast<unsigned int>(std::min<long long>(parsed, maximum));
     }
 
     /// Reads a 0..255 environment variable, keeping \a fallback only when unset or unparseable.
@@ -1631,8 +1641,10 @@ namespace
                 return false;
 
             static const bool enabled = envFlag("OPENMW_REMIX_GROUNDCOVER", true);
-            static const unsigned int budget
-                = envUInt("OPENMW_REMIX_GROUNDCOVER_BUDGET", kMaxGroundcoverCopies);
+            // Bounded by the per-frame instance ceiling, because that is what this budget counts: one
+            // grass copy is one instance, and the loop below is already stopped by kMaxInstancesPerFrame.
+            static const unsigned int budget = envUInt(
+                "OPENMW_REMIX_GROUNDCOVER_BUDGET", kMaxGroundcoverCopies, kMaxInstancesPerFrame);
             if (!enabled || budget == 0)
                 return true;
 
@@ -3195,7 +3207,12 @@ namespace MWRender
 
     unsigned int RemixScene::primitiveBudget()
     {
-        static const unsigned int budget = envUInt("OPENMW_REMIX_PRIMITIVE_BUDGET", kPrimitiveBudget);
+        // No meaningful upper bound to impose here, so none is imposed. This counts triangles, and the
+        // only real ceiling is the runtime's NEE prefix-sum index -- clamping to that silently would be
+        // worse than letting a deliberately large value through, because the whole reason this is tunable
+        // is to measure against that ceiling rather than assume it.
+        static const unsigned int budget = envUInt("OPENMW_REMIX_PRIMITIVE_BUDGET", kPrimitiveBudget,
+            std::numeric_limits<unsigned int>::max());
         return budget;
     }
 
