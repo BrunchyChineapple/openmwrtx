@@ -6,6 +6,7 @@
 #include <osg/Texture2D>
 
 #include <algorithm>
+#include <string>
 
 namespace Terrain
 {
@@ -161,7 +162,7 @@ namespace Terrain
 
                     // Named so a consumer can tell chunks apart in a log, and so the texture identity
                     // derived from it is stable for a given chunk rather than depending on load order.
-                    image->setFileName("terrain_composite");
+                    image->setFileName(std::string(CompositeMap::sReadbackImageName));
                     // Published last, under the lock, after the pixels are in. Ordering matters as much as
                     // the mutual exclusion: the consumer must not be able to see this pointer before it can
                     // see the data glReadPixels just wrote.

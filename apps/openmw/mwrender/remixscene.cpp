@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <osg/Camera>
 #include <osg/FrameStamp>
@@ -484,6 +486,264 @@ namespace
         return nullptr;
     }
 
+    /// Bytes one BC1 mip level of the given extent occupies.
+    ///
+    /// Rounded up to whole 4x4 blocks, which is why the levels below 4x4 all cost the same eight bytes.
+    /// Deliberately the same expression the compressed upload path uses to validate a source mip chain:
+    /// CreateTexture memcpys exactly the byte count it is handed, so producer and consumer disagreeing
+    /// about a level's size is a buffer overrun inside the runtime rather than a wrong-looking texture.
+    constexpr unsigned long long bc1LevelBytes(int width, int height)
+    {
+        return ((static_cast<unsigned long long>(width) + 3ull) / 4ull)
+            * ((static_cast<unsigned long long>(height) + 3ull) / 4ull) * 8ull;
+    }
+
+    /// Packs 8-bit RGB into RGB565, the endpoint format a BC1 block stores.
+    constexpr unsigned short packRgb565(int red, int green, int blue)
+    {
+        return static_cast<unsigned short>(((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3));
+    }
+
+    /// Expands RGB565 back to 8 bits, replicating the high bits downwards exactly as a BC1 decoder does.
+    ///
+    /// Reproducing the decoder's reconstruction rather than keeping the original 8-bit endpoints is what
+    /// makes index selection below agree with the colours the GPU will actually produce. Selecting against
+    /// unquantised endpoints picks a visibly worse index for texels near a palette boundary.
+    void unpackRgb565(unsigned short packed, int& red, int& green, int& blue)
+    {
+        const int red5 = (packed >> 11) & 0x1F;
+        const int green6 = (packed >> 5) & 0x3F;
+        const int blue5 = packed & 0x1F;
+        red = (red5 << 3) | (red5 >> 2);
+        green = (green6 << 2) | (green6 >> 4);
+        blue = (blue5 << 3) | (blue5 >> 2);
+    }
+
+    /// sRGB byte to linear and back, tabulated, for gamma-correct mip generation.
+    ///
+    /// Averaging sRGB-encoded bytes directly biases every level dark, and the bias compounds down the
+    /// chain. Only minified ground samples the small levels, so in-game that reads as the distance at
+    /// which the terrain suddenly gets darker -- a moving band across the ground as the camera travels,
+    /// which is worse than the shimmer the mip chain is being added to fix. Both directions are tables
+    /// because this runs over about a third again as many pixels as the composite has, per composite.
+    struct SrgbTransfer
+    {
+        std::uint16_t mToLinear[256]; ///< sRGB byte to linear, full 16-bit range.
+        unsigned char mToSrgb[4096]; ///< Linear, quantised to 12 bits, back to an sRGB byte.
+
+        SrgbTransfer()
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                const double encoded = i / 255.0;
+                const double linear = encoded <= 0.04045 ? encoded / 12.92
+                                                         : std::pow((encoded + 0.055) / 1.055, 2.4);
+                mToLinear[i] = static_cast<std::uint16_t>(std::lround(linear * 65535.0));
+            }
+            for (int i = 0; i < 4096; ++i)
+            {
+                // Bucket centre rather than edge, so the round trip of an exactly representable value
+                // lands back on itself instead of one step low.
+                const double linear = (i + 0.5) / 4096.0;
+                const double encoded = linear <= 0.0031308 ? linear * 12.92
+                                                           : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+                mToSrgb[i] = static_cast<unsigned char>(
+                    std::clamp(std::lround(encoded * 255.0), 0L, 255L));
+            }
+        }
+    };
+
+    const SrgbTransfer& srgbTransfer()
+    {
+        static const SrgbTransfer transfer;
+        return transfer;
+    }
+
+    /// Encodes one 4x4 RGBA8 block, given as 16 tightly packed texels, into the eight bytes of a BC1 block.
+    ///
+    /// Range fit: the endpoints are the corners of the block's colour bounding box, inset slightly, and
+    /// each texel takes the nearest of the four palette entries, found by projecting onto the endpoint
+    /// axis rather than by comparing against all four. That is the standard fast encoder rather than an
+    /// exhaustive search, which is the right trade here -- this runs once per chunk on a frame thread, and
+    /// what it encodes is ground albedo whose whole purpose is to be seen at a distance.
+    ///
+    /// Alpha is discarded. The only caller is the terrain composite, whose render target has no alpha
+    /// channel at all and whose alpha is forced opaque on readback.
+    void encodeBc1Block(const unsigned char* block, unsigned char* out)
+    {
+        int low[3] = { 255, 255, 255 };
+        int high[3] = { 0, 0, 0 };
+        for (int texel = 0; texel < 16; ++texel)
+        {
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                const int value = block[texel * 4 + channel];
+                low[channel] = std::min(low[channel], value);
+                high[channel] = std::max(high[channel], value);
+            }
+        }
+
+        // Inset the bounding box by a sixteenth of its extent on each side. Its corners are outliers by
+        // construction, so endpoints placed exactly on them spend both of the two exactly-representable
+        // palette entries on the two most extreme texels and leave the bulk of the block to the
+        // interpolated ones. Pulling in lowers the total error; this is the inset stb_dxt applies.
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const int margin = (high[channel] - low[channel]) >> 4;
+            low[channel] = std::min(low[channel] + margin, 255);
+            high[channel] = std::max(high[channel] - margin, 0);
+        }
+
+        unsigned short packedHigh = packRgb565(high[0], high[1], high[2]);
+        unsigned short packedLow = packRgb565(low[0], low[1], low[2]);
+        // BC1 selects its four-colour opaque mode on the first endpoint comparing greater than the second.
+        // The other ordering means three colours plus a punch-through slot, which is not what an opaque
+        // ground albedo wants -- and the two orderings are not interchangeable, so this is a correctness
+        // step rather than a preference.
+        if (packedHigh < packedLow)
+            std::swap(packedHigh, packedLow);
+
+        int endpointHigh[3];
+        int endpointLow[3];
+        unpackRgb565(packedHigh, endpointHigh[0], endpointHigh[1], endpointHigh[2]);
+        unpackRgb565(packedLow, endpointLow[0], endpointLow[1], endpointLow[2]);
+
+        int axis[3];
+        int axisLengthSquared = 0;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            axis[channel] = endpointHigh[channel] - endpointLow[channel];
+            axisLengthSquared += axis[channel] * axis[channel];
+        }
+
+        std::uint32_t indices = 0;
+        // A zero-length axis means the whole block quantised to one colour. Index 0 is that colour under
+        // either mode, so leaving every index at zero is correct and the palette below is irrelevant.
+        if (axisLengthSquared > 0)
+        {
+            // BC1 numbers its palette high, low, two-thirds-high, one-third-high, so walking the axis
+            // upwards from the low endpoint does not walk the indices in order.
+            static constexpr std::uint32_t kIndexForStep[4] = { 1, 3, 2, 0 };
+            for (int texel = 0; texel < 16; ++texel)
+            {
+                int projection = 0;
+                for (int channel = 0; channel < 3; ++channel)
+                    projection += (block[texel * 4 + channel] - endpointLow[channel]) * axis[channel];
+
+                // Nearest of the four evenly spaced points on the axis. The division is folded into the
+                // rounding so this stays in integers: step = round(3 * projection / axisLengthSquared).
+                // A texel outside the inset box projects negative, which truncates towards zero and is
+                // then clamped -- the clamp is load-bearing, not defensive.
+                const int step
+                    = std::clamp((projection * 6 + axisLengthSquared) / (axisLengthSquared * 2), 0, 3);
+                indices |= kIndexForStep[step] << (texel * 2);
+            }
+        }
+
+        out[0] = static_cast<unsigned char>(packedHigh & 0xFF);
+        out[1] = static_cast<unsigned char>(packedHigh >> 8);
+        out[2] = static_cast<unsigned char>(packedLow & 0xFF);
+        out[3] = static_cast<unsigned char>(packedLow >> 8);
+        out[4] = static_cast<unsigned char>(indices & 0xFF);
+        out[5] = static_cast<unsigned char>((indices >> 8) & 0xFF);
+        out[6] = static_cast<unsigned char>((indices >> 16) & 0xFF);
+        out[7] = static_cast<unsigned char>((indices >> 24) & 0xFF);
+    }
+
+    /// Compresses \a pixels to BC1 and appends a full mip chain, largest first, to \a out.
+    ///
+    /// Returns the number of levels written, which is the count the upload has to declare. Levels run all
+    /// the way to 1x1: that is what a DDS mip chain does, and the byte arithmetic above already accounts
+    /// for the sub-block levels costing a whole block each.
+    ///
+    /// \a pixels is tightly packed RGBA8 of \a width by \a height.
+    unsigned int compressBc1WithMips(
+        const unsigned char* pixels, int width, int height, std::vector<unsigned char>& out)
+    {
+        const SrgbTransfer& transfer = srgbTransfer();
+
+        std::vector<unsigned char> level(
+            pixels, pixels + static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+        int levelWidth = width;
+        int levelHeight = height;
+        unsigned int levels = 0;
+
+        while (true)
+        {
+            const std::size_t base = out.size();
+            out.resize(base + static_cast<std::size_t>(bc1LevelBytes(levelWidth, levelHeight)));
+            unsigned char* cursor = out.data() + base;
+
+            for (int blockY = 0; blockY < levelHeight; blockY += 4)
+            {
+                for (int blockX = 0; blockX < levelWidth; blockX += 4)
+                {
+                    unsigned char block[64];
+                    for (int y = 0; y < 4; ++y)
+                    {
+                        // Levels smaller than 4x4 still occupy a whole block, so the last row and column
+                        // repeat to fill it. Clamping rather than zero-filling keeps the block's colour
+                        // range honest; padding with black would drag an endpoint to black.
+                        const int sourceY = std::min(blockY + y, levelHeight - 1);
+                        for (int x = 0; x < 4; ++x)
+                        {
+                            const int sourceX = std::min(blockX + x, levelWidth - 1);
+                            const unsigned char* source = level.data()
+                                + (static_cast<std::size_t>(sourceY) * levelWidth + sourceX) * 4;
+                            std::memcpy(block + (y * 4 + x) * 4, source, 4);
+                        }
+                    }
+                    encodeBc1Block(block, cursor);
+                    cursor += 8;
+                }
+            }
+            ++levels;
+
+            if (levelWidth == 1 && levelHeight == 1)
+                break;
+
+            // 2x2 box filter in linear light. An odd extent repeats its surviving column or row rather
+            // than dropping it; composites are square powers of two, so that path is defensive only.
+            const int nextWidth = std::max(1, levelWidth / 2);
+            const int nextHeight = std::max(1, levelHeight / 2);
+            std::vector<unsigned char> next(
+                static_cast<std::size_t>(nextWidth) * static_cast<std::size_t>(nextHeight) * 4);
+            for (int y = 0; y < nextHeight; ++y)
+            {
+                const int top = std::min(y * 2, levelHeight - 1);
+                const int bottom = std::min(y * 2 + 1, levelHeight - 1);
+                for (int x = 0; x < nextWidth; ++x)
+                {
+                    const int left = std::min(x * 2, levelWidth - 1);
+                    const int right = std::min(x * 2 + 1, levelWidth - 1);
+                    const unsigned char* corner[4] = {
+                        level.data() + (static_cast<std::size_t>(top) * levelWidth + left) * 4,
+                        level.data() + (static_cast<std::size_t>(top) * levelWidth + right) * 4,
+                        level.data() + (static_cast<std::size_t>(bottom) * levelWidth + left) * 4,
+                        level.data() + (static_cast<std::size_t>(bottom) * levelWidth + right) * 4,
+                    };
+                    unsigned char* destination
+                        = next.data() + (static_cast<std::size_t>(y) * nextWidth + x) * 4;
+                    for (int channel = 0; channel < 3; ++channel)
+                    {
+                        const unsigned int sum = transfer.mToLinear[corner[0][channel]]
+                            + transfer.mToLinear[corner[1][channel]] + transfer.mToLinear[corner[2][channel]]
+                            + transfer.mToLinear[corner[3][channel]];
+                        destination[channel] = transfer.mToSrgb[(sum / 4u) >> 4];
+                    }
+                    // Alpha carries no transfer function, so it averages directly.
+                    destination[3] = static_cast<unsigned char>(
+                        (corner[0][3] + corner[1][3] + corner[2][3] + corner[3][3] + 2) / 4);
+                }
+            }
+            level = std::move(next);
+            levelWidth = nextWidth;
+            levelHeight = nextHeight;
+        }
+
+        return levels;
+    }
+
     /// Alpha threshold used when OpenMW asks for a cutout but its own reference value is unusable.
     ///
     /// OpenMW expresses alpha testing through osg::AlphaFunc with a float reference; a NIF that enables
@@ -852,6 +1112,26 @@ namespace
             // Particle systems are exempt. Their bounds are rebuilt as the particles move and are not
             // dependable enough to reject on, and there are only tens of systems, so the saving would not
             // pay for a flame that vanishes.
+            // Distance from the eye to this drawable's world-space bounding centre, for the submission
+            // budget's nearest-first admission. Computed here, ahead of and independently of the cull,
+            // because the budget needs it for every drawable that reaches the handover -- including when
+            // culling is switched off and including particle systems, which the cull below exempts.
+            //
+            // From the bound rather than from the transform's translation, and that distinction is
+            // load-bearing. ObjectPaging flattens static transforms into the vertices of a merged chunk, so
+            // the very instances the budget exists to weigh -- the large merged distant chunks -- carry a
+            // translation that says nothing about where their geometry is. Sorting on that would put the
+            // heaviest geometry in an arbitrary place in the order.
+            float distanceSquared = 0.0f;
+            {
+                const osg::BoundingSphere& bound = drawable.getBound();
+                const osg::Vec3f worldCentre = bound.valid()
+                    ? bound.center() * mMatrix
+                    : osg::Vec3f(static_cast<float>(mMatrix(3, 0)), static_cast<float>(mMatrix(3, 1)),
+                          static_cast<float>(mMatrix(3, 2)));
+                distanceSquared = (worldCentre - mEye).length2();
+            }
+
             if (!mFrustum.getPlaneList().empty() && dynamic_cast<osgParticle::ParticleSystem*>(&drawable) == nullptr)
             {
                 const osg::BoundingSphere& local = drawable.getBound();
@@ -1100,13 +1380,13 @@ namespace
             // "not pickable", hence the offset -- the first instance of a frame would otherwise opt
             // itself out.
             mScene.drawSubmitted(mesh, transform, categories, true,
-                mScene.lastMeshIsSkinned() ? rig : nullptr, mInstances + 1);
+                mScene.lastMeshIsSkinned() ? rig : nullptr, mInstances + 1, distanceSquared);
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
 
             // The base layer is submitted; the rest of the ground goes over it.
             if (terrain != nullptr)
-                submitTerrainLayers(*terrain, *geometry, categories, transform);
+                submitTerrainLayers(*terrain, *geometry, categories, transform, distanceSquared);
         }
 
         /// Submits a terrain chunk's overlaid layers, one draw each, over the base layer already sent.
@@ -1122,7 +1402,7 @@ namespace
         /// the point: that path is well travelled, and the alternative -- baking the layers into a texture
         /// -- was tried and is both slower and blurrier.
         void submitTerrainLayers(const Terrain::TerrainDrawable& terrain, osg::Geometry& geometry,
-            unsigned int categories, const float (&baseTransform)[12])
+            unsigned int categories, const float (&baseTransform)[12], float distanceSquared)
         {
             static const bool enabled = envFlag("OPENMW_REMIX_TERRAIN_LAYERS", true);
             if (!enabled)
@@ -1249,7 +1529,11 @@ namespace
                 if (layerMesh == 0)
                     continue;
 
-                mScene.drawSubmitted(layerMesh, baseTransform, categories, true, nullptr, mInstances + 1);
+                // The base layer's distance, because that is what this is: the same chunk, submitted again
+                // with different coverage. A layer sorting away from its own base layer would let the
+                // budget admit one and reject the other, which is worse than dropping the chunk outright.
+                mScene.drawSubmitted(
+                    layerMesh, baseTransform, categories, true, nullptr, mInstances + 1, distanceSquared);
                 ++mInstances;
             }
         }
@@ -1380,13 +1664,18 @@ namespace
                 const osg::Vec3f at(static_cast<float>(world(3, 0)), static_cast<float>(world(3, 1)),
                     static_cast<float>(world(3, 2)));
 
-                if (fadeEnd > 0.0f && (at - mEye).length() > fadeEnd)
+                const float copyDistanceSquared = (at - mEye).length2();
+                if (fadeEnd > 0.0f && copyDistanceSquared > fadeEnd * fadeEnd)
                     continue;
 
                 float transform[12];
                 writeTransform(world, transform);
 
-                mScene.drawSubmitted(mesh, transform, categories, true, nullptr, mInstances + 1);
+                // Per copy rather than per blade geometry, and here the translation is the right source:
+                // each copy is a real instance transform, so unlike a merged chunk its origin is where its
+                // geometry is.
+                mScene.drawSubmitted(
+                    mesh, transform, categories, true, nullptr, mInstances + 1, copyDistanceSquared);
                 mScene.noteInstancePosition(world(3, 0), world(3, 1), world(3, 2));
                 ++mInstances;
                 ++mGroundcoverCopies;
@@ -2010,6 +2299,10 @@ namespace MWRender
         mMeshesCreated = 0;
         mPrimitivesSubmitted = 0;
         mInstancesOverBudget = 0;
+        // Cleared rather than shrunk. flushSubmissions empties it at the end of every frame, so this only
+        // matters on the paths below that return early -- but leaving a previous frame's instances queued
+        // would submit them again with stale transforms.
+        mPendingInstances.clear();
         mSkinnedDropped = 0;
         mLastParticleCount = 0;
         mParticleInstances = 0;
@@ -2127,6 +2420,10 @@ namespace MWRender
             osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())),
             frustum);
         sceneRoot->accept(visitor);
+        // Everything the traversal queued is handed over here, nearest-first and under the triangle budget.
+        // Must run before the counters below are read: mPrimitivesSubmitted and mInstancesOverBudget are
+        // decided by the admission pass, not by the traversal.
+        flushSubmissions();
         mLastInstanceCount = visitor.instances();
         mCulled = visitor.culled();
 
@@ -2179,12 +2476,14 @@ namespace MWRender
                              << (mTextureBytesPeak >> 20) << " MiB) over " << mUploadedTextures.size()
                              << " identities, " << mTexturesReleased << " released and " << mMaterialsReleased
                              << " materials with them"
-                             // The number that decides whether the runtime's 26-bit primitive index holds.
-                             // Instances turned away being non-zero means the budget is binding and geometry
-                             // is missing from the frame; it staying zero means the scene fits and this cost
+                             // The number that decides whether the runtime's NEE cache prefix-sum index
+                             // holds. Note the real ceiling is 16,777,214 and not the 67,108,863 the runtime
+                             // logs -- see kPrimitiveBudget for why. Instances turned away being non-zero
+                             // means the budget is binding, and since admission is nearest-first what is
+                             // missing is the far field; it staying zero means the scene fits and this cost
                              // nothing.
                              << "; " << mPrimitivesSubmitted << " triangles submitted of "
-                             << kPrimitiveBudget << " budgeted, " << mInstancesOverBudget
+                             << primitiveBudget() << " budgeted, " << mInstancesOverBudget
                              << " instances turned away"
                              << "; camera eye " << eye.x() << ", " << eye.y()
                              << ", " << eye.z() << " looking " << forward.x() << ", " << forward.y()
@@ -2199,6 +2498,44 @@ namespace MWRender
                 Log(Debug::Info) << "Remix scene: instance origins span " << mMin[0] << ".." << mMax[0]
                                  << ", " << mMin[1] << ".." << mMax[1] << ", " << mMin[2] << ".."
                                  << mMax[2];
+            }
+
+            // The runtime's own VRAM accounting, per category, on the same interval as the report above.
+            //
+            // A separate line rather than more fields on that one: it answers a different question, it
+            // wants grepping on its own, and the scene line is long enough already.
+            //
+            // Every field is measured by the runtime's allocator, not estimated here, and the categories
+            // are worth more read against each other than summed:
+            //
+            // - `accel` is the BVH. It is the only number that reflects geometry the *runtime* substituted:
+            //   a replacement swaps a mesh for a heavier one without moving the triangle count this host
+            //   reports, so `accel` rising while `triangles submitted` holds steady localises the growth to
+            //   the replacement pack.
+            // - `material textures` is the pool `rtx.texturemanager.fixedBudgetMiB` bounds. It does *not*
+            //   include what this host uploads through createTexture -- those are reported as `textures
+            //   resident` on the line above, are a separate pool, and cannot be demoted, only released.
+            // - `retained` is the allocator holding freed chunks rather than returning them to the driver.
+            //   Retention, not consumption. Reading a rising total without this field is how a
+            //   high-water-mark allocator gets mistaken for a leak.
+            // - `driver` minus `allocated` is everything outside the runtime's allocator: DLSS and NGX
+            //   working memory, raytracing pipeline state, bindless descriptor pools, NRC. No other number
+            //   here can see it, and it is not small.
+            RemixRT::Runtime::VramStats vram;
+            if (mRuntime.vramStats(vram))
+            {
+                const auto mib = [](unsigned long long bytes) { return bytes >> 20; };
+                Log(Debug::Info) << "Remix VRAM: driver " << mib(vram.mDriverAllocated) << " of "
+                                 << mib(vram.mDriverBudget) << " MiB budget; runtime allocator "
+                                 << mib(vram.mTotalAllocated) << " allocated, " << mib(vram.mTotalUsed)
+                                 << " used, " << mib(vram.mPoolRetained) << " retained; accel "
+                                 << mib(vram.mAccelerationStructure) << ", replacement geometry "
+                                 << mib(vram.mReplacementGeometry) << ", material textures "
+                                 << mib(vram.mMaterialTextures) << ", buffers " << mib(vram.mBuffers)
+                                 << ", render targets " << mib(vram.mRenderTargets)
+                                 << ", opacity micromap " << mib(vram.mOpacityMicromap)
+                                 << " MiB; runtime texture cache " << vram.mTextureCacheCount
+                                 << " entries";
             }
         }
 
@@ -2424,6 +2761,47 @@ namespace MWRender
             // Distinguished in the log, because a source with no alpha channel gets 255 written into it
             // and any cutout against the result is a no-op.
             cached.mFormat = alpha >= 0 ? "RGBA8" : "RGBA8(opaque)";
+
+            // Terrain composites, and only terrain composites, are block-compressed and given a mip chain.
+            //
+            // They are the one class of texture here that is both very large and generated rather than
+            // loaded: a whole chunk's blended albedo read back from a render target at Terrain/"composite
+            // map resolution". At 2048 that is 16.8 MB each, and an exterior session composites hundreds of
+            // them, which makes this the largest single call on texture memory in the game. BC1 is a 6x
+            // reduction and is what Morrowind's own ground textures already are, so it asks nothing of this
+            // art that it did not already accept.
+            //
+            // The mip chain matters twice over, and the second reason is the less obvious one. Without it
+            // minification has nothing to fall back on and the ground shimmers. But a single-mip texture
+            // also cannot be partially resident, so the runtime's texture manager has no way to demote
+            // these under pressure -- its only option is to evict them whole, which is what showed up as
+            // ground textures dropping out after walking for a while. Even with the compression this is
+            // the half that makes the memory behaviour graceful rather than cliff-edged.
+            //
+            // Restricted to composites deliberately, and the restriction is not conservatism. The hash
+            // computed below is the texture's public identity: it is what an rtx.conf texture tag is
+            // stored under and what a replacement pack is authored against. Changing the bytes of anything
+            // that came from a file on disk would silently invalidate both, with no diagnostic. A composite
+            // has no file, cannot be tagged and cannot be replaced, so it is the one case where re-encoding
+            // costs nothing downstream.
+            static const bool compressComposites
+                = envFlag("OPENMW_REMIX_COMPOSITE_COMPRESS", true);
+            if (compressComposites
+                && std::string_view(image.getFileName()) == Terrain::CompositeMap::sReadbackImageName)
+            {
+                std::vector<unsigned char> compressed;
+                // The whole chain is four thirds of level zero plus the sub-block tail, and one allocation
+                // beats eleven reallocations while a frame is waiting on this.
+                compressed.reserve(
+                    static_cast<std::size_t>(bc1LevelBytes(width, height) * 4ull / 3ull + 64ull));
+                mipLevels = compressBc1WithMips(converted.data(), width, height, compressed);
+                converted = std::move(compressed);
+                uploadData = converted.data();
+                uploadSize = converted.size();
+                format = colour ? RemixRT::Runtime::Format_BC1_RGB
+                                : RemixRT::Runtime::Format_BC1_RGB_Linear;
+                cached.mFormat = "BC1_RGB(composite)";
+            }
         }
         else
         {
@@ -2733,20 +3111,102 @@ namespace MWRender
 
     void RemixScene::drawSubmitted(unsigned long long mesh, const float* transform,
         unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig,
-        unsigned int pickingValue)
+        unsigned int pickingValue, float distanceSquared)
     {
-        // Weighed against the frame's triangle budget before anything is handed over. Unknown identities --
-        // particle meshes, the probe quad -- are admitted unweighed: they are individually tiny and the point
-        // of this is the merged distant chunks, which are always in the map because this traversal built them.
-        if (const auto primitives = mMeshPrimitives.find(mesh); primitives != mMeshPrimitives.end())
+        PendingInstance pending;
+        pending.mMesh = mesh;
+        std::memcpy(pending.mTransform, transform, sizeof(pending.mTransform));
+        pending.mCategoryFlags = categoryFlags;
+        pending.mRig = rig;
+        pending.mPickingValue = pickingValue;
+        pending.mDistanceSquared = distanceSquared;
+        pending.mDoubleSided = doubleSided;
+
+        // Unknown identities are admitted unweighed: particle meshes and the probe quad are individually
+        // tiny, and the point of the budget is the merged distant chunks, which are always in the map
+        // because this traversal built them.
+        const auto primitives = mMeshPrimitives.find(mesh);
+        pending.mPrimitives = primitives != mMeshPrimitives.end() ? primitives->second : 0u;
+
+        // The sky is never budgeted, whatever its distance.
+        //
+        // It has to be exempt precisely *because* the budget is now distance-ordered. OpenMW's sky dome is
+        // submitted as ordinary geometry, and its bounding centre is further away than anything else in the
+        // scene, so a distance sort puts it last and a binding budget would drop it first. Under path
+        // tracing the sky is the dominant area light in every cell, interiors included -- losing it is not a
+        // degraded far field, it is the world going dark.
+        pending.mExempt = (categoryFlags & RemixRT::Runtime::Category_Sky) != 0;
+
+        mPendingInstances.push_back(pending);
+    }
+
+    void RemixScene::flushSubmissions()
+    {
+        static const bool nearestFirst = envFlag("OPENMW_REMIX_BUDGET_NEAREST_FIRST", true);
+
+        // Sort keys, not instances. A PendingInstance is ~88 bytes, and at the 20,000-instance ceiling
+        // sorting them directly would move well over a megabyte through a merge sort every frame -- a
+        // measurable share of a submit stage that runs in 1.44 ms. The key is eight bytes and contiguous,
+        // so the sort touches a 160 KB array instead and the instances are read once, in order.
+        mSubmissionOrder.clear();
+        mSubmissionOrder.reserve(mPendingInstances.size());
+        for (unsigned int index = 0; index < static_cast<unsigned int>(mPendingInstances.size()); ++index)
         {
-            if (mPrimitivesSubmitted + primitives->second > kPrimitiveBudget)
-            {
-                ++mInstancesOverBudget;
-                return;
-            }
-            mPrimitivesSubmitted += primitives->second;
+            const PendingInstance& pending = mPendingInstances[index];
+            // Exemption folded into the key rather than branched on in the comparator: distances are never
+            // negative, so -1 sorts every exempt instance ahead of the field for free.
+            mSubmissionOrder.push_back(
+                { pending.mExempt ? -1.0f : pending.mDistanceSquared, index });
         }
+
+        if (nearestFirst)
+        {
+            // Ties broken by index, so equal distances keep traversal order and a frame is reproducible.
+            // That makes an unstable sort safe, which is worth having: the comparator is total.
+            std::sort(mSubmissionOrder.begin(), mSubmissionOrder.end(),
+                [](const SubmissionKey& left, const SubmissionKey& right) {
+                    if (left.mDistanceSquared != right.mDistanceSquared)
+                        return left.mDistanceSquared < right.mDistanceSquared;
+                    return left.mIndex < right.mIndex;
+                });
+        }
+
+        const unsigned int budget = primitiveBudget();
+        for (const SubmissionKey& key : mSubmissionOrder)
+        {
+            const PendingInstance& pending = mPendingInstances[key.mIndex];
+            if (!pending.mExempt && pending.mPrimitives != 0)
+            {
+                if (mPrimitivesSubmitted + pending.mPrimitives > budget)
+                {
+                    // Not a break. An instance that does not fit is skipped rather than ending the pass,
+                    // because one enormous merged chunk arriving mid-list must not shut out every smaller
+                    // instance behind it -- and with the list sorted, everything behind it is further away
+                    // and cheaper to keep.
+                    ++mInstancesOverBudget;
+                    continue;
+                }
+                mPrimitivesSubmitted += pending.mPrimitives;
+            }
+            submitInstanceNow(pending);
+        }
+        mPendingInstances.clear();
+    }
+
+    unsigned int RemixScene::primitiveBudget()
+    {
+        static const unsigned int budget = envUInt("OPENMW_REMIX_PRIMITIVE_BUDGET", kPrimitiveBudget);
+        return budget;
+    }
+
+    void RemixScene::submitInstanceNow(const PendingInstance& pending)
+    {
+        const unsigned long long mesh = pending.mMesh;
+        const float* const transform = pending.mTransform;
+        const unsigned int categoryFlags = pending.mCategoryFlags;
+        const bool doubleSided = pending.mDoubleSided;
+        const SceneUtil::RigGeometry* const rig = pending.mRig;
+        const unsigned int pickingValue = pending.mPickingValue;
 
         if (rig == nullptr)
         {

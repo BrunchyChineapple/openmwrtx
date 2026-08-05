@@ -181,13 +181,22 @@ namespace MWRender
 
         /// Queues one instance. Companion to submitGeometry, same reason for being public.
         ///
+        /// Genuinely queues, rather than handing over immediately: the instance is held until the
+        /// traversal finishes so that the triangle budget can admit nearest-first. See
+        /// flushSubmissions for why that matters.
+        ///
         /// @param rig when non-null, its current bone matrices are submitted with the instance. Must be
-        ///        the same rig the mesh was created from.
+        ///        the same rig the mesh was created from. Read at flush time, still within this frame.
         /// @param pickingValue identifies this draw so the developer menu can resolve a click in the
         ///        scene to it. Must be distinct per draw within a frame; zero leaves it unpickable.
+        /// @param distanceSquared world-space distance from the eye to this instance's bounding-sphere
+        ///        centre, squared. The budget's sort key. Must be the *bound* centre and not the
+        ///        transform's translation: ObjectPaging flattens static transforms into the vertices of
+        ///        a merged chunk, so the translation of the largest instances in the scene says nothing
+        ///        about where their geometry actually is.
         void drawSubmitted(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
             bool doubleSided, const SceneUtil::RigGeometry* rig = nullptr,
-            unsigned int pickingValue = 0);
+            unsigned int pickingValue = 0, float distanceSquared = 0.0f);
 
         /// Records a submitted instance's world-space origin, for the diagnostic extent log.
         void noteInstancePosition(double x, double y, double z);
@@ -578,22 +587,87 @@ namespace MWRender
         /// Triangles admitted so far this frame, and how many instances the budget turned away.
         unsigned int mPrimitivesSubmitted = 0;
         unsigned int mInstancesOverBudget = 0;
-        /// Ceiling on triangles submitted in one frame.
+
+        /// One queued instance, held from drawSubmitted until flushSubmissions.
         ///
-        /// The runtime indexes primitives in 26 bits, so 67,108,863 is a hard limit: past it the index wraps
-        /// and the NEE cache and prefix-sum lookups read whatever the wrapped value lands on. That is not an
-        /// artefact, it is a GPU reset -- measured at 143,278,765 triangles, 2.14x over, arriving as an
-        /// AppHangTransient with three nvlddmkm resets behind it.
+        /// The transform is copied by value rather than pointed at. The traversal writes it into a stack
+        /// array per drawable, so a pointer would dangle the moment that scope ended.
+        struct PendingInstance
+        {
+            unsigned long long mMesh;
+            float mTransform[12];
+            unsigned int mCategoryFlags;
+            const SceneUtil::RigGeometry* mRig;
+            unsigned int mPickingValue;
+            float mDistanceSquared;
+            unsigned int mPrimitives; ///< Zero for an identity with no recorded triangle count.
+            bool mDoubleSided;
+            bool mExempt; ///< Admitted regardless of the budget. See flushSubmissions.
+        };
+
+        /// This frame's queued instances, cleared at the start of every submit.
+        std::vector<PendingInstance> mPendingInstances;
+
+        /// Sort key for one queued instance: what to order by, and which instance it refers to.
+        struct SubmissionKey
+        {
+            float mDistanceSquared; ///< Negative for a budget-exempt instance, so it sorts first.
+            unsigned int mIndex; ///< Into mPendingInstances. Also the tie-break, to keep frames stable.
+        };
+
+        /// Scratch for flushSubmissions' sort. A member so its capacity survives between frames.
+        std::vector<SubmissionKey> mSubmissionOrder;
+
+        /// Sorts the queued instances nearest-first, admits them under the triangle budget, hands over.
         ///
-        /// A ceiling rather than a better cull because the distribution defeats culling. Rejecting geometry
-        /// too small to resolve removed 3,000 drawables and 0.03% of the triangles: the count is concentrated
-        /// in a few thousand merged distant chunks that are large on screen and enormously dense, not in many
-        /// small objects. Those need decimated meshes to fix properly -- ObjectPaging already substitutes a
-        /// `_dist` variant on the distant path, and none are installed -- and until they exist this is what
-        /// keeps the frame submittable.
+        /// Nearest-first is the whole point, and it is what makes the budget usable rather than merely
+        /// protective. Enforced greedily at drawSubmitted time, the budget dropped whatever happened to be
+        /// traversed last -- and traversal order for paged chunks is quadtree order, which is spatially
+        /// coherent but has nothing to do with distance. So a binding budget deleted an arbitrary wedge of
+        /// the world, near geometry included, which is why it could only be set high enough never to bind.
+        /// Sorted by distance it degrades as a draw-distance reduction instead, which is a visual trade
+        /// worth making and can therefore be set to a number that actually protects the runtime.
         ///
-        /// Set below the limit rather than at it, because this counts what this traversal hands over and the
-        /// runtime adds its own replacement geometry on top.
+        /// Deferring costs nothing else. Submission order is meaningless to a path tracer -- there is no
+        /// depth test and no blend order, the runtime builds an acceleration structure from the whole set --
+        /// so when the budget does not bind this reorders the handover and changes nothing observable.
+        void flushSubmissions();
+
+        /// Hands one admitted instance to the runtime, resolving bone matrices if it is skinned.
+        ///
+        /// Split out of drawSubmitted when that became a queue. Called only from flushSubmissions, which is
+        /// still inside the frame that queued it -- which is what keeps the rig's bone matrices valid, since
+        /// they are current from the update traversal onwards rather than only at the moment of traversal.
+        void submitInstanceNow(const PendingInstance& pending);
+
+        /// The frame triangle budget in force, from OPENMW_REMIX_PRIMITIVE_BUDGET or the default below.
+        ///
+        /// Env-tunable because the right value is an open question that needs measuring in-game rather than
+        /// deciding here, and because rebuilding to try a number is a poor way to spend a test run.
+        static unsigned int primitiveBudget();
+
+        /// Default ceiling on triangles submitted in one frame.
+        ///
+        /// **The 67,108,863 figure the runtime logs is not the real limit.** `PRIMITIVE_INDEX_BIT_COUNT`
+        /// is 26 in the runtime's `instance_definitions.h`, but grepping the runtime for it finds exactly
+        /// one use: the log message that prints it. Nothing packs a primitive index into 26 bits. The field
+        /// that actually constrains the count is the NEE cache's prefix-sum ID, which is **24** bits --
+        /// `NEE_CACHE_INVALID_ID` is `0xffffff`, and `update_nee_cache.comp.slang` masks tasks with
+        /// `& 0xffffff` and packs them as `(range << 24) | prefixSumID`. With the sentinel reserved the
+        /// usable range is 16,777,214.
+        ///
+        /// So this default is **3.3x above the real ceiling**, not comfortably below a 67M one. It is left
+        /// where it is only because lowering it was unsafe while the budget dropped arbitrary geometry;
+        /// with flushSubmissions sorting nearest-first that objection is gone, and the number wants
+        /// re-measuring downwards. Use OPENMW_REMIX_PRIMITIVE_BUDGET to try values without a rebuild.
+        ///
+        /// What exceeding it costs: truncated prefix-sum IDs resolve to a garbage surface and primitive,
+        /// which the runtime's own source notes "can cause an out-of-range shared memory access in the
+        /// update shader" (`integrator_indirect.slangh`). Measured at 143,278,765 triangles -- 8.5x the
+        /// real ceiling -- arriving as an AppHangTransient with three nvlddmkm resets behind it.
+        ///
+        /// Set below whatever limit is chosen rather than at it, because this counts what this traversal
+        /// hands over and the runtime adds its own replacement geometry on top.
         static constexpr unsigned int kPrimitiveBudget = 56000000u;
         /// Frame each identity's last claim was dropped, for identities nothing claims any more.
         ///

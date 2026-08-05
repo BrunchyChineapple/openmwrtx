@@ -1044,6 +1044,35 @@ namespace RemixRT
         return reinterpret_cast<unsigned long long>(handle);
     }
 
+    bool Runtime::vramStats(VramStats& out) const
+    {
+        // Zeroed on every failure path, so a caller that ignores the return value reports nothing rather
+        // than reporting whatever was in the struct beforehand. A stale VRAM figure is worse than no
+        // figure: it looks like a measurement.
+        out = VramStats{};
+
+        if (!mImpl->mStarted || mImpl->mApi.GetVramStats == nullptr)
+            return false;
+
+        remixapi_VramStats stats = {};
+        if (mImpl->mApi.GetVramStats(&stats) != REMIXAPI_ERROR_CODE_SUCCESS)
+            return false;
+
+        out.mTotalAllocated = stats.totalAllocatedBytes;
+        out.mTotalUsed = stats.totalUsedBytes;
+        out.mPoolRetained = stats.poolRetainedBytes;
+        out.mReplacementGeometry = stats.usedReplacementGeometryBytes;
+        out.mBuffers = stats.usedBufferBytes;
+        out.mAccelerationStructure = stats.usedAccelerationStructureBytes;
+        out.mOpacityMicromap = stats.usedOpacityMicromapBytes;
+        out.mMaterialTextures = stats.usedMaterialTextureBytes;
+        out.mRenderTargets = stats.usedRenderTargetBytes;
+        out.mDriverAllocated = stats.driverAllocatedBytes;
+        out.mDriverBudget = stats.driverBudgetBytes;
+        out.mTextureCacheCount = stats.forkTextureCacheCount;
+        return true;
+    }
+
     void Runtime::destroyTexture(unsigned long long texture)
     {
         if (!mImpl->mStarted || mImpl->mApi.DestroyTexture == nullptr || texture == 0)
@@ -1904,6 +1933,12 @@ namespace RemixRT
     {
         Log(Debug::Warning) << "Remix: the runtime is Windows-only; the Remix backend is unavailable "
                                "on this platform";
+        return false;
+    }
+
+    bool Runtime::vramStats(VramStats& out) const
+    {
+        out = VramStats{};
         return false;
     }
 

@@ -373,6 +373,72 @@ namespace RemixRT
         /// Releases an uploaded texture.
         void destroyTexture(unsigned long long texture);
 
+        /// Per-category VRAM the runtime is holding, in bytes.
+        ///
+        /// Every field is a direct read of the runtime's own allocator accounting. Nothing here is
+        /// estimated or derived, which is the point: VRAM questions on this integration had been argued
+        /// from symptoms when the runtime was already keeping the answer and nobody was asking for it.
+        ///
+        /// Covers only what the runtime owns. OpenMW's own GL allocations are not in here, and neither is
+        /// anything outside the runtime's allocator -- see mDriverAllocated for that gap.
+        struct VramStats
+        {
+            unsigned long long mTotalAllocated = 0; ///< Everything the runtime's allocator holds.
+            unsigned long long mTotalUsed = 0; ///< Of that, what is actually in use.
+
+            /// Allocated minus used: chunks the allocator keeps rather than returning to the driver.
+            ///
+            /// The difference between holding and consuming. The allocator retains freed chunks in a
+            /// high-water-mark pattern, so a large value here is retention that a compaction request would
+            /// return, not memory anything needs. Reading a rising total without this field is how a
+            /// retention pattern gets mistaken for a leak.
+            unsigned long long mPoolRetained = 0;
+
+            unsigned long long mReplacementGeometry = 0; ///< Vertex and index data for pack meshes.
+            unsigned long long mBuffers = 0;
+
+            /// Acceleration structures -- the BVH.
+            ///
+            /// The number that says whether the geometry handed over is affordable, which is not the same
+            /// question as how many triangles it was. A replacement swaps a mesh for a heavier one without
+            /// changing anything this host counts, so this is the only place that shows up.
+            unsigned long long mAccelerationStructure = 0;
+
+            unsigned long long mOpacityMicromap = 0;
+
+            /// Replacement and material textures: the pool rtx.texturemanager.fixedBudgetMiB bounds.
+            ///
+            /// Textures this host uploads through createTexture are **not** counted here. Those are a
+            /// separate pool with different rules -- they have no file behind them, so they cannot be
+            /// demoted to a lower mip, only released when the host releases them. Conflating the two is
+            /// what led to a texture budget being blamed for a single-mip upload problem it cannot reach.
+            unsigned long long mMaterialTextures = 0;
+
+            unsigned long long mRenderTargets = 0;
+
+            /// What the driver reports for this process on device-local heaps, and the budget it is
+            /// measured against. This is the Task Manager and nvidia-smi view.
+            ///
+            /// mDriverAllocated minus mTotalAllocated is everything outside the runtime's own allocator:
+            /// DLSS and NGX working memory, raytracing pipeline state, bindless descriptor pools, NRC.
+            /// That gap is invisible to every other field here and is not small.
+            unsigned long long mDriverAllocated = 0;
+            unsigned long long mDriverBudget = 0;
+
+            /// Population of the runtime's own texture cache.
+            ///
+            /// Climbing while this host's identity count stays flat localises the growth to the runtime
+            /// side rather than to what OpenMW uploads. Note it is a high-water mark rather than a live
+            /// count -- freed slots become sentinels instead of being removed -- so read the trend.
+            unsigned int mTextureCacheCount = 0;
+        };
+
+        /// Reads the runtime's VRAM accounting into \a out.
+        ///
+        /// @return false if the runtime is not running, or is older than this entry point; \a out is
+        ///         zeroed in that case rather than left untouched.
+        bool vramStats(VramStats& out) const;
+
         /// Creates a material that samples an uploaded texture for its albedo.
         ///
         /// @param textureHash the hash passed to createTexture. Referenced through the runtime's

@@ -5,6 +5,7 @@
 
 #include <mutex>
 #include <set>
+#include <string_view>
 
 namespace osg
 {
@@ -83,6 +84,14 @@ namespace Terrain
         /// chunk, and the result kept for as long as the chunk lives. At the default 512x512 RGBA8 that is
         /// 1MB a chunk. Enabled by the Remix backend, which has no other way to obtain a real albedo.
         static bool sReadbackEnabled;
+
+        /// The osg::Image::getFileName() every readback image carries.
+        ///
+        /// A composite has no file behind it, so this stands in as its origin in logs. It is also the only
+        /// signal a consumer has that an image is a composite rather than loaded art, which the Remix
+        /// backend routes on -- composites are the one class of texture it block-compresses on upload.
+        /// Shared from here so the producer and that consumer cannot drift apart silently.
+        static constexpr std::string_view sReadbackImageName = "terrain_composite";
     };
 
     /**
