@@ -260,7 +260,13 @@ namespace
         void heartbeat() { mHeartbeat.store(nowMs(), std::memory_order_relaxed); }
 
     private:
-        static constexpr std::size_t kMaxFrames = 48;
+        /// Deep enough to get past a recursive teardown to whoever started it.
+        ///
+        /// Was 48, which was exactly the length of the one stack that mattered: a recursive OSG node
+        /// destruction about twelve levels deep at four frames a level, truncated one frame short of its
+        /// caller. A cap that swallows the answer is worse than no cap, and these are captured once per
+        /// stall so the extra depth costs nothing worth counting.
+        static constexpr std::size_t kMaxFrames = 192;
 
         static double nowMs()
         {
