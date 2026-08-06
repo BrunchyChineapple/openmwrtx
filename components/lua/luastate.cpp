@@ -9,6 +9,8 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/files/conversion.hpp>
+#include <components/files/istreamptr.hpp>
+#include <components/files/utils.hpp>
 #include <components/vfs/manager.hpp>
 
 #include "luastateptr.hpp"
@@ -420,7 +422,8 @@ namespace LuaUtil
 
     sol::function LuaState::loadFromVFS(const VFS::Path::Normalized& path)
     {
-        std::string fileContent(std::istreambuf_iterator<char>(*mVFS->get(path)), {});
+        const Files::IStreamPtr stream = mVFS->get(path);
+        const std::string fileContent = Files::readAll(*stream);
         sol::load_result res = mSol.load(fileContent, path.value(), sol::load_mode::text);
         if (!res.valid())
             throw std::runtime_error(std::string("Lua error: ") += res.get<sol::error>().what());
@@ -431,7 +434,7 @@ namespace LuaUtil
     {
         const auto path = packageNameToPath(libName, mLibSearchPaths);
         std::ifstream stream(path);
-        std::string fileContent(std::istreambuf_iterator<char>(stream), {});
+        const std::string fileContent = Files::readAll(stream);
         sol::load_result res = mSol.load(fileContent, Files::pathToUnicodeString(path), sol::load_mode::text);
         if (!res.valid())
             throw std::runtime_error("Lua error: " + res.get<std::string>());
