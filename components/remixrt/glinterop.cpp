@@ -1190,15 +1190,24 @@ namespace RemixRT
         //                            entirely, which means the display path or the comparison itself
         //   this peak much lower  -> the composite draw is losing it, and that is a small amount of code
         //
-        // A 32x32 block from the centre of the viewport rather than the whole frame: glReadPixels stalls
-        // the pipeline, so this has to stay small, and it only runs every 600th composite.
+        // This is deliberately opt-in. glReadPixels is a synchronous GPU-to-CPU round trip and the
+        // composite callback can run many times per displayed frame, so even a nominal once-per-600-call
+        // diagnostic caused dozens of full 4K readbacks during a short gameplay capture.
         {
-            static unsigned compositeFrames = 0;
-            if (++compositeFrames % 600 == 0)
+            static const bool logFramebufferLuma = []() {
+                const char* value = std::getenv("OPENMW_REMIX_COMPOSITE_LUMA_LOG");
+                const bool enabled = value != nullptr && *value != '\0' && *value != '0';
+                if (enabled)
+                    Log(Debug::Info) << "Remix composite: full-frame luma diagnostic enabled by "
+                                        "OPENMW_REMIX_COMPOSITE_LUMA_LOG";
+                return enabled;
+            }();
+            static unsigned compositeCalls = 0;
+            if (logFramebufferLuma && ++compositeCalls % 600 == 0)
             {
-                GLint viewport[4] = {};
-                glGetIntegerv(GL_VIEWPORT, viewport);
-                if (viewport[2] > 0 && viewport[3] > 0)
+                GLint lumaViewport[4] = {};
+                glGetIntegerv(GL_VIEWPORT, lumaViewport);
+                if (lumaViewport[2] > 0 && lumaViewport[3] > 0)
                 {
                     // The whole framebuffer, sampled with the same prime stride the readback probe uses.
                     //
@@ -1206,13 +1215,14 @@ namespace RemixRT
                     // against the readback's whole-frame peak, which is not a comparison at all: one was the
                     // brightest pixel anywhere in a 4K frame, the other the middle of a dark wall. It
                     // reported 22/255 against 0.80 and that difference was unreadable. Reading the whole
-                    // thing costs 33 MB once every six hundred frames, which is nothing for a diagnostic
+                    // thing costs 33 MB once every six hundred calls, which is nothing for a diagnostic
                     // and is the only way the two numbers mean the same thing.
                     const std::size_t pixels
-                        = static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]);
+                        = static_cast<std::size_t>(lumaViewport[2])
+                        * static_cast<std::size_t>(lumaViewport[3]);
                     std::vector<unsigned char> frame(pixels * 4, 0);
-                    glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], GL_RGBA,
-                        GL_UNSIGNED_BYTE, frame.data());
+                    glReadPixels(lumaViewport[0], lumaViewport[1], lumaViewport[2], lumaViewport[3],
+                        GL_RGBA, GL_UNSIGNED_BYTE, frame.data());
 
                     // A histogram, because peak is not exposure and reporting it as though it were sent
                     // this investigation down a blind alley for a long time.
