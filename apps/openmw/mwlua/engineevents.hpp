@@ -106,7 +106,21 @@ namespace MWLua
 
         void clear() { mQueue.clear(); }
         void addToQueue(Event e) { mQueue.push_back(std::move(e)); }
-        void callEngineHandlers();
+
+        /// Dispatches queued events, spending at most \a budgetMs on it and deducting what it used.
+        ///
+        /// Needs a budget because OnActive reaches LocalScripts::setActive, which calls engine handlers,
+        /// which begins with ensureLoaded -- so this is where a newly active object's scripts are
+        /// instantiated, and instantiation runs the top level of the object's whole require graph. A mod
+        /// whose NPC script pulls a megabyte of modules costs milliseconds per NPC, and entering a town
+        /// activates dozens at once: measured at 512 ms in one frame.
+        ///
+        /// A budget of zero means no limit, which is the behaviour this had before.
+        ///
+        /// Whatever does not fit stays queued, in order, ahead of anything added later. The queue is
+        /// drained from the front and always makes progress by at least one event, so nothing can be
+        /// starved by a single expensive one.
+        void callEngineHandlers(double& budgetMs);
 
     private:
         class Visitor;

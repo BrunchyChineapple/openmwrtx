@@ -365,8 +365,14 @@ namespace MWLua
             mQueuedCallbacks.clear();
             breakdown.mQueuedCallbacks = lap();
 
-            // Run engine handlers
-            mEngineEvents.callEngineHandlers();
+            // Run engine handlers. Shares the frame's instantiation budget with the loops below, because
+            // this is the door most newly active objects come through: OnActive ends in
+            // LocalScripts::setActive, which calls handlers, which loads the container.
+            //
+            // Bounding only the other three doors was worse than useless. It moved the same work into this
+            // span rather than removing it -- bookkeeping and timers dropped from 346 ms and 612 ms to
+            // roughly 5 ms each, and engine events rose to 512 ms in their place.
+            mEngineEvents.callEngineHandlers(loadBudgetMs);
             breakdown.mEngineEvents = lap();
             bool isPaused = timeManager.isPaused();
 

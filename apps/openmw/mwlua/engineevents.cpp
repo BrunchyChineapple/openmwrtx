@@ -1,5 +1,8 @@
 #include "engineevents.hpp"
 
+#include <chrono>
+#include <iterator>
+
 #include <components/debug/debuglog.hpp>
 #include <components/settings/values.hpp>
 
@@ -173,12 +176,54 @@ namespace MWLua
         MWWorld::WorldModel* mWorldModel = MWBase::Environment::get().getWorldModel();
     };
 
-    void EngineEvents::callEngineHandlers()
+    void EngineEvents::callEngineHandlers(double& budgetMs)
     {
         Visitor vis(mGlobalScripts);
-        for (const Event& event : mQueue)
+
+        // Swapped out before dispatch rather than iterated in place. A handler can queue another engine
+        // event, and the previous form walked mQueue with a range-for while that was possible; retaining a
+        // tail makes that hazard sharper, so the batch is detached first and the remainder put back
+        // afterwards -- ahead of anything the handlers added, which keeps the queue in order.
+        std::vector<Event> batch;
+        batch.swap(mQueue);
+
+        if (budgetMs <= 0.0)
+        {
+            for (const Event& event : batch)
+                std::visit(vis, event);
+            return;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t processed = 0;
+        for (const Event& event : batch)
+        {
             std::visit(vis, event);
-        mQueue.clear();
+            ++processed;
+            // Checked after dispatch, not before, because whether an event instantiates anything is not
+            // knowable from the event alone -- OnActive only costs something when the object's scripts are
+            // not loaded yet. The cost of that is overshooting the budget by at most one event.
+            const double spent
+                = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (spent >= budgetMs && processed < batch.size())
+                break;
+        }
+        budgetMs -= std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+        if (processed < batch.size())
+        {
+            // Rebuilt by move-construction rather than inserted at the front. OnNewExterior holds a
+            // CellStore reference, so Event has no move assignment, and vector::insert needs assignment to
+            // shift the elements already present.
+            std::vector<Event> remaining;
+            remaining.reserve(batch.size() - processed + mQueue.size());
+            for (std::size_t i = processed; i < batch.size(); ++i)
+                remaining.push_back(std::move(batch[i]));
+            // Anything a handler queued during this pass goes after the deferred tail, preserving order.
+            for (Event& queued : mQueue)
+                remaining.push_back(std::move(queued));
+            mQueue = std::move(remaining);
+        }
     }
 
 }
