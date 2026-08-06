@@ -10,6 +10,7 @@
 #include <components/esm/exteriorcelllocation.hpp>
 #include <components/misc/algorithm.hpp>
 
+#include "cellrefindex.hpp"
 #include "cellstore.hpp"
 #include "ptr.hpp"
 #include "ptrregistry.hpp"
@@ -67,6 +68,10 @@ namespace MWWorld
 
         Ptr getPtrByRefId(const ESM::RefId& name);
 
+        /// Advances the reference id index by at most \a budgetMs, so that getPtrByRefId stops reading cells
+        /// that cannot contain what it is looking for. Cheap once the index is complete. See CellRefIndex.
+        void advanceCellRefIndex(double budgetMs) { mCellRefIndex.advance(mStore, mReaders, budgetMs); }
+
         Ptr getPtr(ESM::RefNum refNum) const { return mPtrRegistry.getOrEmpty(refNum); }
 
         PtrRegistryView getPtrRegistryView() const { return PtrRegistryView(mPtrRegistry); }
@@ -116,6 +121,7 @@ namespace MWWorld
         ESM::Cell mDraftCell;
         std::vector<std::pair<ESM::RefId, CellStore*>> mIdCache;
         std::size_t mIdCacheIndex = 0;
+        CellRefIndex mCellRefIndex;
 
         CellStore& getOrInsertCellStore(const ESM::Cell& cell);
 

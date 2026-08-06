@@ -391,11 +391,58 @@ MWWorld::Ptr MWWorld::WorldModel::getPtrByRefId(const ESM::RefId& name)
     // Now try the other cells
     const MWWorld::Store<ESM::Cell>& cells = mStore.get<ESM::Cell>();
 
+    // Which of those cells can possibly declare this id, asked once rather than once per cell.
+    //
+    // The loops below are otherwise untouched, deliberately. The index is used only to skip -- never to
+    // choose, reorder or shortcut -- so the order these cells are visited in is unchanged, including the
+    // reverse iteration over mExteriors above that exists to resolve the vanilla game's ambiguous
+    // chargen_plank in favour of the right one. A filter cannot get that wrong; a replacement lookup could.
+    //
+    // Skipping is what makes this worth doing at all: insertCellStore constructs a CellStore, and
+    // getPtrAndCache then has it parse the cell's whole reference list off disk. Both are avoided for a cell
+    // that provably has nothing to offer. Until the index finishes building, cannotContain answers false
+    // throughout and this behaves exactly as it did before.
+    const CellRefIndex::Query declaring = mCellRefIndex.query(name);
+
+    // Reports what this search actually cost, on every exit path.
+    //
+    // Worth having because the absence of a freeze is not evidence that the index is working -- the search
+    // that used to freeze happens once per AI package and might simply not have fired. "Read 0 cells, skipped
+    // 3214" is evidence. Silent unless the fallback ran at all, and only for the first few, since once it is
+    // working there is nothing to watch.
+    struct Report
+    {
+        const ESM::RefId& mName;
+        std::size_t mIndexed;
+        std::size_t mTotal;
+        bool mComplete;
+        unsigned int mRead = 0;
+        unsigned int mSkipped = 0;
+
+        ~Report()
+        {
+            if (mRead + mSkipped == 0)
+                return;
+            static unsigned int sReported = 0;
+            if (++sReported > 20)
+                return;
+            Log(Debug::Info) << "Searched for " << mName << " outside the loaded cells: read " << mRead
+                             << " cells, skipped " << mSkipped << "; index covers " << mIndexed << " of "
+                             << mTotal << " cells" << (mComplete ? " (complete)" : " so far");
+        }
+    } report{ name, mCellRefIndex.indexedCells(), mCellRefIndex.totalCells(), mCellRefIndex.complete() };
+
     for (auto iter = cells.extBegin(); iter != cells.extEnd(); ++iter)
     {
         if (mCells.contains(iter->mId))
             continue;
+        if (declaring.cannotContain(iter->mId))
+        {
+            ++report.mSkipped;
+            continue;
+        }
 
+        ++report.mRead;
         Ptr ptr = getPtrAndCache(name, insertCellStore(*iter));
 
         if (!ptr.isEmpty())
@@ -406,7 +453,13 @@ MWWorld::Ptr MWWorld::WorldModel::getPtrByRefId(const ESM::RefId& name)
     {
         if (mCells.contains(iter->mId))
             continue;
+        if (declaring.cannotContain(iter->mId))
+        {
+            ++report.mSkipped;
+            continue;
+        }
 
+        ++report.mRead;
         Ptr ptr = getPtrAndCache(name, insertCellStore(*iter));
 
         if (!ptr.isEmpty())

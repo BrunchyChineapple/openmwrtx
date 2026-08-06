@@ -169,6 +169,23 @@ Cells Settings
    you can try a lower value, although the framerate during loading will suffer a bit in that case.
 
 .. omw-setting::
+   :title: ref id index budget ms
+   :type: float32
+   :range: ≥ 0
+   :default: 3.0
+
+   Milliseconds of work per frame spent building an index of which cells declare which object IDs.
+
+   Searching for an object by ID falls back, when the object is not in an already-loaded cell, to reading
+   every exterior and then every interior cell in the content files and parsing each one's reference list.
+   On a large load order that fallback can take several seconds inside a single frame, and it is reachable
+   from the per-frame AI update. With the index built, cells that cannot contain the ID being searched for
+   are skipped without being read at all.
+
+   The index is built in slices while the game runs and is paid for once per session. Until it completes,
+   searches behave exactly as they did without it. Setting this to zero disables the index entirely.
+
+.. omw-setting::
    :title: pointers cache size
    :type: int
    :range: [40, 1000]

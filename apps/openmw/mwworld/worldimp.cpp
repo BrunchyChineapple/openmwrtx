@@ -1606,6 +1606,19 @@ namespace MWWorld
                 MWBase::Environment::get().getWindowManager()->getLoadingScreen());
             mWorldScene->resetCellLoaded();
         }
+
+        // Chip away at the reference id index while the game runs, so that a later search by id does not have
+        // to read every cell in the content files to discover it is not there. See MWWorld::CellRefIndex for
+        // why this is built here rather than on a worker thread, and why it is safe for the search to trust it.
+        //
+        // Not run while paused: the point of a per-frame budget is to hide behind frames that are happening
+        // anyway, and a paused game has a menu open that the player is waiting on.
+        //
+        // Deliberately a small slice. The whole build is a few seconds of work paid once per session, and the
+        // stall it removes is over four seconds, so there is no need to hurry and every reason not to be felt.
+        // The setting's sanitizer already floors this at zero, and zero means "do not build the index".
+        if (!paused)
+            mWorldModel.advanceCellRefIndex(Settings::cells().mRefIdIndexBudgetMs);
     }
 
     void World::updatePhysics(
