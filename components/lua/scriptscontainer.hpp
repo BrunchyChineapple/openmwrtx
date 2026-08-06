@@ -1,6 +1,8 @@
 #ifndef COMPONENTS_LUA_SCRIPTSCONTAINER_H
 #define COMPONENTS_LUA_SCRIPTSCONTAINER_H
 
+#include <chrono>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -193,9 +195,32 @@ namespace LuaUtil
         {
             float mAvgInstructionCount = 0; // averaged number of Lua instructions per frame
             int64_t mMemoryUsage = 0; // bytes
+            /// Wall time this script's engine handlers took during the current profiler frame, in ms.
+            ///
+            /// Kept because the instruction count above cannot answer "which script made the frame late".
+            /// A Lua call into an engine binding is one instruction no matter how long the engine spends
+            /// inside it, so a script that asks the engine one expensive question per frame is
+            /// indistinguishable from one that asks a cheap one. That is not a hypothetical distinction
+            /// here: a single object lookup by id used to read every cell in the world, and no
+            /// instruction count would have moved.
+            ///
+            /// Not averaged, unlike the instruction count. The thing being diagnosed is one late frame,
+            /// and a thirty-frame average of a 300 ms spike is a 10 ms line item.
+            double mFrameTimeMs = 0.0;
+            /// Handler invocations behind mFrameTimeMs, so a slow script can be told from a numerous one.
+            unsigned int mFrameCalls = 0;
         };
         void collectStats(std::vector<ScriptStats>& stats) const;
         static int64_t getInstanceCount() { return sInstanceCount; }
+
+        /// Opens a new window for ScriptStats::mFrameTimeMs. Call once per Lua update, before any handler.
+        ///
+        /// Per-script times are stamped with this counter rather than cleared in statsNextFrame, because
+        /// statsNextFrame is only called for the global container and the active local ones. Menu scripts
+        /// and containers reached solely through an event handler never see it, so clearing there would
+        /// leave those accumulating across frames and reporting a total that belongs to no single frame.
+        static void beginProfilerFrame() { ++sProfilerFrame; }
+        static std::uint64_t profilerFrame() { return sProfilerFrame; }
 
         virtual bool isActive() const { return false; }
 
@@ -250,6 +275,13 @@ namespace LuaUtil
             ensureLoaded();
             for (Handler& handler : handlers.mList)
             {
+                // Two clock reads per handler call, unconditionally. Measured against what it buys: the
+                // frame loop was blocking for up to 346 ms waiting on this thread with no way to say which
+                // of 206 scripts was responsible. steady_clock::now is a QueryPerformanceCounter read at
+                // roughly 25 ns, so even a few thousand handler calls per frame is well under 0.1 ms --
+                // and the call count is reported alongside the time so that assumption stays checkable
+                // rather than being taken on trust.
+                const auto handlerStart = std::chrono::steady_clock::now();
                 try
                 {
                     LuaUtil::call({ this, handler.mScriptId }, handler.mFn, args...);
@@ -259,6 +291,11 @@ namespace LuaUtil
                     Log(Debug::Error) << mNamePrefix << "[" << scriptPath(handler.mScriptId) << "] " << handlers.mName
                                       << " failed. " << e.what();
                 }
+                // Charged even when the handler threw: the time was spent either way, and a handler that
+                // throws slowly is exactly the kind of thing worth seeing.
+                addFrameTime(handler.mScriptId,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - handlerStart)
+                        .count());
             }
         }
 
@@ -281,6 +318,8 @@ namespace LuaUtil
             std::map<int64_t, sol::main_protected_function> mTemporaryCallbacks;
             VFS::Path::Normalized mPath;
             ScriptStats mStats;
+            /// Which profiler frame mStats.mFrameTimeMs belongs to. See beginProfilerFrame.
+            std::uint64_t mFrameTimeStamp = 0;
 
             ~Script();
         };
@@ -300,6 +339,7 @@ namespace LuaUtil
         friend class LuaState;
         void addInstructionCount(int scriptId, int64_t instructionCount);
         void addMemoryUsage(int scriptId, int64_t memoryDelta);
+        void addFrameTime(int scriptId, double ms);
 
         // Add to container without calling onInit/onLoad.
         bool addScript(
@@ -362,6 +402,10 @@ namespace LuaUtil
         friend class ScriptTracker;
 
         static int64_t sInstanceCount; // debug information, shown in Lua profiler
+    /// Not atomic on purpose. Every path that touches it runs inside LuaState::protectedCall, and the
+    /// main thread's synchronizedUpdate completes before the frame hands the worker its update request,
+    /// so Lua work is serialised even though it changes threads.
+    static std::uint64_t sProfilerFrame;
     };
 }
 

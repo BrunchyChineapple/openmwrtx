@@ -634,6 +634,33 @@ namespace MWRender
         double mCompositeEncodeMs = 0.0;
         unsigned int mCompositesDeferred = 0;
 
+        /// The most expensive submit since the last scene log, with the state that could explain it.
+        ///
+        /// A mean cannot describe this and neither can the frame report, which measures submit as one
+        /// number. Measured submits run a few milliseconds most frames and spike to 88-168 ms, and one
+        /// frame of 97.5 ms was 98.6% accounted for by submit alone -- so the spike is real, it is ours,
+        /// and it was the second largest remaining stutter with nothing saying which half of the function
+        /// it was in.
+        ///
+        /// Split into the two halves that do the work, because they fail for unrelated reasons: the
+        /// traversal walks the scene graph and its cost tracks how much geometry is loaded, while the flush
+        /// hands instances to the runtime and builds acceleration structures for whatever is new. Steady
+        /// state is roughly 9,000-11,000 instances with 85 meshes built, and a burst of new meshes is a
+        /// very different problem from a traversal that got longer.
+        struct WorstSubmit
+        {
+            double mTotalMs = 0.0;
+            double mTraversalMs = 0.0;
+            double mFlushMs = 0.0;
+            double mCompositeEncodeMs = 0.0;
+            unsigned int mInstances = 0;
+            unsigned int mMeshesCreated = 0;
+            unsigned int mPrimitives = 0;
+            unsigned int mCulled = 0;
+            std::uint64_t mFrame = 0;
+        };
+        WorstSubmit mWorstSubmit;
+
         /// One queued instance, held from drawSubmitted until flushSubmissions.
         ///
         /// The transform is copied by value rather than pointed at. The traversal writes it into a stack

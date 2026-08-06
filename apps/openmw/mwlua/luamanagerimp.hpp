@@ -60,6 +60,30 @@ namespace MWLua
         // The parallelism can be turned off in the settings.
         void update();
 
+        /// Wall-clock cost of one update(), split so an overrun can be attributed to a part of it.
+        ///
+        /// The spans tile update() completely rather than sampling the parts that looked suspicious. That
+        /// choice is what the previous round of this cost: the frame loop's wait on this thread was
+        /// measured at up to 346 ms and several runs went on ruling out phases that were never in the
+        /// frame at all.
+        struct UpdateBreakdown
+        {
+            double mGarbageCollect = 0.0;
+            /// Object list rebuild, auto-started scripts, dead container sweep, per-script stat rollover.
+            double mBookkeeping = 0.0;
+            double mTimers = 0.0;
+            double mEventHandlers = 0.0;
+            double mQueuedCallbacks = 0.0;
+            double mEngineEvents = 0.0;
+            double mLocalScriptUpdates = 0.0;
+            double mGlobalScriptUpdates = 0.0;
+            double mScriptUnloading = 0.0;
+            /// Measured end to end, not summed from the spans, so anything they fail to cover shows up as
+            /// a difference rather than disappearing.
+            double mTotal = 0.0;
+            unsigned int mActiveLocalScripts = 0;
+        };
+
         // \brief Executes latency-critical and scene graph related Lua logic.
         //
         // Called by engine.cpp from the main thread between InputManager and MechanicsManager updates.
@@ -195,6 +219,9 @@ namespace MWLua
             std::optional<LuaUtil::ScriptIdsWithInitializationData> autoStartConf = std::nullopt);
         void reloadAllScriptsImpl();
         void synchronizedUpdateUnsafe();
+
+        /// Logs the breakdown and the worst scripts of the frame when update() overruns. Silent otherwise.
+        void reportSlowUpdate(const UpdateBreakdown& breakdown) const;
 
         bool mInitialized = false;
         bool mGlobalScriptsStarted = false;

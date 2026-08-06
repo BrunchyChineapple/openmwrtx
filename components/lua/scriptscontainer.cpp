@@ -787,6 +787,30 @@ namespace LuaUtil
         }
     }
 
+    std::uint64_t ScriptsContainer::sProfilerFrame = 0;
+
+    void ScriptsContainer::addFrameTime(int scriptId, double ms)
+    {
+        if (LoadedData* data = std::get_if<LoadedData>(&mData))
+        {
+            auto it = data->mScripts.find(scriptId);
+            if (it == data->mScripts.end())
+                return;
+            Script& script = it->second;
+            // Lazily zeroed on first touch of a new frame rather than cleared for everyone at frame start.
+            // Clearing every script every frame would walk all of them whether they ran or not, which is
+            // the opposite of what a profiler for a hot path should do.
+            if (script.mFrameTimeStamp != sProfilerFrame)
+            {
+                script.mFrameTimeStamp = sProfilerFrame;
+                script.mStats.mFrameTimeMs = 0.0;
+                script.mStats.mFrameCalls = 0;
+            }
+            script.mStats.mFrameTimeMs += ms;
+            script.mStats.mFrameCalls += 1;
+        }
+    }
+
     void ScriptsContainer::addMemoryUsage(int scriptId, int64_t memoryDelta)
     {
         int64_t* usage = std::visit(
@@ -825,6 +849,13 @@ namespace LuaUtil
             {
                 stats[id].mAvgInstructionCount += script.mStats.mAvgInstructionCount;
                 stats[id].mMemoryUsage += script.mStats.mMemoryUsage;
+                // Only the current frame's samples. A stale value belongs to whichever earlier frame last
+                // ran this script, and summing it in would attribute another frame's cost to this one.
+                if (script.mFrameTimeStamp == sProfilerFrame)
+                {
+                    stats[id].mFrameTimeMs += script.mStats.mFrameTimeMs;
+                    stats[id].mFrameCalls += script.mStats.mFrameCalls;
+                }
             }
         }
         for (auto& [id, mem] : mRemovedScriptsMemoryUsage)

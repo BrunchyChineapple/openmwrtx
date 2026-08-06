@@ -2567,13 +2567,37 @@ namespace MWRender
                 static_cast<float>(right.z())),
             osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())),
             frustum);
+        const auto traversalStart = std::chrono::steady_clock::now();
         sceneRoot->accept(visitor);
+        const auto flushStart = std::chrono::steady_clock::now();
         // Everything the traversal queued is handed over here, nearest-first and under the triangle budget.
         // Must run before the counters below are read: mPrimitivesSubmitted and mInstancesOverBudget are
         // decided by the admission pass, not by the traversal.
         flushSubmissions();
+        const auto flushEnd = std::chrono::steady_clock::now();
         mLastInstanceCount = visitor.instances();
         mCulled = visitor.culled();
+
+        // Keep the worst submit of the window together with the counters from the same frame. Recording
+        // them separately would pair a spike with whichever frame's counts happened to be logged next,
+        // which is the mistake that had an opacity micromap message blamed for a stall earlier.
+        {
+            const double traversalMs
+                = std::chrono::duration<double, std::milli>(flushStart - traversalStart).count();
+            const double flushMs = std::chrono::duration<double, std::milli>(flushEnd - flushStart).count();
+            if (traversalMs + flushMs > mWorstSubmit.mTotalMs)
+            {
+                mWorstSubmit.mTotalMs = traversalMs + flushMs;
+                mWorstSubmit.mTraversalMs = traversalMs;
+                mWorstSubmit.mFlushMs = flushMs;
+                mWorstSubmit.mCompositeEncodeMs = mCompositeEncodeMs;
+                mWorstSubmit.mInstances = mLastInstanceCount;
+                mWorstSubmit.mMeshesCreated = mMeshesCreated;
+                mWorstSubmit.mPrimitives = mPrimitivesSubmitted;
+                mWorstSubmit.mCulled = mCulled;
+                mWorstSubmit.mFrame = mFrame;
+            }
+        }
 
         if (visitor.clamped() && !mLoggedClamp)
         {
@@ -2641,6 +2665,16 @@ namespace MWRender
                              << ", " << forward.z() << " up " << up.x() << ", " << up.y() << ", "
                              << up.z() << " fov " << fov << " near " << nearClip << " far " << farClip
                              << (populated ? "" : " -- nothing found, so Remix has nothing to raytrace");
+            // The spike, not the average. See WorstSubmit.
+            Log(Debug::Info) << "Remix scene: worst submit since the last report " << mWorstSubmit.mTotalMs
+                             << " ms on frame " << mWorstSubmit.mFrame << " -- traversal "
+                             << mWorstSubmit.mTraversalMs << " ms, hand-over and mesh builds "
+                             << mWorstSubmit.mFlushMs << " ms (composite encode "
+                             << mWorstSubmit.mCompositeEncodeMs << " ms of that); " << mWorstSubmit.mInstances
+                             << " instances, " << mWorstSubmit.mMeshesCreated << " meshes built, "
+                             << mWorstSubmit.mPrimitives << " triangles, " << mWorstSubmit.mCulled
+                             << " culled";
+            mWorstSubmit = WorstSubmit{};
             if (mHaveExtent)
             {
                 // The camera sits inside this box when geometry really is around the player. If it does

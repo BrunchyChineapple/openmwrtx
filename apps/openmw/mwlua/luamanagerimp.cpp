@@ -220,8 +220,38 @@ namespace MWLua
 
     void LuaManager::update()
     {
+        // Wall-clock breakdown of this function, reported when it overruns.
+        //
+        // This runs on the Lua worker thread and the frame loop blocks in Worker::finishUpdate waiting for
+        // it. The frame report measured that wait at 108-346 ms on ordinary walking frames, which on its
+        // own accounted for nearly all of a 379 ms frame -- 32 ms of measured spans plus 346 ms of waiting
+        // here. What no existing measurement could say was which part of the Lua update was slow.
+        //
+        // The spans below tile the whole function rather than sampling suspects, because the previous
+        // round of this was spent ruling out things that were never in the frame. Per-script time comes
+        // from ScriptStats::mFrameTimeMs, which exists because OpenMW's own per-script metric is an
+        // averaged instruction count and a call into an engine binding is one instruction however long
+        // the engine spends inside it.
+        const auto updateStart = std::chrono::steady_clock::now();
+        auto lapStamp = updateStart;
+        // Milliseconds since the previous lap, so consecutive spans share one clock read at each boundary
+        // instead of taking two each.
+        const auto lap = [&lapStamp] {
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - lapStamp).count();
+            lapStamp = now;
+            return ms;
+        };
+
+        // Opens the window that callEngineHandlers accumulates per-script time into. Placed here so the
+        // window is exactly the span the frame loop waits on, no wider and no narrower.
+        LuaUtil::ScriptsContainer::beginProfilerFrame();
+
+        UpdateBreakdown breakdown;
+
         if (const int steps = Settings::lua().mGcStepsPerFrame; steps > 0)
             lua_gc(mLua.unsafeState(), LUA_GCSTEP, steps);
+        breakdown.mGarbageCollect = lap();
 
         if (mPlayer.isEmpty())
             return; // The game is not started yet.
@@ -252,6 +282,8 @@ namespace MWLua
         mGlobalScripts.statsNextFrame();
         for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
             asLocal(ptr)->statsNextFrame();
+        breakdown.mBookkeeping = lap();
+        breakdown.mActiveLocalScripts = static_cast<unsigned int>(mActiveLocalScripts.size());
 
         mLuaEvents.finalizeEventBatch();
 
@@ -263,27 +295,115 @@ namespace MWLua
             for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
                 asLocal(ptr)->processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
         }
+        breakdown.mTimers = lap();
 
         // Run event handlers for events that were sent before `finalizeEventBatch`.
         mLuaEvents.callEventHandlers();
+        breakdown.mEventHandlers = lap();
 
         mLua.protectedCall([&](LuaUtil::LuaView& lua) {
             // Run queued callbacks
             for (CallbackWithData& c : mQueuedCallbacks)
                 c.mCallback.tryCall(c.mArg);
             mQueuedCallbacks.clear();
+            breakdown.mQueuedCallbacks = lap();
 
             // Run engine handlers
             mEngineEvents.callEngineHandlers();
+            breakdown.mEngineEvents = lap();
             bool isPaused = timeManager.isPaused();
 
             float frameDuration = MWBase::Environment::get().getFrameDuration();
             for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
                 asLocal(ptr)->update(isPaused ? 0 : frameDuration);
+            breakdown.mLocalScriptUpdates = lap();
             mGlobalScripts.update(isPaused ? 0 : frameDuration);
+            breakdown.mGlobalScriptUpdates = lap();
 
             mScriptTracker.unloadInactiveScripts(lua);
+            breakdown.mScriptUnloading = lap();
         });
+
+        breakdown.mTotal
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - updateStart)
+                  .count();
+        reportSlowUpdate(breakdown);
+    }
+
+    void LuaManager::reportSlowUpdate(const UpdateBreakdown& breakdown) const
+    {
+        // Well above anything a frame's Lua update should cost, so this stays silent unless something is
+        // genuinely wrong. Set below the smallest wait measured so far (108 ms) so none of them escape.
+        constexpr double overrunMs = 100.0;
+        if (breakdown.mTotal < overrunMs)
+            return;
+
+        Log(Debug::Warning) << "Lua update held the frame thread for " << breakdown.mTotal << " ms across "
+                            << breakdown.mActiveLocalScripts
+                            << " active local script container(s): garbage collect "
+                            << breakdown.mGarbageCollect << " | bookkeeping " << breakdown.mBookkeeping
+                            << " | timers " << breakdown.mTimers << " | event handlers "
+                            << breakdown.mEventHandlers << " | queued callbacks "
+                            << breakdown.mQueuedCallbacks << " | engine events "
+                            << breakdown.mEngineEvents << " | local script updates "
+                            << breakdown.mLocalScriptUpdates << " | global script updates "
+                            << breakdown.mGlobalScriptUpdates << " | script unloading "
+                            << breakdown.mScriptUnloading;
+
+        // Per-script attribution for the same frame. Sums every container so a script running on four
+        // hundred actors is reported once with its total, which is the number that matters here -- a
+        // cheap handler multiplied by the active actor count is a perfectly ordinary way to lose 300 ms,
+        // and it looks nothing like one expensive script in a per-instance view.
+        using Stats = LuaUtil::ScriptsContainer::ScriptStats;
+        std::vector<Stats> stats;
+        mGlobalScripts.collectStats(stats);
+        for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
+        {
+            if (LocalScripts* scripts = asLocal(ptr))
+                scripts->collectStats(stats);
+        }
+
+        std::vector<std::size_t> order;
+        order.reserve(stats.size());
+        for (std::size_t id = 0; id < stats.size(); ++id)
+        {
+            if (stats[id].mFrameCalls > 0)
+                order.push_back(id);
+        }
+        std::sort(order.begin(), order.end(),
+            [&stats](std::size_t a, std::size_t b) { return stats[a].mFrameTimeMs > stats[b].mFrameTimeMs; });
+
+        const LuaUtil::ScriptsConfiguration& configuration = mLua.getConfiguration();
+        double attributed = 0.0;
+        unsigned int calls = 0;
+        for (const std::size_t id : order)
+        {
+            attributed += stats[id].mFrameTimeMs;
+            calls += stats[id].mFrameCalls;
+        }
+
+        // Only the worst few. The point is to name a culprit, and a table of 206 rows in a log is a
+        // thing nobody reads.
+        constexpr std::size_t kReported = 8;
+        for (std::size_t i = 0; i < order.size() && i < kReported; ++i)
+        {
+            const std::size_t id = order[i];
+            Log msg(Debug::Warning);
+            msg << "  " << stats[id].mFrameTimeMs << " ms across " << stats[id].mFrameCalls
+                << " handler call(s): ";
+            // collectStats sizes its vector from the configuration, so this should always hold. Checked
+            // anyway rather than indexed on faith, because the alternative is an out-of-range read in a
+            // diagnostic that only runs when something is already going wrong.
+            if (id < configuration.size())
+                msg << configuration[id].mScriptPath;
+            else
+                msg << "<script id " << id << " not in the configuration>";
+        }
+        // The remainder is not slack to be ignored: it covers Lua reached other than through an engine
+        // handler -- event handlers, timer callbacks and queued callbacks -- and the spans above say which.
+        Log(Debug::Warning) << "  " << attributed << " ms of " << breakdown.mTotal
+                            << " ms attributed to engine handlers across " << calls << " call(s) in "
+                            << order.size() << " script(s); the rest is in the spans above";
     }
 
     void LuaManager::objectTeleported(const MWWorld::Ptr& ptr)

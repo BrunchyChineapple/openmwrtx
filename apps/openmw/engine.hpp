@@ -277,6 +277,19 @@ namespace OMW
             /// SimulationPhases.
             double mWorstPostCopyMs = 0.0;
             double mWorstLuaFinishMs = 0.0;
+            /// Summed across the window, so the mean accounting covers them too.
+            double mPostCopyMs = 0.0;
+            double mLuaFinishMs = 0.0;
+            /// The worst frame's own share of the two, so the accounted percentage can include them.
+            ///
+            /// Tracking only the window maxima was a real defect in this report, not a missing nicety. A
+            /// frame of 379 ms was printed as "accounted 31.97 of 379.144 (8.43%)" while Lua finish for the
+            /// same window stood at 346.437 -- and 31.97 + 346.437 is 378.4. The frame was fully explained
+            /// and the line said it was 8% explained, because the one span that accounted for ninety percent
+            /// of it was measured, printed, and then left out of the sum. Several windows were spent looking
+            /// for a phantom before the two numbers were added together by hand.
+            double mWorstFramePostCopyMs = 0.0;
+            double mWorstFrameLuaFinishMs = 0.0;
             /// The worst frame's own simulation breakdown, and the window maxima tracked independently of
             /// it for the same reason submit and present are.
             SimulationPhases mWorstFramePhases;

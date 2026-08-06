@@ -1139,6 +1139,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             mRemixTiming.mWorstPostCopyMs = std::max(mRemixTiming.mWorstPostCopyMs, mRemixPostCopyMs);
             mRemixTiming.mWorstLuaFinishMs
                 = std::max(mRemixTiming.mWorstLuaFinishMs, mRemixLuaFinishMs);
+            mRemixTiming.mPostCopyMs += mRemixPostCopyMs;
+            mRemixTiming.mLuaFinishMs += mRemixLuaFinishMs;
 
             SimulationPhases& worstPhases = mRemixTiming.mWorstPhases;
             worstPhases.mInput = std::max(worstPhases.mInput, mRemixPhases.mInput);
@@ -1201,6 +1203,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 mRemixTiming.mWorstFrameReadbackMs = readbackMs;
                 mRemixTiming.mWorstFrameOsgUpdateMs = mRemixOsgUpdateMs;
                 mRemixTiming.mWorstFrameOsgRenderMs = mRemixRenderMs;
+                mRemixTiming.mWorstFramePostCopyMs = mRemixPostCopyMs;
+                mRemixTiming.mWorstFrameLuaFinishMs = mRemixLuaFinishMs;
                 mRemixTiming.mWorstFrameIndex = mRemixTiming.mFrames;
             }
 
@@ -1227,8 +1231,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 // the next thing to do is measure, not optimise -- which is exactly the mistake the first
                 // pass at this made by assuming the readback dominated.
                 const double phases = mRemixTiming.mPhasesTotalMs / frames;
+                const double luaFinish = mRemixTiming.mLuaFinishMs / frames;
+                const double postCopy = mRemixTiming.mPostCopyMs / frames;
                 const double accounted = submit + present + (mRemixTiming.mCopyMs / frames) + readbackQueue
-                    + readbackLock + readbackCopy + osgUpdate + osgRender + phases;
+                    + readbackLock + readbackCopy + osgUpdate + osgRender + phases + luaFinish + postCopy;
 
                 Log(Debug::Info) << "Remix frame cost over " << mRemixTiming.mFrames
                                  << " frames, mean ms: frame " << frame << " | OpenMW update " << osgUpdate
@@ -1237,6 +1243,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                                  << (mRemixTiming.mCopyMs / frames) << " | readback queue " << readbackQueue
                                  << " | readback lock (GPU wait) " << readbackLock << " | readback copy "
                                  << readbackCopy << " | OpenMW simulation " << phases
+                                 << " | Lua worker wait " << luaFinish << " | post-copy " << postCopy
                                  << " | upload CPU->GPU " << uploadMs << " (draw thread, "
                                  << uploads << " uploads); worst single readback "
                                  << mRemixTiming.mWorstReadbackMs
@@ -1246,7 +1253,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 const double worstAccounted = mRemixTiming.mWorstFrameSubmitMs
                     + mRemixTiming.mWorstFramePresentMs + mRemixTiming.mWorstFrameCopyMs
                     + mRemixTiming.mWorstFrameReadbackMs + mRemixTiming.mWorstFrameOsgUpdateMs
-                    + mRemixTiming.mWorstFrameOsgRenderMs + mRemixTiming.mWorstFramePhases.total();
+                    + mRemixTiming.mWorstFrameOsgRenderMs + mRemixTiming.mWorstFramePhases.total()
+                    + mRemixTiming.mWorstFrameLuaFinishMs + mRemixTiming.mWorstFramePostCopyMs;
 
                 const SimulationPhases& wfp = mRemixTiming.mWorstFramePhases;
                 const SimulationPhases& wp = mRemixTiming.mWorstPhases;
@@ -1311,7 +1319,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                                  << mRemixTiming.mWorstFrameSubmitMs << " | present "
                                  << mRemixTiming.mWorstFramePresentMs << " | copy to shared "
                                  << mRemixTiming.mWorstFrameCopyMs << " | readback "
-                                 << mRemixTiming.mWorstFrameReadbackMs << "; accounted " << worstAccounted
+                                 << mRemixTiming.mWorstFrameReadbackMs << " | Lua worker wait "
+                                 << mRemixTiming.mWorstFrameLuaFinishMs << " | post-copy "
+                                 << mRemixTiming.mWorstFramePostCopyMs << "; accounted " << worstAccounted
                                  << " of " << mRemixTiming.mWorstFrameMs << " ("
                                  << (mRemixTiming.mWorstFrameMs > 0.0
                                             ? 100.0 * worstAccounted / mRemixTiming.mWorstFrameMs
