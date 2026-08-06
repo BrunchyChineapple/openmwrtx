@@ -1,6 +1,12 @@
 #include "luamanagerimp.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <map>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include <MyGUI_InputManager.h>
 #include <osg/Stats>
@@ -372,14 +378,66 @@ namespace MWLua
 
     void LuaManager::applyDelayedActions()
     {
-        BoolScopeGuard applyingGuard(mApplyingDelayedActions);
-        for (DelayedAction& action : mActionQueue)
-            action.apply();
-        mActionQueue.clear();
+        // The batch is timed as well as each action, because the two describe different problems and only
+        // one of them was visible.
+        //
+        // A measured 769 ms stall sat inside LuaUi::Element::create under DelayedAction::apply, yet no
+        // single action reported an overrun -- the queue was simply long. One four-hundred-millisecond
+        // action and four hundred one-millisecond actions cost the same frame and want opposite fixes, and
+        // per-action timing alone cannot tell them apart.
+        constexpr double batchOverrunMs = 150.0;
+        const auto batchStarted = std::chrono::steady_clock::now();
+        const std::size_t queued = mActionQueue.size();
 
-        if (mTeleportPlayerAction)
-            mTeleportPlayerAction->apply();
-        mTeleportPlayerAction.reset();
+        // Per-name totals, so an overrunning batch says what it was full of. Only populated once the batch
+        // is already known to be long, which is why the timing is per action rather than measured here.
+        std::vector<std::pair<std::string_view, double>> costs;
+        costs.reserve(queued);
+
+        {
+            BoolScopeGuard applyingGuard(mApplyingDelayedActions);
+            for (DelayedAction& action : mActionQueue)
+            {
+                const auto actionStarted = std::chrono::steady_clock::now();
+                action.apply();
+                costs.emplace_back(action.name(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - actionStarted)
+                        .count());
+            }
+            mActionQueue.clear();
+
+            if (mTeleportPlayerAction)
+                mTeleportPlayerAction->apply();
+            mTeleportPlayerAction.reset();
+        }
+
+        const double batchMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batchStarted)
+                  .count();
+        if (batchMs < batchOverrunMs || queued == 0)
+            return;
+
+        std::map<std::string_view, std::pair<unsigned int, double>> byName;
+        for (const auto& [name, ms] : costs)
+        {
+            auto& entry = byName[name];
+            entry.first += 1;
+            entry.second += ms;
+        }
+
+        std::vector<std::pair<std::string_view, std::pair<unsigned int, double>>> ranked(
+            byName.begin(), byName.end());
+        std::sort(ranked.begin(), ranked.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.second.second > rhs.second.second; });
+
+        Log(Debug::Warning) << "Lua actions held the main thread for " << batchMs << " ms across " << queued
+                            << " queued action(s); worst kinds:";
+        const std::size_t shown = std::min<std::size_t>(ranked.size(), 5);
+        for (std::size_t i = 0; i < shown; ++i)
+        {
+            Log(Debug::Warning) << "  '" << ranked[i].first << "' x" << ranked[i].second.first << " = "
+                                << ranked[i].second.second << " ms";
+        }
     }
 
     void LuaManager::clear()
@@ -920,6 +978,20 @@ namespace MWLua
 
     void LuaManager::DelayedAction::apply() const
     {
+        // Timed, and named when it overruns.
+        //
+        // These run on the main thread inside synchronizedUpdate, so a slow one is a stall with no other
+        // symptom: the frame breakdown can only say "lua sync", which is true of every action there is.
+        // Two measured stalls came through here -- 764 ms building a nested MyGUI widget tree via
+        // LuaUi::Element::create, and 792 ms inside ActionTeleport::teleport waiting on terrain load -- and
+        // neither could be attributed to a mod without this. mName is free; the traceback needs
+        // 'lua debug = true', which is worth one run to identify a culprit.
+        //
+        // The threshold is deliberately well above anything an action should cost, so this stays silent
+        // unless something is genuinely wrong.
+        constexpr double overrunMs = 100.0;
+        const auto started = std::chrono::steady_clock::now();
+
         try
         {
             mFn();
@@ -932,6 +1004,19 @@ namespace MWLua
                 Log(Debug::Error) << "Set 'lua debug=true' in settings.cfg to enable action tracebacks";
             else
                 Log(Debug::Error) << "Caller " << mCallerTraceback;
+        }
+
+        const double elapsedMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        if (elapsedMs >= overrunMs)
+        {
+            Log(Debug::Warning) << "Lua action '" << mName << "' held the main thread for " << elapsedMs
+                                << " ms";
+            if (mCallerTraceback.empty())
+                Log(Debug::Warning) << "  set 'lua debug = true' in settings.cfg to learn which script "
+                                       "queued it";
+            else
+                Log(Debug::Warning) << "  queued by " << mCallerTraceback;
         }
     }
 

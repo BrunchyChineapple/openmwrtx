@@ -244,6 +244,11 @@ namespace MWLua
             DelayedAction(LuaUtil::LuaState* state, std::function<void()> fn, std::string_view name);
             void apply() const;
 
+            /// The action's kind, for attributing a long queue. Not unique to a script: every ui.create
+            /// queues "Create UI" whoever called it, which is why a slow batch is reported by kind and
+            /// count rather than pretending to name a mod.
+            std::string_view name() const { return mName; }
+
         private:
             std::string mCallerTraceback;
             std::function<void()> mFn;
