@@ -8,8 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <chrono>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <osg/Camera>
@@ -98,6 +100,16 @@ namespace
         if (value == nullptr || *value == '\0')
             return fallback;
         return *value != '0';
+    }
+
+    /// Reads a millisecond budget from an environment variable, defaulting to \a fallback when unset,
+    /// empty or not a number. Negative values are clamped to zero, which the callers read as "no limit".
+    double envMilliseconds(const char* name, double fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+        return std::max(0.0, std::atof(value));
     }
 
     /// Emission strength for world geometry while lights are still missing. Low enough to read as flat
@@ -569,6 +581,52 @@ namespace
         return transfer;
     }
 
+    /// Splits [0, count) across hardware threads, running \a body(begin, end) on each span.
+    ///
+    /// The compressor below is the largest synchronous cost in texture submission, and it runs on the
+    /// frame thread. Serially it is tens of milliseconds for one 1024-square composite -- more than a
+    /// whole frame at 60 Hz -- so every chunk the terrain composites lands as a hitch. That is
+    /// independent of replacements, which is why it shows up walking through empty countryside.
+    ///
+    /// The work parallelises exactly: BC1 block encoding reads one 4x4 texel neighbourhood and writes
+    /// eight bytes at a fixed offset, and the box filter reads two source rows and writes one. No span
+    /// touches another's output, so no synchronisation is needed beyond the join.
+    ///
+    /// Threads are created per call rather than pooled. A composite is infrequent and the call is already
+    /// tens of milliseconds, so creation cost is noise against it, and a pool here would have to coexist
+    /// with OpenMW's own work queues for no benefit.
+    ///
+    /// \a minimumPerSpan keeps small mip levels serial: below it the thread handshake costs more than the
+    /// work, and the chain descends to 1x1.
+    template <typename Body>
+    void parallelSpans(int count, int minimumPerSpan, Body body)
+    {
+        const int available = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+        const int worthwhile = count / std::max(1, minimumPerSpan);
+        const int spans = std::clamp(worthwhile, 1, available);
+        if (spans <= 1)
+        {
+            body(0, count);
+            return;
+        }
+
+        const int perSpan = (count + spans - 1) / spans;
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<std::size_t>(spans) - 1);
+        for (int span = 1; span < spans; ++span)
+        {
+            const int begin = span * perSpan;
+            const int end = std::min(count, begin + perSpan);
+            if (begin >= end)
+                break;
+            workers.emplace_back([&body, begin, end] { body(begin, end); });
+        }
+        // The calling thread takes the first span rather than waiting, so one span costs no handshake.
+        body(0, std::min(count, perSpan));
+        for (std::thread& worker : workers)
+            worker.join();
+    }
+
     /// Encodes one 4x4 RGBA8 block, given as 16 tightly packed texels, into the eight bytes of a BC1 block.
     ///
     /// Range fit: the endpoints are the corners of the block's colour bounding box, inset slightly, and
@@ -667,73 +725,80 @@ namespace
     /// for the sub-block levels costing a whole block each.
     ///
     /// \a pixels is tightly packed RGBA8 of \a width by \a height.
+    ///
+    /// Span thresholds: a block row is four pixel rows, so 16 of them is 64 pixel rows of encoding, and a
+    /// level under 256 rows tall stays serial. Both are set so the smaller mip levels -- which are cheap
+    /// and numerous, the chain running to 1x1 -- do not pay a thread handshake to save microseconds.
+    constexpr int kMinBlockRowsPerSpan = 16;
+    constexpr int kMinFilterRowsPerSpan = 64;
+
     unsigned int compressBc1WithMips(
         const unsigned char* pixels, int width, int height, std::vector<unsigned char>& out)
     {
         const SrgbTransfer& transfer = srgbTransfer();
 
-        std::vector<unsigned char> level(
-            pixels, pixels + static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-        int levelWidth = width;
-        int levelHeight = height;
-        unsigned int levels = 0;
-
-        while (true)
+        // One parallel region for the whole chain, not one per level.
+        //
+        // The first version parallelised each mip level's encode and each downsample separately, which for
+        // a 1024-square composite spawned roughly sixty threads across the eleven levels. Thread creation
+        // on Windows costs tens of microseconds, so the handshake came to milliseconds and dominated the
+        // work it was hiding: measured cost per composite stayed at about 7 ms, and a burst of 82 in one
+        // frame produced the 678 ms scene-submit spike that the frame breakdown attributed the freeze to.
+        //
+        // So the chain is built first -- each downsample depends on the previous level, so that part is
+        // inherently sequential and is memory-bound rather than compute-bound -- and then every block of
+        // every level is encoded in a single parallel pass over a flat list of block rows. That is one
+        // thread-spawn set per composite instead of sixty.
+        struct MipLevel
         {
-            const std::size_t base = out.size();
-            out.resize(base + static_cast<std::size_t>(bc1LevelBytes(levelWidth, levelHeight)));
-            unsigned char* cursor = out.data() + base;
+            std::vector<unsigned char> pixels;
+            int width = 0;
+            int height = 0;
+            int blocksAcross = 0;
+            int blocksDown = 0;
+            std::size_t outOffset = 0;
+        };
 
-            for (int blockY = 0; blockY < levelHeight; blockY += 4)
-            {
-                for (int blockX = 0; blockX < levelWidth; blockX += 4)
-                {
-                    unsigned char block[64];
-                    for (int y = 0; y < 4; ++y)
-                    {
-                        // Levels smaller than 4x4 still occupy a whole block, so the last row and column
-                        // repeat to fill it. Clamping rather than zero-filling keeps the block's colour
-                        // range honest; padding with black would drag an endpoint to black.
-                        const int sourceY = std::min(blockY + y, levelHeight - 1);
-                        for (int x = 0; x < 4; ++x)
-                        {
-                            const int sourceX = std::min(blockX + x, levelWidth - 1);
-                            const unsigned char* source = level.data()
-                                + (static_cast<std::size_t>(sourceY) * levelWidth + sourceX) * 4;
-                            std::memcpy(block + (y * 4 + x) * 4, source, 4);
-                        }
-                    }
-                    encodeBc1Block(block, cursor);
-                    cursor += 8;
-                }
-            }
-            ++levels;
+        std::vector<MipLevel> chain;
+        {
+            MipLevel base;
+            base.pixels.assign(
+                pixels, pixels + static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+            base.width = width;
+            base.height = height;
+            chain.push_back(std::move(base));
+        }
 
-            if (levelWidth == 1 && levelHeight == 1)
-                break;
+        while (chain.back().width > 1 || chain.back().height > 1)
+        {
+            const MipLevel& source = chain.back();
+            const int levelWidth = source.width;
+            const int levelHeight = source.height;
 
             // 2x2 box filter in linear light. An odd extent repeats its surviving column or row rather
             // than dropping it; composites are square powers of two, so that path is defensive only.
-            const int nextWidth = std::max(1, levelWidth / 2);
-            const int nextHeight = std::max(1, levelHeight / 2);
-            std::vector<unsigned char> next(
-                static_cast<std::size_t>(nextWidth) * static_cast<std::size_t>(nextHeight) * 4);
-            for (int y = 0; y < nextHeight; ++y)
+            MipLevel next;
+            next.width = std::max(1, levelWidth / 2);
+            next.height = std::max(1, levelHeight / 2);
+            next.pixels.resize(
+                static_cast<std::size_t>(next.width) * static_cast<std::size_t>(next.height) * 4);
+
+            for (int y = 0; y < next.height; ++y)
             {
                 const int top = std::min(y * 2, levelHeight - 1);
                 const int bottom = std::min(y * 2 + 1, levelHeight - 1);
-                for (int x = 0; x < nextWidth; ++x)
+                for (int x = 0; x < next.width; ++x)
                 {
                     const int left = std::min(x * 2, levelWidth - 1);
                     const int right = std::min(x * 2 + 1, levelWidth - 1);
                     const unsigned char* corner[4] = {
-                        level.data() + (static_cast<std::size_t>(top) * levelWidth + left) * 4,
-                        level.data() + (static_cast<std::size_t>(top) * levelWidth + right) * 4,
-                        level.data() + (static_cast<std::size_t>(bottom) * levelWidth + left) * 4,
-                        level.data() + (static_cast<std::size_t>(bottom) * levelWidth + right) * 4,
+                        source.pixels.data() + (static_cast<std::size_t>(top) * levelWidth + left) * 4,
+                        source.pixels.data() + (static_cast<std::size_t>(top) * levelWidth + right) * 4,
+                        source.pixels.data() + (static_cast<std::size_t>(bottom) * levelWidth + left) * 4,
+                        source.pixels.data() + (static_cast<std::size_t>(bottom) * levelWidth + right) * 4,
                     };
                     unsigned char* destination
-                        = next.data() + (static_cast<std::size_t>(y) * nextWidth + x) * 4;
+                        = next.pixels.data() + (static_cast<std::size_t>(y) * next.width + x) * 4;
                     for (int channel = 0; channel < 3; ++channel)
                     {
                         const unsigned int sum = transfer.mToLinear[corner[0][channel]]
@@ -746,12 +811,67 @@ namespace
                         (corner[0][3] + corner[1][3] + corner[2][3] + corner[3][3] + 2) / 4);
                 }
             }
-            level = std::move(next);
-            levelWidth = nextWidth;
-            levelHeight = nextHeight;
+
+            chain.push_back(std::move(next));
         }
 
-        return levels;
+        // Lay the levels out largest first, which is the order a DDS mip chain and the upload both expect.
+        std::size_t total = 0;
+        for (MipLevel& level : chain)
+        {
+            level.blocksAcross = (level.width + 3) / 4;
+            level.blocksDown = (level.height + 3) / 4;
+            level.outOffset = total;
+            total += static_cast<std::size_t>(bc1LevelBytes(level.width, level.height));
+        }
+        out.resize(total);
+        unsigned char* const outBase = out.data();
+
+        // Flat list of (level, block row) so one parallel range covers every block in the chain. A
+        // 1024-square composite comes to about 511 rows, so the index costs nothing to build.
+        std::vector<std::pair<unsigned int, int>> rows;
+        rows.reserve(512);
+        for (unsigned int levelIndex = 0; levelIndex < chain.size(); ++levelIndex)
+        {
+            for (int row = 0; row < chain[levelIndex].blocksDown; ++row)
+                rows.emplace_back(levelIndex, row);
+        }
+
+        parallelSpans(static_cast<int>(rows.size()), kMinBlockRowsPerSpan, [&](int beginRow, int endRow) {
+            for (int index = beginRow; index < endRow; ++index)
+            {
+                const MipLevel& level = chain[rows[index].first];
+                const int row = rows[index].second;
+                const int levelWidth = level.width;
+                const int levelHeight = level.height;
+                unsigned char* cursor = outBase + level.outOffset
+                    + static_cast<std::size_t>(row) * level.blocksAcross * 8;
+                const int blockY = row * 4;
+
+                for (int blockX = 0; blockX < levelWidth; blockX += 4)
+                {
+                    unsigned char block[64];
+                    for (int y = 0; y < 4; ++y)
+                    {
+                        // Levels smaller than 4x4 still occupy a whole block, so the last row and column
+                        // repeat to fill it. Clamping rather than zero-filling keeps the block's colour
+                        // range honest; padding with black would drag an endpoint to black.
+                        const int sourceY = std::min(blockY + y, levelHeight - 1);
+                        for (int x = 0; x < 4; ++x)
+                        {
+                            const int sourceX = std::min(blockX + x, levelWidth - 1);
+                            const unsigned char* source = level.pixels.data()
+                                + (static_cast<std::size_t>(sourceY) * levelWidth + sourceX) * 4;
+                            std::memcpy(block + (y * 4 + x) * 4, source, 4);
+                        }
+                    }
+                    encodeBc1Block(block, cursor);
+                    cursor += 8;
+                }
+            }
+        });
+
+        return static_cast<unsigned int>(chain.size());
     }
 
     /// Alpha threshold used when OpenMW asks for a cutout but its own reference value is unusable.
@@ -1159,6 +1279,10 @@ namespace
 
                     if (!mFrustum.contains(osg::BoundingSphere(center, radius)))
                     {
+                        // Rejected for this frame, not gone. Without this its mesh stops being touched,
+                        // expires kMeshEvictionFrames later and has its acceleration structure destroyed
+                        // -- so turning away and back rebuilds the BLAS of everything behind the camera.
+                        mScene.retainCulledDrawable(drawable);
                         ++mCulled;
                         return;
                     }
@@ -1187,6 +1311,11 @@ namespace
                         if (distance > 1.0f
                             && static_cast<float>(local.radius() * scale) / distance < mMinAngularRadius)
                         {
+                            // Same reasoning as the frustum reject above. This one is distance-keyed
+                            // rather than direction-keyed, so what it churned was every object sitting
+                            // near the threshold as the player walks -- a smaller herd than a spin, and
+                            // more often.
+                            mScene.retainCulledDrawable(drawable);
                             ++mCulled;
                             return;
                         }
@@ -1283,6 +1412,10 @@ namespace
             // machine. Better to render a partial scene and say so than to hang.
             if (mInstances >= kMaxInstancesPerFrame)
             {
+                // Retained for the same reason as the culls: being over the per-frame instance ceiling
+                // says nothing about whether this geometry is still in the scene, and letting it expire
+                // would mean the frame after a clamp pays to rebuild what it just declined to draw.
+                mScene.retainGeometry(*geometry);
                 mClamped = true;
                 return;
             }
@@ -2309,8 +2442,11 @@ namespace MWRender
         // every frame is 500 acceleration structure builds. Those are indistinguishable from the cache
         // size alone, and the difference is the dominant term in the frame.
         mMeshesCreated = 0;
+        mMeshesRetained = 0;
         mPrimitivesSubmitted = 0;
         mInstancesOverBudget = 0;
+        mCompositeEncodeMs = 0.0;
+        mCompositesDeferred = 0;
         // Cleared rather than shrunk. flushSubmissions empties it at the end of every frame, so this only
         // matters on the paths below that return early -- but leaving a previous frame's instances queued
         // would submit them again with stale transforms.
@@ -2476,7 +2612,8 @@ namespace MWRender
                              << mTexturesUploaded << " textures (" << mTexturesShared
                              << " uploads avoided, content already present); " << mSkinnedInstances
                              << " instances were skinned, " << mCulled
-                             << " drawables outside the frustum were culled, and " << mSkinnedDropped
+                             << " drawables outside the frustum were culled (" << mMeshesRetained
+                             << " of them held resident rather than left to expire), and " << mSkinnedDropped
                              << " skins were not ready; " << mLastParticleCount << " particles from "
                              << mParticleMeshes.size() << " systems"
                              // Bytes, not counts. A count could not be weighed against video memory at all:
@@ -2497,6 +2634,8 @@ namespace MWRender
                              << "; " << mPrimitivesSubmitted << " triangles submitted of "
                              << primitiveBudget() << " budgeted, " << mInstancesOverBudget
                              << " instances turned away"
+                             << "; composite encode " << mCompositeEncodeMs << " ms, "
+                             << mCompositesDeferred << " deferred to a later frame"
                              << "; camera eye " << eye.x() << ", " << eye.y()
                              << ", " << eye.z() << " looking " << forward.x() << ", " << forward.y()
                              << ", " << forward.z() << " up " << up.x() << ", " << up.y() << ", "
@@ -2801,6 +2940,45 @@ namespace MWRender
             if (compressComposites
                 && std::string_view(image.getFileName()) == Terrain::CompositeMap::sReadbackImageName)
             {
+                // Bounded per frame, because the arrival rate is bursty and the cost is not small.
+                //
+                // Terrain composites are generated as chunks come into view, and measured bursts reach 82
+                // in a single second. Encoding all of them the moment they appear put 678 ms into one
+                // frame's scene submit, which the frame breakdown identified as the stutter. The work
+                // itself is necessary and its result is cached, so the only thing wrong with it is doing
+                // an unbounded amount of it between two presents.
+                //
+                // Over budget, this returns without caching anything. The caller falls back to the default
+                // material for that chunk and the composite is retried next frame, so a burst fills in
+                // over several frames instead of stopping the game. Retry is safe precisely because
+                // nothing was cached: the identity is derived from the encoded bytes, so a deferred
+                // composite has no half-built state to reconcile.
+                // Off by default, because the visible cost is worse than the cost it saves.
+                //
+                // A budget of 4 ms did what it was meant to: composite encode per frame fell from 678 ms to
+                // about 6, and the worst scene submit in a window went from 106-678 ms down to 43-142. But a
+                // deferred composite leaves its chunk on the default material until a later frame, and in
+                // motion that reads as ground squares flashing white for a second or two. For a showcase
+                // that is a worse defect than the stutter it removes.
+                //
+                // The encoder rewrite is what actually mattered: one parallel region per composite instead
+                // of one per mip level took the per-composite cost from about 7 ms to under 2, which is a
+                // real reduction with no visual cost at all. That is kept; the deferral is not.
+                //
+                // Left in and tunable rather than deleted, because it is the right mechanism with the wrong
+                // fallback. Given a way to keep the previous composite for a chunk, or to encode off the
+                // frame thread, deferring becomes invisible and this becomes worth switching on.
+                static const double budgetMs
+                    = envMilliseconds("OPENMW_REMIX_COMPOSITE_BUDGET_MS", 0.0);
+
+                if (budgetMs > 0.0 && mCompositeEncodeMs >= budgetMs)
+                {
+                    ++mCompositesDeferred;
+                    return 0;
+                }
+
+                const auto encodeStart = std::chrono::steady_clock::now();
+
                 std::vector<unsigned char> compressed;
                 // The whole chain is four thirds of level zero plus the sub-block tail, and one allocation
                 // beats eleven reallocations while a frame is waiting on this.
@@ -2813,6 +2991,10 @@ namespace MWRender
                 format = colour ? RemixRT::Runtime::Format_BC1_RGB
                                 : RemixRT::Runtime::Format_BC1_RGB_Linear;
                 cached.mFormat = "BC1_RGB(composite)";
+
+                mCompositeEncodeMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - encodeStart)
+                                          .count();
             }
         }
         else
@@ -3646,11 +3828,9 @@ namespace MWRender
         // this whole approach comes from. RigGeometry's copy constructor shares mSourceGeometry, so every
         // actor wearing the same body part or armour piece resolves to one Remix mesh, submitted once and
         // instanced with different bone transforms.
-        // Injective over (geometry, layer) -- see mGeometryIdentities in the header for why this is a
-        // combination rather than a hash.
-        const std::uint64_t key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&geometry))
-                * 0x100000001B3ull
-            + surface.mCoverageLayer;
+        // Address alone; the terrain layer selects among the identities held under it. See
+        // mGeometryIdentities in the header for why the layer is not part of the key.
+        const std::uintptr_t key = reinterpret_cast<std::uintptr_t>(&geometry);
 
         const auto* positions = dynamic_cast<const osg::Vec3Array*>(geometry.getVertexArray());
         if (positions == nullptr || positions->empty())
@@ -3665,21 +3845,31 @@ namespace MWRender
         // at creation so neither can be swapped afterwards.
         if (auto memo = mGeometryIdentities.find(key); memo != mGeometryIdentities.end())
         {
-            GeometryIdentity& identity = memo->second;
-            if (identity.mVertexCount == vertexCount && identity.mMaterial == material
-                && identity.mModifiedCount == positions->getModifiedCount()
-                && std::equal(std::begin(identity.mTexMat), std::end(identity.mTexMat),
-                    std::begin(surface.mTexMat)))
+            for (GeometryIdentity& identity : memo->second)
             {
-                // The mesh can still be missing here, because eviction works on meshes and this memo is
-                // only a lookup cache. Falling through rebuilds it rather than returning a dead handle.
-                if (auto found = mMeshes.find(identity.mMeshHash); found != mMeshes.end())
+                if (identity.mCoverageLayer != surface.mCoverageLayer)
+                    continue;
+
+                if (identity.mVertexCount == vertexCount && identity.mMaterial == material
+                    && identity.mModifiedCount == positions->getModifiedCount()
+                    && std::equal(std::begin(identity.mTexMat), std::end(identity.mTexMat),
+                        std::begin(surface.mTexMat)))
                 {
-                    identity.mLastUsedFrame = mFrame;
-                    found->second.mLastUsedFrame = mFrame;
-                    mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
-                    return found->second.mHandle;
+                    // The mesh can still be missing here, because eviction works on meshes and this memo
+                    // is only a lookup cache. Falling through rebuilds it rather than returning a dead
+                    // handle.
+                    if (auto found = mMeshes.find(identity.mMeshHash); found != mMeshes.end())
+                    {
+                        identity.mLastUsedFrame = mFrame;
+                        found->second.mLastUsedFrame = mFrame;
+                        mLastMeshBonesPerVertex = found->second.mBonesPerVertex;
+                        return found->second.mHandle;
+                    }
                 }
+
+                // Only one identity per layer, so a failed revalidation means a rebuild rather than a
+                // look at the next element.
+                break;
             }
         }
 
@@ -3892,14 +4082,13 @@ namespace MWRender
 
         if (reused)
         {
-            GeometryIdentity identity;
+            GeometryIdentity& identity = identityFor(key, surface.mCoverageLayer);
             identity.mMeshHash = hash;
             identity.mLastUsedFrame = mFrame;
             identity.mVertexCount = vertexCount;
             identity.mModifiedCount = positions->getModifiedCount();
             identity.mMaterial = material;
             std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(identity.mTexMat));
-            mGeometryIdentities[key] = identity;
             ++mMeshesShared;
             return reusedHandle;
         }
@@ -3969,14 +4158,13 @@ namespace MWRender
         std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(cached.mTexMat));
         mMeshes[hash] = cached;
 
-        GeometryIdentity identity;
+        GeometryIdentity& identity = identityFor(key, surface.mCoverageLayer);
         identity.mMeshHash = hash;
         identity.mLastUsedFrame = mFrame;
         identity.mVertexCount = vertexCount;
         identity.mModifiedCount = positions->getModifiedCount();
         identity.mMaterial = material;
         std::copy(std::begin(surface.mTexMat), std::end(surface.mTexMat), std::begin(identity.mTexMat));
-        mGeometryIdentities[key] = identity;
 
         mLastMeshBonesPerVertex = skinning.mBonesPerVertex;
         return handle;
@@ -4022,11 +4210,86 @@ namespace MWRender
         // for the whole session as the player moves and cells page out.
         for (auto it = mGeometryIdentities.begin(); it != mGeometryIdentities.end();)
         {
-            if (mFrame - it->second.mLastUsedFrame > kMeshEvictionFrames)
+            std::vector<GeometryIdentity>& identities = it->second;
+            const std::uint64_t frame = mFrame;
+            identities.erase(std::remove_if(identities.begin(), identities.end(),
+                                 [frame](const GeometryIdentity& identity) {
+                                     return frame - identity.mLastUsedFrame > kMeshEvictionFrames;
+                                 }),
+                identities.end());
+
+            // A geometry whose every layer has expired takes its map slot with it, so the map is bounded
+            // by live content rather than by everything seen this session.
+            if (identities.empty())
                 it = mGeometryIdentities.erase(it);
             else
                 ++it;
         }
+    }
+
+    RemixScene::GeometryIdentity& RemixScene::identityFor(std::uintptr_t address, unsigned int layer)
+    {
+        std::vector<GeometryIdentity>& identities = mGeometryIdentities[address];
+        for (GeometryIdentity& identity : identities)
+            if (identity.mCoverageLayer == layer)
+                return identity;
+
+        identities.emplace_back();
+        identities.back().mCoverageLayer = layer;
+        return identities.back();
+    }
+
+    void RemixScene::retainGeometry(osg::Geometry& geometry)
+    {
+        // Lookup only, never an insert: a geometry with no memo has no mesh to keep alive, and inserting
+        // here would grow the map with empty slots for everything the cull rejects.
+        auto memo = mGeometryIdentities.find(reinterpret_cast<std::uintptr_t>(&geometry));
+        if (memo == mGeometryIdentities.end())
+            return;
+
+        ++mMeshesRetained;
+
+        for (GeometryIdentity& identity : memo->second)
+        {
+            identity.mLastUsedFrame = mFrame;
+
+            // The memo is stamped whether or not the mesh is still there. If it has already been
+            // evicted the next submission rebuilds it, and the memo staying current is what stops the
+            // slot itself expiring underneath a geometry that is still in the scene.
+            if (auto found = mMeshes.find(identity.mMeshHash); found != mMeshes.end())
+                found->second.mLastUsedFrame = mFrame;
+        }
+    }
+
+    void RemixScene::retainCulledDrawable(osg::Drawable& drawable)
+    {
+        // Resolved exactly as the submission path resolves it, because a different answer here would
+        // stamp the wrong slot and the retention would silently do nothing.
+        //
+        // The two dynamic_casts sit behind the null check rather than ahead of it, which the submission
+        // path has no reason to do but this one does: it runs for every drawable the cull rejects, twelve
+        // to fifteen thousand of them a frame outdoors. A RigGeometry and a MorphGeometry are both
+        // Drawables that are not Geometries, so asGeometry() answers for the ordinary case -- terrain,
+        // statics and merged paging chunks, which is nearly all of that number -- in one virtual call.
+        osg::Geometry* geometry = drawable.asGeometry();
+        if (geometry == nullptr)
+        {
+            if (const auto* rig = dynamic_cast<const SceneUtil::RigGeometry*>(&drawable))
+            {
+                geometry = rig->getSourceGeometry().get();
+            }
+            else if (const auto* morph = dynamic_cast<const SceneUtil::MorphGeometry*>(&drawable))
+            {
+                // Whichever frame-parity buffer holds the last completed blend, which is the one the
+                // submission path would have hashed. The other parity's memo is left to expire: a morph
+                // rebuilds its mesh whenever the pose moves regardless, so retaining both would hold a
+                // mesh that the next submission cannot reuse anyway.
+                geometry = const_cast<osg::Geometry*>(morph->getMorphedGeometry());
+            }
+        }
+
+        if (geometry != nullptr)
+            retainGeometry(*geometry);
     }
 }
 

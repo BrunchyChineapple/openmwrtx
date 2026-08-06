@@ -16,6 +16,8 @@
 namespace osg
 {
     class Camera;
+    class Drawable;
+    class Geometry;
     class Image;
     class Texture2D;
 }
@@ -23,6 +25,7 @@ namespace osg
 namespace SceneUtil
 {
     class LightSource;
+    class MorphGeometry;
     class RigGeometry;
 }
 
@@ -201,6 +204,28 @@ namespace MWRender
         /// Records a submitted instance's world-space origin, for the diagnostic extent log.
         void noteInstancePosition(double x, double y, double z);
 
+        /// Marks \a drawable's mesh as still part of the loaded scene without submitting it, for a
+        /// drawable the traversal reached and then rejected.
+        ///
+        /// Culling is a visibility decision taken every frame; eviction is a residency decision about
+        /// whether content still exists. Those were the same signal -- mesh lifetime was driven by
+        /// "submitted recently" -- so anything the frustum rejected stopped being touched, fell due
+        /// kMeshEvictionFrames later and had its acceleration structure destroyed. Turning back rebuilt
+        /// it. At half a second of eviction window that is a BLAS rebuild for most of the world every
+        /// time the player spins round, and a smaller one every few steps as objects cross the
+        /// apparent-size threshold.
+        ///
+        /// Being reached by the traversal at all is the residency signal wanted here: the drawable is in
+        /// the scene graph, so its cell is loaded. Content that genuinely goes away -- an unloaded cell,
+        /// or an animated mesh superseded by the next pose -- stops being traversed, is never retained,
+        /// and still evicts on the same schedule as before.
+        ///
+        /// Public for the same reason as submitGeometry: the traversal lives in the .cpp.
+        void retainCulledDrawable(osg::Drawable& drawable);
+
+        /// retainCulledDrawable for a caller that has already resolved the geometry.
+        void retainGeometry(osg::Geometry& geometry);
+
         /// Submits one OpenMW light source, at the world position \a x, \a y, \a z.
         ///
         /// Public for the same reason as submitGeometry: the traversal lives in the .cpp.
@@ -292,11 +317,17 @@ namespace MWRender
         struct GeometryIdentity
         {
             unsigned long long mMeshHash = 0;
+            /// Frame the geometry this memo describes was last known to be part of the loaded scene --
+            /// which is not the same question as whether it was drawn. See retainGeometry.
             std::uint64_t mLastUsedFrame = 0;
             unsigned int mVertexCount = 0;
             unsigned int mModifiedCount = 0;
             unsigned long long mMaterial = 0;
             float mTexMat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+            /// Which layer of its terrain chunk this identity describes; zero for everything that is not
+            /// a terrain layer. Held in the value rather than folded into the map key so that a lookup by
+            /// geometry address alone reaches every layer -- see mGeometryIdentities.
+            unsigned int mCoverageLayer = 0;
         };
 
         struct CachedTexture
@@ -441,6 +472,10 @@ namespace MWRender
         unsigned long long meshFor(osg::Geometry& geometry, unsigned long long material,
             const SurfaceState& surface, const SceneUtil::RigGeometry* rig);
 
+        /// The memo slot for one \a layer of the geometry at \a address, appended empty if that pair has
+        /// not been seen. The returned reference is invalidated by the next call.
+        GeometryIdentity& identityFor(std::uintptr_t address, unsigned int layer);
+
         /// Expands \a rig's grouped influences into the flat per-vertex arrays the runtime wants.
         ///
         /// Fills mWeightScratch and mBoneIndexScratch and returns the bones-per-vertex count, or 0 if the
@@ -489,14 +524,17 @@ namespace MWRender
         /// Keyed by osg::Geometry address, purely as a memo to keep content hashing off the per-frame path.
         /// Unlike mMeshes this is not an identity -- it is a cache of a lookup, and an address reused by a
         /// different geometry is caught by the revalidation checks in GeometryIdentity.
-        /// Keyed on geometry address combined with the terrain layer index, not on the address alone.
         ///
-        /// A chunk's layers all share one osg::Geometry, so an address-only key made them evict one
-        /// another and every layer rebuilt its mesh every frame. The combination is injective rather than
-        /// a hash: multiplying by an odd constant is invertible modulo 2^64, so distinct addresses stay
-        /// distinct, and adding a layer index far smaller than the multiplier cannot reach the next
-        /// address's slot. No collisions to reason about.
-        std::unordered_map<std::uint64_t, GeometryIdentity> mGeometryIdentities;
+        /// One entry per terrain layer, because a chunk's layers all share one osg::Geometry and a
+        /// single-entry map made them evict one another -- every layer rebuilt its mesh every frame.
+        ///
+        /// The layer index lives in the value and not in the key, which the key deliberately used to
+        /// carry. retainGeometry has to reach every identity a geometry owns, and it runs at the cull
+        /// sites, before any state set has been merged -- so it does not know the layer, and the layer
+        /// count is data-driven per chunk rather than bounded, so it cannot enumerate them either. Keying
+        /// on the address alone makes that one lookup. The vector holds a single element for everything
+        /// that is not terrain, which is nearly all of it.
+        std::unordered_map<std::uintptr_t, std::vector<GeometryIdentity>> mGeometryIdentities;
         /// Keyed by osg::Image address. Textures and materials are never evicted: OpenMW's resource
         /// system shares images aggressively and keeps them alive for the session, the set is bounded by
         /// how many distinct textures the game has, and re-uploading one costs a full staging copy.
@@ -587,6 +625,14 @@ namespace MWRender
         /// Triangles admitted so far this frame, and how many instances the budget turned away.
         unsigned int mPrimitivesSubmitted = 0;
         unsigned int mInstancesOverBudget = 0;
+        /// Milliseconds spent encoding terrain composites in the frame in progress, and how many were put
+        /// off to a later frame once that budget was spent. Reset per frame with the counters above.
+        ///
+        /// Composites arrive in bursts as chunks come into view -- measured at up to 82 in one second --
+        /// and encoding all of them immediately put 678 ms into a single frame's scene submit. Bounding the
+        /// work per frame spreads a burst over several frames instead of stopping the game.
+        double mCompositeEncodeMs = 0.0;
+        unsigned int mCompositesDeferred = 0;
 
         /// One queued instance, held from drawSubmitted until flushSubmissions.
         ///
@@ -760,6 +806,14 @@ namespace MWRender
         /// of BLAS builds. Particle systems are expected to appear here every frame by construction; static
         /// geometry appearing here every frame is a fault.
         unsigned int mMeshesCreated = 0;
+
+        /// Drawables the traversal rejected this frame whose mesh was held resident anyway, per frame.
+        ///
+        /// The counter that says whether retainGeometry is doing anything: against mCulled it reads as
+        /// "this many were rejected, this many of them would previously have expired and been rebuilt on
+        /// the way back". A retained count near zero while mCulled is in the thousands means the memo
+        /// lookup is missing, not that there was nothing to keep.
+        unsigned int mMeshesRetained = 0;
         unsigned int mSkinnedDropped = 0;
         /// Bones per vertex of the mesh the last submitGeometry resolved to, so the caller can tell
         /// whether the instance it is about to queue needs bone transforms. Carried on the object rather
