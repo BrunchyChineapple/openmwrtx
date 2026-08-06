@@ -1,8 +1,11 @@
 #include "objects.hpp"
 
+#include <chrono>
+
 #include <osg/Group>
 #include <osg/UserDataContainer>
 
+#include <components/debug/debuglog.hpp>
 #include <components/misc/resourcehelpers.hpp>
 #include <components/misc/strings/algorithm.hpp>
 #include <components/sceneutil/positionattitudetransform.hpp>
@@ -85,8 +88,24 @@ namespace MWRender
                 animated = false;
         }
 
+        // Timed, and named when it overruns.
+        //
+        // Constructing the animation resolves the model, and on a cache miss that means loading the NIF and
+        // every texture it names, off disk, here on the frame thread. A measured frame spent 1105 ms doing
+        // exactly that for one activator, with ImageManager::getImage at the bottom of the stack. The
+        // preloader is supposed to have this warm by the time a cell is entered, so an overrun names the
+        // asset it failed to cover rather than leaving it as "cell loading is slow".
+        constexpr double overrunMs = 50.0;
+        const auto started = std::chrono::steady_clock::now();
+
         osg::ref_ptr<ObjectAnimation> anim(
             new ObjectAnimation(ptr, animationMesh, mResourceSystem, animated, allowLight));
+
+        const double elapsedMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        if (elapsedMs >= overrunMs)
+            Log(Debug::Warning) << "Model insertion held the frame thread for " << elapsedMs << " ms: "
+                                << animationMesh;
 
         mObjects.emplace(ptr.mRef, std::move(anim));
     }

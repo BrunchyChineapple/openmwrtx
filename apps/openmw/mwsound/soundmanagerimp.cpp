@@ -7,6 +7,8 @@
 
 #include <osg/Matrixf>
 
+#include <chrono>
+
 #include <components/debug/debuglog.hpp>
 #include <components/misc/resourcehelpers.hpp>
 #include <components/misc/rng.hpp>
@@ -175,10 +177,29 @@ namespace MWSound
 
     DecoderPtr SoundManager::loadVoice(VFS::Path::NormalizedView voicefile)
     {
+        // Timed, and named when it overruns.
+        //
+        // This runs on the frame thread, reached from Actors::updateGreetingState when an NPC greets the
+        // player, and it opens the voice file there and then. A measured frame spent 834 ms inside the
+        // CreateFileW at the bottom of it. The suspected reason is the shape of the install rather than this
+        // code -- 144,908 loose voice files across 11 GB, which no filesystem metadata cache will hold -- so
+        // the number matters more than the theory: if opens are cheap now, there is nothing here to fix.
+        constexpr double overrunMs = 50.0;
+        const auto started = std::chrono::steady_clock::now();
+        const auto report = [&started, voicefile] {
+            const double elapsedMs
+                = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+                      .count();
+            if (elapsedMs >= overrunMs)
+                Log(Debug::Warning) << "Voice load held the frame thread for " << elapsedMs << " ms: "
+                                    << voicefile;
+        };
+
         try
         {
             DecoderPtr decoder = getDecoder();
             decoder->open(Misc::ResourceHelpers::correctSoundPath(voicefile, *decoder->mResourceMgr));
+            report();
             return decoder;
         }
         catch (std::exception& e)
