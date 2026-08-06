@@ -1,13 +1,17 @@
 #include "remixscene.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1394,6 +1398,12 @@ namespace
             mScene.noteInstancePosition(mMatrix(3, 0), mMatrix(3, 1), mMatrix(3, 2));
             ++mInstances;
 
+            if (terrain != nullptr)
+            {
+                const unsigned int available = kMaxInstancesPerFrame - mInstances;
+                mInstances += mScene.submitTerrainAnchors(*terrain, categories, available);
+            }
+
             // The base layer is submitted; the rest of the ground goes over it.
             if (terrain != nullptr)
                 submitTerrainLayers(*terrain, *geometry, categories, transform, distanceSquared);
@@ -1999,10 +2009,20 @@ namespace MWRender
             = mRuntime.createFlatMaterial(kProbeMaterialHash, 1.0f, 0.1f, 0.6f, 0.9f, 0.0f, 40.0f);
         if (mProbeMaterial == 0)
             Log(Debug::Warning) << "Remix scene: could not create the bisect quad's material";
+
+        loadTerrainAnchors();
     }
 
     RemixScene::~RemixScene()
     {
+        for (const TerrainAnchor& anchor : mTerrainAnchors)
+        {
+            if (anchor.mMesh != 0)
+                mRuntime.destroyMesh(anchor.mMesh);
+        }
+        mTerrainAnchors.clear();
+        mSubmittedTerrainAnchors.clear();
+
         for (const auto& [key, cached] : mMeshes)
             mRuntime.destroyMesh(cached.mHandle);
         mMeshes.clear();
@@ -2038,6 +2058,209 @@ namespace MWRender
             mRuntime.destroyMaterial(mWaterMaterial);
         if (mDefaultMaterial != 0)
             mRuntime.destroyMaterial(mDefaultMaterial);
+    }
+
+    void RemixScene::loadTerrainAnchors()
+    {
+        const char* manifestPath = std::getenv("OPENMW_REMIX_TERRAIN_ANCHORS");
+        if (manifestPath == nullptr || *manifestPath == '\0')
+            return;
+
+        std::ifstream manifest(manifestPath);
+        if (!manifest)
+        {
+            Log(Debug::Warning) << "Remix terrain anchors disabled: could not open manifest '"
+                                << manifestPath << "'";
+            return;
+        }
+
+        auto trim = [](std::string value) {
+            const auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+            const auto first = std::find_if_not(value.begin(), value.end(), isSpace);
+            if (first == value.end())
+                return std::string();
+            const auto last = std::find_if_not(value.rbegin(), value.rend(), isSpace).base();
+            return std::string(first, last);
+        };
+
+        auto parsePosition = [](const std::string& token, float& out) {
+            errno = 0;
+            char* end = nullptr;
+            const double value = std::strtod(token.c_str(), &end);
+            if (end == token.c_str() || end != token.c_str() + token.size() || errno == ERANGE
+                || !std::isfinite(value)
+                || std::abs(value) > static_cast<double>(std::numeric_limits<float>::max()))
+            {
+                return false;
+            }
+            out = static_cast<float>(value);
+            return std::isfinite(out);
+        };
+
+        constexpr std::string_view kHeader = "# openmw-remix-terrain-anchors v1";
+        std::vector<TerrainAnchor> parsed;
+        std::unordered_set<std::uint64_t> hashes;
+        std::string error;
+        std::string line;
+        unsigned int lineNumber = 0;
+        bool haveHeader = false;
+
+        while (std::getline(manifest, line))
+        {
+            ++lineNumber;
+            line = trim(std::move(line));
+            if (line.empty())
+                continue;
+
+            if (!haveHeader)
+            {
+                if (line != kHeader)
+                    error = "expected '# openmw-remix-terrain-anchors v1' on the first non-empty line";
+                else
+                    haveHeader = true;
+                if (!error.empty())
+                    break;
+                continue;
+            }
+
+            if (line.front() == '#')
+                continue;
+
+            std::istringstream fields(line);
+            std::string hashToken;
+            std::string xToken;
+            std::string yToken;
+            std::string zToken;
+            std::string extra;
+            if (!(fields >> hashToken >> xToken >> yToken >> zToken) || (fields >> extra))
+            {
+                error = "expected exactly <16-hex-hash> <x> <y> <z>";
+                break;
+            }
+
+            TerrainAnchor anchor;
+            const auto hashResult = std::from_chars(
+                hashToken.data(), hashToken.data() + hashToken.size(), anchor.mHash, 16);
+            if (hashToken.size() != 16 || hashResult.ec != std::errc()
+                || hashResult.ptr != hashToken.data() + hashToken.size() || anchor.mHash == 0)
+            {
+                error = "mesh hash must be exactly 16 hexadecimal digits and non-zero";
+                break;
+            }
+            if (!parsePosition(xToken, anchor.mPosition[0])
+                || !parsePosition(yToken, anchor.mPosition[1])
+                || !parsePosition(zToken, anchor.mPosition[2]))
+            {
+                error = "anchor coordinates must be finite numbers representable as floats";
+                break;
+            }
+            if (!hashes.insert(anchor.mHash).second)
+            {
+                error = "duplicate mesh hash";
+                break;
+            }
+            parsed.push_back(anchor);
+        }
+
+        if (error.empty() && !haveHeader)
+            error = "missing '# openmw-remix-terrain-anchors v1' header";
+        if (error.empty() && parsed.empty())
+            error = "manifest contains no anchors";
+
+        if (!error.empty())
+        {
+            Log(Debug::Warning) << "Remix terrain anchors disabled: " << error
+                                << " (line " << lineNumber << ", manifest '" << manifestPath << "')";
+            return;
+        }
+
+        // A tiny, real triangle rather than a degenerate one: some acceleration-structure builders discard
+        // zero-area geometry before replacement matching can see its mesh identity. The bridge layer sets
+        // preserveOriginalDrawCall=0, so this is only a fail-safe speck if that layer is absent or malformed.
+        RemixRT::Runtime::Vertex vertices[3] = {};
+        vertices[1].mPosition[0] = 0.01f;
+        vertices[2].mPosition[1] = 0.01f;
+        for (RemixRT::Runtime::Vertex& vertex : vertices)
+        {
+            vertex.mNormal[2] = 1.0f;
+            vertex.mColor = 0xFFFFFFFFu;
+        }
+        const unsigned int indices[3] = { 0, 1, 2 };
+
+        for (TerrainAnchor& anchor : parsed)
+        {
+            anchor.mMesh = mRuntime.createMesh(
+                anchor.mHash, vertices, 3, indices, 3, mDefaultMaterial);
+            if (anchor.mMesh == 0)
+            {
+                for (const TerrainAnchor& created : parsed)
+                {
+                    if (created.mMesh != 0)
+                        mRuntime.destroyMesh(created.mMesh);
+                }
+                Log(Debug::Warning) << "Remix terrain anchors disabled: runtime rejected mesh "
+                                    << anchor.mHash << " from manifest '" << manifestPath << "'";
+                return;
+            }
+        }
+
+        const std::size_t nonZeroZ = static_cast<std::size_t>(std::count_if(parsed.begin(), parsed.end(),
+            [](const TerrainAnchor& anchor) { return anchor.mPosition[2] != 0.0f; }));
+        mTerrainAnchors = std::move(parsed);
+        Log(Debug::Info) << "Remix terrain anchors: loaded " << mTerrainAnchors.size()
+                         << " stable exterior roots from '" << manifestPath << "' (" << nonZeroZ
+                         << " with non-zero Z)";
+    }
+
+    unsigned int RemixScene::submitTerrainAnchors(const Terrain::TerrainDrawable& terrain,
+        unsigned int categoryFlags, unsigned int maxInstances)
+    {
+        if (maxInstances == 0 || mTerrainAnchors.empty() || !terrain.hasChunkMetadata()
+            || !terrain.isDefaultWorldspaceChunk() || terrain.getChunkLod() != 0)
+        {
+            return 0;
+        }
+
+        const float worldSize = terrain.getChunkWorldSize();
+        if (!(worldSize > 0.0f) || !std::isfinite(worldSize))
+            return 0;
+
+        const osg::Vec2f center = terrain.getChunkWorldCenter();
+        const float halfSize = worldSize * 0.5f;
+        const float minX = center.x() - halfSize;
+        const float minY = center.y() - halfSize;
+        const float maxX = center.x() + halfSize;
+        const float maxY = center.y() + halfSize;
+
+        unsigned int submitted = 0;
+        for (const TerrainAnchor& anchor : mTerrainAnchors)
+        {
+            if (submitted == maxInstances)
+                break;
+
+            // Half-open edges assign an anchor on a child boundary deterministically to the child whose
+            // minimum edge it touches. The per-frame set remains the safety net for overlapping selections.
+            const float x = anchor.mPosition[0];
+            const float y = anchor.mPosition[1];
+            if (x < minX || x >= maxX || y < minY || y >= maxY)
+                continue;
+            if (!mSubmittedTerrainAnchors.insert(anchor.mHash).second)
+                continue;
+
+            const float transform[12] = {
+                1.0f, 0.0f, 0.0f, anchor.mPosition[0],
+                0.0f, 1.0f, 0.0f, anchor.mPosition[1],
+                0.0f, 0.0f, 1.0f, anchor.mPosition[2]
+            };
+            const float dx = anchor.mPosition[0] - mLastCameraEye[0];
+            const float dy = anchor.mPosition[1] - mLastCameraEye[1];
+            const float dz = anchor.mPosition[2] - mLastCameraEye[2];
+            drawSubmitted(anchor.mMesh, transform, categoryFlags, true, nullptr, 0,
+                dx * dx + dy * dy + dz * dz);
+            noteInstancePosition(anchor.mPosition[0], anchor.mPosition[1], anchor.mPosition[2]);
+            ++submitted;
+        }
+        return submitted;
     }
 
     void RemixScene::noteInstancePosition(double x, double y, double z)
@@ -2315,6 +2538,7 @@ namespace MWRender
         // matters on the paths below that return early -- but leaving a previous frame's instances queued
         // would submit them again with stale transforms.
         mPendingInstances.clear();
+        mSubmittedTerrainAnchors.clear();
         mSkinnedDropped = 0;
         mLastParticleCount = 0;
         mParticleInstances = 0;

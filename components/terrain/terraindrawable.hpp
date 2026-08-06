@@ -2,6 +2,7 @@
 #define OPENMW_COMPONENTS_TERRAIN_DRAWABLE_H
 
 #include <osg/Geometry>
+#include <osg/Vec2f>
 
 namespace osg
 {
@@ -63,6 +64,26 @@ namespace Terrain
         CompositeMap* getCompositeMap() const { return mCompositeMap; }
         void setCompositeMapRenderer(CompositeMapRenderer* renderer) { mCompositeMapRenderer = renderer; }
 
+        /// Records the quadtree chunk this drawable represents for consumers that need a stable
+        /// world-space terrain identity rather than the drawable's transient geometry hash.
+        ///
+        /// The centre and size are in world/game units. Keeping this on the drawable means a later scene
+        /// traversal can recover the semantic footprint after the quadtree has selected its current LOD.
+        void setChunkMetadata(
+            const osg::Vec2f& worldCenter, float worldSize, unsigned char lod, bool defaultWorldspace)
+        {
+            mChunkWorldCenter = worldCenter;
+            mChunkWorldSize = worldSize;
+            mChunkLod = lod;
+            mDefaultWorldspace = defaultWorldspace;
+            mHasChunkMetadata = true;
+        }
+        bool hasChunkMetadata() const { return mHasChunkMetadata; }
+        const osg::Vec2f& getChunkWorldCenter() const { return mChunkWorldCenter; }
+        float getChunkWorldSize() const { return mChunkWorldSize; }
+        unsigned char getChunkLod() const { return mChunkLod; }
+        bool isDefaultWorldspaceChunk() const { return mDefaultWorldspace; }
+
     private:
         osg::BoundingBox mWaterBoundingBox;
         PassVector mPasses;
@@ -72,6 +93,12 @@ namespace Terrain
         osg::ref_ptr<SceneUtil::LightListCallback> mLightListCallback;
         osg::ref_ptr<CompositeMap> mCompositeMap;
         osg::ref_ptr<CompositeMapRenderer> mCompositeMapRenderer;
+
+        osg::Vec2f mChunkWorldCenter;
+        float mChunkWorldSize = 0.0f;
+        unsigned char mChunkLod = 0;
+        bool mDefaultWorldspace = false;
+        bool mHasChunkMetadata = false;
     };
 
 }

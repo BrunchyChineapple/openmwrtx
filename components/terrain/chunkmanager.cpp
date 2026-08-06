@@ -313,6 +313,11 @@ namespace Terrain
 
         geometry->setupWaterBoundingBox(-1, chunkSize * mStorage->getCellWorldSize(mWorldspace) / numVerts);
 
+        const float cellWorldSize = mStorage->getCellWorldSize(mWorldspace);
+        geometry->setChunkMetadata(
+            chunkCenter * cellWorldSize, chunkSize * cellWorldSize, lod,
+            mWorldspace == ESM::Cell::sDefaultWorldspaceId);
+
         if (!templateGeometry && compile && mSceneManager->getIncrementalCompileOperation())
         {
             mSceneManager->getIncrementalCompileOperation()->add(geometry);

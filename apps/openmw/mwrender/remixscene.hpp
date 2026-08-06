@@ -31,6 +31,11 @@ namespace osgParticle
     class ParticleSystem;
 }
 
+namespace Terrain
+{
+    class TerrainDrawable;
+}
+
 namespace MWRender
 {
     /// Feeds OpenMW's scene graph to the Remix runtime, one frame at a time.
@@ -200,6 +205,15 @@ namespace MWRender
 
         /// Records a submitted instance's world-space origin, for the diagnostic extent log.
         void noteInstancePosition(double x, double y, double z);
+
+        /// Queues the stable semantic anchors covered by one visible, full-resolution terrain chunk.
+        ///
+        /// Anchors are loaded from OPENMW_REMIX_TERRAIN_ANCHORS and exist solely as replacement roots:
+        /// their explicit mesh hashes let a USD bridge attach legacy terrain/scatter subtrees without
+        /// depending on OpenMW's LOD-, tessellation-, or material-dependent terrain mesh hashes.
+        /// Returns the number queued, capped by \a maxInstances.
+        unsigned int submitTerrainAnchors(const Terrain::TerrainDrawable& terrain,
+            unsigned int categoryFlags, unsigned int maxInstances);
 
         /// Submits one OpenMW light source, at the world position \a x, \a y, \a z.
         ///
@@ -463,6 +477,9 @@ namespace MWRender
         /// Releases meshes not submitted for a while.
         void evictStaleMeshes();
 
+        /// Strictly loads and creates the optional stable terrain anchor meshes.
+        void loadTerrainAnchors();
+
         RemixRT::Runtime& mRuntime;
 
         /// The last camera handed to the runtime, kept so resubmitCamera can repeat it. Plain floats in the
@@ -481,6 +498,17 @@ namespace MWRender
         unsigned long long mWaterMaterial = 0;
         unsigned long long mProbeMaterial = 0;
         unsigned long long mProbeMesh = 0;
+
+        struct TerrainAnchor
+        {
+            std::uint64_t mHash = 0;
+            float mPosition[3] = { 0.0f, 0.0f, 0.0f };
+            unsigned long long mMesh = 0;
+        };
+        std::vector<TerrainAnchor> mTerrainAnchors;
+        /// Anchor hashes already queued this frame. Several .125-cell children can cover the same logical
+        /// .25-cell anchor, so coverage alone is intentionally not assumed to be unique.
+        std::unordered_set<std::uint64_t> mSubmittedTerrainAnchors;
         /// Keyed by the mesh's content hash, which is also the identity Remix knows it by and the key a USD
         /// replacement is authored against. Previously keyed by geometry address, which is why the same
         /// mesh presented a different identity on every run.

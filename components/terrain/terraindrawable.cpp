@@ -18,6 +18,11 @@ namespace Terrain
         : osg::Geometry(copy, copyop)
         , mPasses(copy.mPasses)
         , mLightListCallback(copy.mLightListCallback)
+        , mChunkWorldCenter(copy.mChunkWorldCenter)
+        , mChunkWorldSize(copy.mChunkWorldSize)
+        , mChunkLod(copy.mChunkLod)
+        , mDefaultWorldspace(copy.mDefaultWorldspace)
+        , mHasChunkMetadata(copy.mHasChunkMetadata)
     {
     }
 
