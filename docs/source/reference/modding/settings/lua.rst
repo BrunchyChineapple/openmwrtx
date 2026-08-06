@@ -72,3 +72,21 @@ Lua Settings
 
    Lua garbage collector steps per frame.
    Higher values allow more memory to be freed per frame.
+
+.. omw-setting::
+   :title: local script load budget ms
+   :type: float32
+   :range: ≥ 0
+   :default: 4.0
+
+   Milliseconds per frame that may be spent starting local scripts on objects that have just become
+   active. Zero removes the limit and starts all of them in the frame they arrive.
+
+   Starting a local script runs the top level of every module it requires, and each object gets its own
+   module instances, so a script with a large require graph pays for that graph once per object. Walking
+   into a town can activate dozens of NPCs at once, which without a budget arrives as one long frame.
+
+   The work is spread rather than avoided. Nothing is dropped: an object that does not fit in this frame
+   keeps its place and starts in a later one, and a script that is already running never spends the
+   budget again. The visible consequence is that a newly active object's script can begin one or two
+   frames later than it otherwise would.

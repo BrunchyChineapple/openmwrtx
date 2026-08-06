@@ -267,12 +267,52 @@ namespace MWLua
 
         mObjectLists.update();
 
-        for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mQueuedAutoStartedScripts)
+        // Milliseconds this frame may spend instantiating local scripts that are not loaded yet.
+        //
+        // Instantiating a container runs the top level of its whole require graph, and that graph is content,
+        // not engine: LuaState::runInNewSandbox gives every sandbox its own `loaded` table, so the tree is
+        // re-executed once per object. A measured mod put 64 modules and 1.08 MB of Lua behind one NPC
+        // script -- about 5 ms per NPC -- and entering a town activates sixty of them at once. That arrived
+        // as a single 345 ms frame, twice over: once through the queue below on an NPC's first activation,
+        // and again through processTimers when a returning NPC's container had been unloaded by
+        // ScriptTracker in the meantime.
+        //
+        // Spending the same work over several frames rather than one is the same treatment the terrain
+        // composite encoder and the reference id index already get. Nothing is skipped permanently: a
+        // container that does not fit this frame keeps its place and is instantiated by a later one, and
+        // because a loaded container never spends the budget again the queue always drains.
+        //
+        // Zero disables the budget and restores the previous behaviour.
+        double loadBudgetMs = Settings::lua().mLocalScriptLoadBudgetMs;
+        const bool loadBudgetActive = loadBudgetMs > 0.0;
+        // Charges the wall time of a call that may have instantiated a container. Only ever called when the
+        // container was unloaded beforehand, so no clock is read on the common path where it was not.
+        const auto chargeLoad = [&loadBudgetMs](const std::chrono::steady_clock::time_point start) {
+            loadBudgetMs -= std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start)
+                                .count();
+        };
+
         {
-            if (LocalScripts* scripts = asLocal(ptr))
+            // Kept in the same order, with the tail retained rather than dropped.
+            std::vector<LuaUtil::ScriptsContainerWeakPtr> deferred;
+            for (std::size_t i = 0; i < mQueuedAutoStartedScripts.size(); ++i)
+            {
+                LocalScripts* scripts = asLocal(mQueuedAutoStartedScripts[i]);
+                if (scripts == nullptr)
+                    continue;
+                if (loadBudgetActive && loadBudgetMs <= 0.0)
+                {
+                    deferred.push_back(mQueuedAutoStartedScripts[i]);
+                    continue;
+                }
+                const auto started = std::chrono::steady_clock::now();
                 scripts->addAutoStartedScripts();
+                if (loadBudgetActive)
+                    chargeLoad(started);
+            }
+            mQueuedAutoStartedScripts = std::move(deferred);
         }
-        mQueuedAutoStartedScripts.clear();
 
         std::erase_if(mActiveLocalScripts, [](const LuaUtil::ScriptsContainerWeakPtr& ptr) {
             LocalScripts* l = asLocal(ptr);
@@ -293,7 +333,24 @@ namespace MWLua
             mMenuScripts.processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
             mGlobalScripts.processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
             for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
-                asLocal(ptr)->processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
+            {
+                LocalScripts* scripts = asLocal(ptr);
+                // processTimers calls ensureLoaded unconditionally, so for an unloaded container this is
+                // where the whole module graph gets built -- which is why the measured stall landed in the
+                // timers span rather than in the queue drain above. An unloaded container has no live timer
+                // queues to poll, so deferring it costs nothing this frame beyond the deferral itself.
+                if (!scripts->isLoaded())
+                {
+                    if (loadBudgetActive && loadBudgetMs <= 0.0)
+                        continue;
+                    const auto started = std::chrono::steady_clock::now();
+                    scripts->processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
+                    if (loadBudgetActive)
+                        chargeLoad(started);
+                    continue;
+                }
+                scripts->processTimers(timeManager.getSimulationTime(), timeManager.getGameTime());
+            }
         }
         breakdown.mTimers = lap();
 
@@ -315,7 +372,24 @@ namespace MWLua
 
             float frameDuration = MWBase::Environment::get().getFrameDuration();
             for (const LuaUtil::ScriptsContainerWeakPtr& ptr : mActiveLocalScripts)
-                asLocal(ptr)->update(isPaused ? 0 : frameDuration);
+            {
+                LocalScripts* scripts = asLocal(ptr);
+                // Same reasoning as the timer loop: callEngineHandlers begins with ensureLoaded, so an
+                // unloaded container is instantiated here. Deferring one means its onUpdate starts a frame
+                // or two later than it otherwise would, which is already true of every container that came
+                // through mQueuedAutoStartedScripts.
+                if (!scripts->isLoaded())
+                {
+                    if (loadBudgetActive && loadBudgetMs <= 0.0)
+                        continue;
+                    const auto started = std::chrono::steady_clock::now();
+                    scripts->update(isPaused ? 0 : frameDuration);
+                    if (loadBudgetActive)
+                        chargeLoad(started);
+                    continue;
+                }
+                scripts->update(isPaused ? 0 : frameDuration);
+            }
             breakdown.mLocalScriptUpdates = lap();
             mGlobalScripts.update(isPaused ? 0 : frameDuration);
             breakdown.mGlobalScriptUpdates = lap();

@@ -27,6 +27,8 @@ namespace Settings
         SettingValue<std::uint64_t> mInstructionLimitPerCall{ mIndex, "Lua", "instruction limit per call",
             makeMaxSanitizerUInt64(1001) };
         SettingValue<int> mGcStepsPerFrame{ mIndex, "Lua", "gc steps per frame", makeMaxSanitizerInt(0) };
+        SettingValue<float> mLocalScriptLoadBudgetMs{ mIndex, "Lua", "local script load budget ms",
+            makeMaxSanitizerFloat(0) };
     };
 }
 
