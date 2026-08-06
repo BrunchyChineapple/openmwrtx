@@ -1,6 +1,8 @@
 #include "loadingscreen.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 
 #include <osgViewer/Viewer>
 
@@ -349,9 +351,26 @@ namespace MWGui
         // at the time this function is called we are in the middle of a frame,
         // so out of order calls are necessary to get a correct frameNumber for the next frame.
         // refer to the advance() and frame() order in Engine::go()
-        mViewer->eventTraversal();
-        mViewer->updateTraversal();
-        mViewer->renderingTraversals();
+        //
+        // Timed separately from the present that follows, because the two answer different questions and
+        // the answer decides what to do about a ten-second cell load. The incremental compile operation
+        // runs here -- setMaximumNumOfObjectsToCompilePerFrame(1000) above is what makes a load compile its
+        // assets rather than hitch afterwards -- so this side of the line is work that has to happen
+        // whether or not anything is shown. The present is the part that only exists to show it.
+        {
+            const auto beforeTraversal = std::chrono::steady_clock::now();
+            mViewer->eventTraversal();
+            mViewer->updateTraversal();
+            mViewer->renderingTraversals();
+
+            RemixRT::NestedFrameStats& nestedStats = RemixRT::nestedFrameStats();
+            const double traversalMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - beforeTraversal)
+                                           .count();
+            nestedStats.mTraversalMs += traversalMs;
+            nestedStats.mWorstTraversalMs = std::max(nestedStats.mWorstTraversalMs, traversalMs);
+        }
+
         // This loop drives the viewer itself, so nothing else will present the frame it just drew. Without
         // this the loading screen renders correctly into Remix's overlay image and is never shown.
         RemixRT::presentNestedFrame();

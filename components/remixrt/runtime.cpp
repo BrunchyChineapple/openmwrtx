@@ -2107,4 +2107,10 @@ namespace RemixRT
         if (gNestedFramePresenter)
             gNestedFramePresenter();
     }
+
+    NestedFrameStats& nestedFrameStats()
+    {
+        static NestedFrameStats sStats;
+        return sStats;
+    }
 }

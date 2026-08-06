@@ -1,9 +1,12 @@
 #include "engine.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <future>
 #include <system_error>
+#include <thread>
+
 
 #include <osgDB/ReaderWriter>
 #include <osgDB/Registry>
@@ -79,8 +82,334 @@
 #include "mwworld/datetimemanager.hpp"
 #include "mwworld/worldimp.hpp"
 
+#ifdef _WIN32
+// Last, and deliberately so. windows.h defines near and far as empty macros left over from the segmented
+// memory model, and OpenMW has functions taking parameters with those names -- Stereo::Manager::updateSettings
+// among them -- so including it any earlier turns unrelated headers into syntax errors. Everything above is
+// already parsed by the time it arrives, and the two macros are dropped immediately for the code below.
+//
+// Psapi is pulled in with a pragma rather than a CMake change because this is the only thing in the
+// executable that wants it, which keeps the dependency next to its single use.
+// WIN32_LEAN_AND_MEAN and NOMINMAX are already set project-wide, so they are not repeated here.
+#include <windows.h>
+
+#include <dbghelp.h>
+#include <psapi.h>
+
+#undef near
+#undef far
+
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "dbghelp.lib")
+#endif
+#endif
+
 namespace
 {
+    /// Records the wall-clock cost of the enclosing scope into \a slot, in milliseconds.
+    ///
+    /// Scoped rather than a stamp pair because the phases this measures are already wrapped in
+    /// ScopedProfile blocks with early returns and continues inside them -- a hand-placed end stamp would
+    /// be skipped on exactly the frames worth measuring.
+    class PhaseTimer
+    {
+    public:
+        explicit PhaseTimer(double& slot)
+            : mSlot(slot)
+            , mStart(std::chrono::steady_clock::now())
+        {
+        }
+
+        ~PhaseTimer()
+        {
+            mSlot = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mStart)
+                        .count();
+        }
+
+        PhaseTimer(const PhaseTimer&) = delete;
+        PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+    private:
+        double& mSlot;
+        std::chrono::steady_clock::time_point mStart;
+    };
+
+    /// Process-wide counters that a per-phase timer cannot see.
+    ///
+    /// The multi-second stalls land on a different phase every time -- input 1146 ms, mechanics 4007 ms,
+    /// lua sync 3406 ms, world 2703 ms -- and each happened exactly once in its window. One of them was
+    /// SDL event pumping taking over a second, which is not work that subsystem is capable of doing. A
+    /// stall that can surface anywhere is not owned by the code it lands in, so the useful question is what
+    /// the process as a whole was doing while it happened.
+    ///
+    /// These separate the remaining candidates. A page-fault burst means the working set is being paged and
+    /// the stall is the memory manager. Disk reads mean I/O reached the frame thread. Neither, with the
+    /// runtime already reporting zero acceleration structures and zero shader compiles for the same spike,
+    /// leaves a lock held by a worker thread -- and that is worth knowing before writing any more timers.
+    struct ProcessCounters
+    {
+        unsigned long long mPageFaults = 0;
+        unsigned long long mReadOps = 0;
+        unsigned long long mReadBytes = 0;
+        unsigned long long mWorkingSetMiB = 0;
+        unsigned long long mAvailableRamMiB = 0;
+    };
+
+    ProcessCounters sampleProcessCounters()
+    {
+        ProcessCounters counters;
+
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS memory{};
+        memory.cb = sizeof(memory);
+        if (::GetProcessMemoryInfo(::GetCurrentProcess(), &memory, sizeof(memory)))
+        {
+            counters.mPageFaults = memory.PageFaultCount;
+            counters.mWorkingSetMiB = memory.WorkingSetSize >> 20;
+        }
+
+        IO_COUNTERS io{};
+        if (::GetProcessIoCounters(::GetCurrentProcess(), &io))
+        {
+            counters.mReadOps = io.ReadOperationCount;
+            counters.mReadBytes = io.ReadTransferCount;
+        }
+
+        MEMORYSTATUSEX system{};
+        system.dwLength = sizeof(system);
+        if (::GlobalMemoryStatusEx(&system))
+            counters.mAvailableRamMiB = system.ullAvailPhys >> 20;
+#endif
+
+        return counters;
+    }
+
+#ifdef _WIN32
+    /// Captures the frame thread's call stack when a frame overruns, so a stall names the function it is
+    /// stuck in instead of the phase it happened to land on.
+    ///
+    /// Every stall measured so far has been a single occurrence, and each landed on a different phase --
+    /// input 1146 ms, mechanics 4222 ms, lua sync 3406 ms, world 2703 ms. One of them was SDL event
+    /// pumping, which that subsystem cannot do. So the phase is not the culprit. The worst read 786 MiB
+    /// across 249,690 operations inside one frame with the background work queue idle and 41 GiB of RAM
+    /// free, which says something on this thread is loading synchronously. A phase timer cannot say what.
+    /// A stack can, and guessing from four attributions that contradict each other is how several runs
+    /// have already been spent.
+    ///
+    /// Deliberately does no symbol resolution and no allocation while the frame thread is suspended.
+    /// DbgHelp is lock-protected, so resolving names against a thread that might itself hold that lock is a
+    /// deadlock. Addresses are collected, the thread is resumed, and only then are they turned into names.
+    class StallSampler
+    {
+    public:
+        explicit StallSampler(double thresholdMs)
+            : mThresholdMs(thresholdMs)
+        {
+            if (mThresholdMs <= 0.0)
+                return;
+
+            // A real handle to this thread, not the pseudo-handle GetCurrentThread returns: that one
+            // always means "the calling thread", so the watcher would suspend itself.
+            if (!::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(),
+                    &mThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    FALSE, 0))
+            {
+                mThread = nullptr;
+                Log(Debug::Warning) << "Remix: could not duplicate the frame thread handle; stall stacks "
+                                       "are unavailable";
+                return;
+            }
+
+            mFrames.reserve(kMaxFrames);
+            mHeartbeat.store(nowMs(), std::memory_order_relaxed);
+            mRunning.store(true, std::memory_order_relaxed);
+            mWorker = std::thread([this] { run(); });
+
+            Log(Debug::Info) << "Remix: capturing a frame-thread stack for any frame over " << mThresholdMs
+                             << " ms (OPENMW_REMIX_STALL_STACK_MS=0 to disable)";
+        }
+
+        ~StallSampler()
+        {
+            mRunning.store(false, std::memory_order_relaxed);
+            if (mWorker.joinable())
+                mWorker.join();
+            if (mThread != nullptr)
+                ::CloseHandle(mThread);
+        }
+
+        StallSampler(const StallSampler&) = delete;
+        StallSampler& operator=(const StallSampler&) = delete;
+
+        /// Called once per frame from the frame thread. A stall is simply this going quiet.
+        void heartbeat() { mHeartbeat.store(nowMs(), std::memory_order_relaxed); }
+
+    private:
+        static constexpr std::size_t kMaxFrames = 48;
+
+        static double nowMs()
+        {
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        }
+
+        void run()
+        {
+            const HANDLE process = ::GetCurrentProcess();
+            ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+            if (!::SymInitialize(process, nullptr, TRUE))
+            {
+                Log(Debug::Warning) << "Remix: SymInitialize failed; stall stacks will be addresses only";
+            }
+
+            // One capture per stall, rearmed only once the frame thread has moved on. Without this a
+            // four-second stall would be sampled forty times and say the same thing forty times.
+            double reported = 0.0;
+
+            while (mRunning.load(std::memory_order_relaxed))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                const double beat = mHeartbeat.load(std::memory_order_relaxed);
+                if (beat == reported || nowMs() - beat < mThresholdMs)
+                    continue;
+
+                mFrames.clear();
+                if (capture())
+                {
+                    reported = beat;
+                    report(nowMs() - beat, process);
+                }
+            }
+
+            ::SymCleanup(process);
+        }
+
+        bool capture()
+        {
+            if (::SuspendThread(mThread) == static_cast<DWORD>(-1))
+                return false;
+
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_FULL;
+            const bool haveContext = ::GetThreadContext(mThread, &context) != FALSE;
+
+            if (haveContext)
+            {
+                STACKFRAME64 frame{};
+                frame.AddrPC.Offset = context.Rip;
+                frame.AddrPC.Mode = AddrModeFlat;
+                frame.AddrFrame.Offset = context.Rbp;
+                frame.AddrFrame.Mode = AddrModeFlat;
+                frame.AddrStack.Offset = context.Rsp;
+                frame.AddrStack.Mode = AddrModeFlat;
+
+                // The two DbgHelp callbacks are required on x64 -- unwinding reads the image's exception
+                // directory, which is what SymFunctionTableAccess64 provides. They touch module tables
+                // rather than PDBs, so this stays off the symbol-loading path; name resolution waits until
+                // after the resume below.
+                while (mFrames.size() < kMaxFrames
+                    && ::StackWalk64(IMAGE_FILE_MACHINE_AMD64, ::GetCurrentProcess(), mThread, &frame,
+                           &context, nullptr, ::SymFunctionTableAccess64, ::SymGetModuleBase64, nullptr))
+                {
+                    if (frame.AddrPC.Offset == 0)
+                        break;
+                    mFrames.push_back(frame.AddrPC.Offset);
+                }
+            }
+
+            ::ResumeThread(mThread);
+            return haveContext && !mFrames.empty();
+        }
+
+        void report(double stalledMs, HANDLE process)
+        {
+            // One line per frame rather than one long line, because these are read by eye and a
+            // forty-deep stack on one line is unreadable.
+            Log(Debug::Warning) << "Remix stall stack: frame thread has been busy for " << stalledMs
+                                << " ms; innermost first:";
+
+            alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+            auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = MAX_SYM_NAME;
+
+            for (std::size_t i = 0; i < mFrames.size(); ++i)
+            {
+                const DWORD64 address = mFrames[i];
+                std::string name = "??";
+                DWORD64 displacement = 0;
+                if (::SymFromAddr(process, address, &displacement, symbol))
+                    name = symbol->Name;
+
+                std::string location;
+                IMAGEHLP_LINE64 line{};
+                line.SizeOfStruct = sizeof(line);
+                DWORD lineDisplacement = 0;
+                if (::SymGetLineFromAddr64(process, address, &lineDisplacement, &line)
+                    && line.FileName != nullptr)
+                {
+                    location = std::string(" at ") + line.FileName + ":" + std::to_string(line.LineNumber);
+                }
+
+                Log(Debug::Warning) << "  #" << i << " " << name << location;
+            }
+        }
+
+        double mThresholdMs = 0.0;
+        HANDLE mThread = nullptr;
+        std::atomic<double> mHeartbeat{ 0.0 };
+        std::atomic<bool> mRunning{ false };
+        std::thread mWorker;
+        /// Reserved up front so the capture allocates nothing while the frame thread is suspended.
+        std::vector<DWORD64> mFrames;
+    };
+#endif
+
+    /// A frame longer than this is a stall rather than a slow frame, and is counted separately.
+    ///
+    /// Counted at all because a window maximum cannot distinguish one four-second frame from forty
+    /// hundred-millisecond ones, and those want completely different fixes. Every multi-second stall
+    /// measured so far has been a single occurrence in its window, which is itself the finding.
+    constexpr double kStallMs = 500.0;
+
+    /// A numeric environment override, or \a fallback when it is unset or does not parse.
+    double envDouble(const char* name, double fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+
+        try
+        {
+            return std::stod(value);
+        }
+        catch (const std::exception&)
+        {
+            Log(Debug::Warning) << "Remix: " << name << " is not a number, using " << fallback;
+            return fallback;
+        }
+    }
+
+    /// Beats the stall sampler's heartbeat, building it on first use.
+    ///
+    /// A function-local static rather than an Engine member because the sampler is Windows-only and lives
+    /// in this file's anonymous namespace; declaring it in the header would drag windows.h along with it.
+    /// Constructed on the first call, which happens on the frame thread -- which is precisely the thread it
+    /// needs a handle to.
+    void beatStallSampler()
+    {
+#ifdef _WIN32
+        static StallSampler sampler(envDouble("OPENMW_REMIX_STALL_STACK_MS", 750.0));
+        sampler.heartbeat();
+#else
+        // Nothing portable to do here: capturing another thread's stack has no standard spelling, and the
+        // stalls being chased are on Windows.
+#endif
+    }
+
     /// True when Remix presents to the screen itself and OpenMW must not move its image.
     ///
     /// The configuration frame generation requires. Interpolated frames are produced during Remix's present
@@ -254,6 +583,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             //
             // The menu's own hotkeys are unaffected because Remix reads them from raw input on its
             // overlay window, not from SDL, so Alt+X still closes it.
+            PhaseTimer phase(mRemixPhases.mInput);
             mInputManager->update(frametime, mRemixMenuHasMouse, mRemixMenuHasMouse);
         }
 
@@ -288,12 +618,14 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 mSoundManager->resumePlayback();
 
             // sound
+            PhaseTimer phase(mRemixPhases.mSound);
             if (mUseSound)
                 mSoundManager->update(frametime);
         }
 
         {
             ScopedProfile<UserStatsType::LuaSyncUpdate> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mLuaSync);
             // Should be called after input manager update and before any change to the game world.
             // It applies to the game world queued changes from the previous frame.
             mLuaManager->synchronizedUpdate();
@@ -302,6 +634,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update game state
         {
             ScopedProfile<UserStatsType::State> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mState);
             mStateManager->update(frametime);
         }
 
@@ -338,6 +671,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update mechanics
         {
             ScopedProfile<UserStatsType::Mechanics> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mMechanics);
 
             if (mStateManager->getState() != MWBase::StateManager::State_NoGame)
             {
@@ -355,6 +689,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update physics
         {
             ScopedProfile<UserStatsType::Physics> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mPhysics);
 
             if (mStateManager->getState() != MWBase::StateManager::State_NoGame)
             {
@@ -365,6 +700,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update world
         {
             ScopedProfile<UserStatsType::World> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mWorld);
 
             if (mStateManager->getState() != MWBase::StateManager::State_NoGame)
             {
@@ -375,6 +711,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // update GUI
         {
             ScopedProfile<UserStatsType::Gui> profile(frameStart, frameNumber, *timer, *stats);
+            PhaseTimer phase(mRemixPhases.mWindowManager);
             mWindowManager->update(frametime);
         }
     }
@@ -533,6 +870,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 mRemixComposite->setSyncArmed(false);
         }
         const auto afterCopy = std::chrono::steady_clock::now();
+        // Also kept on the object, because the span from here to the draw traversal is measured outside
+        // this block's scope.
+        mRemixAfterCopyStamp = afterCopy;
 
         // Only overwrite OpenMW's frame when Remix actually has something in it.
         //
@@ -715,7 +1055,6 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             mRemixTiming.mSubmitMs += ms(afterSubmit - beforeSubmit);
             mRemixTiming.mPresentMs += ms(afterPresent - afterSubmit);
             mRemixTiming.mCopyMs += ms(afterCopy - afterPresent);
-            mRemixTiming.mFrameMs += frametime * 1000.0;
             mRemixTiming.mOsgUpdateMs += mRemixOsgUpdateMs;
             mRemixTiming.mOsgRenderMs += mRemixRenderMs;
 
@@ -728,6 +1067,95 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             mRemixTiming.mReadbackLockMs += static_cast<double>(lockNs) / 1.0e6;
             mRemixTiming.mReadbackCopyMs += static_cast<double>(copyNs) / 1.0e6;
             mRemixTiming.mWorstReadbackMs = std::max(mRemixTiming.mWorstReadbackMs, readbackMs);
+
+            // Keep the slowest frame of the window with its components intact, so a freeze can be
+            // attributed instead of averaged away. Measured on the wall clock rather than frametime, which
+            // is clamped at 200 ms and therefore reports every freeze as exactly 200 ms.
+            const auto frameStamp = std::chrono::steady_clock::now();
+            const double thisFrameMs = ms(frameStamp - mRemixFrameStamp);
+            mRemixFrameStamp = frameStamp;
+
+            // The mean total is the same wall-clock measure as the worst frame. It used to accumulate
+            // frametime, which is clamped, so a window containing a ten-second freeze reported a mean built
+            // from a 200 ms ceiling -- and then the accounted percentage was computed against that, which
+            // made the accounting look far better than it was.
+            mRemixTiming.mFrameMs += thisFrameMs;
+            mRemixTiming.mPhasesTotalMs += mRemixPhases.total();
+
+            mRemixTiming.mWorstSubmitMs
+                = std::max(mRemixTiming.mWorstSubmitMs, ms(afterSubmit - beforeSubmit));
+            mRemixTiming.mWorstPresentMs
+                = std::max(mRemixTiming.mWorstPresentMs, ms(afterPresent - afterSubmit));
+            mRemixTiming.mWorstOsgUpdateMs
+                = std::max(mRemixTiming.mWorstOsgUpdateMs, mRemixOsgUpdateMs);
+            mRemixTiming.mWorstOsgRenderMs = std::max(mRemixTiming.mWorstOsgRenderMs, mRemixRenderMs);
+            mRemixTiming.mWorstPostCopyMs = std::max(mRemixTiming.mWorstPostCopyMs, mRemixPostCopyMs);
+            mRemixTiming.mWorstLuaFinishMs
+                = std::max(mRemixTiming.mWorstLuaFinishMs, mRemixLuaFinishMs);
+
+            SimulationPhases& worstPhases = mRemixTiming.mWorstPhases;
+            worstPhases.mInput = std::max(worstPhases.mInput, mRemixPhases.mInput);
+            worstPhases.mSound = std::max(worstPhases.mSound, mRemixPhases.mSound);
+            worstPhases.mLuaSync = std::max(worstPhases.mLuaSync, mRemixPhases.mLuaSync);
+            worstPhases.mState = std::max(worstPhases.mState, mRemixPhases.mState);
+            worstPhases.mMechanics = std::max(worstPhases.mMechanics, mRemixPhases.mMechanics);
+            worstPhases.mPhysics = std::max(worstPhases.mPhysics, mRemixPhases.mPhysics);
+            worstPhases.mWorld = std::max(worstPhases.mWorld, mRemixPhases.mWorld);
+            worstPhases.mWindowManager
+                = std::max(worstPhases.mWindowManager, mRemixPhases.mWindowManager);
+
+            if (thisFrameMs > kStallMs)
+                mRemixTiming.mStalls += 1;
+
+            // Tell the watcher the frame thread is alive. Anything that stops this for longer than the
+            // threshold gets its stack captured.
+            beatStallSampler();
+
+            // Sampled every frame and differenced, so what lands on the worst frame describes that frame
+            // rather than the session. Cheap: three syscalls reading counters the kernel already keeps.
+            //
+            // Primed on the first sample instead of differencing against zero. Without that the first frame
+            // reports every page fault and every byte the process has read since it started -- which is how
+            // a startup frame came to claim 5,656,900 page faults and 2 GiB of reads, numbers that describe
+            // the whole of startup and not the frame they were printed against.
+            const ProcessCounters counters = sampleProcessCounters();
+            if (!mRemixCountersPrimed)
+            {
+                mRemixCountersPrimed = true;
+                mRemixPrevPageFaults = counters.mPageFaults;
+                mRemixPrevReadOps = counters.mReadOps;
+                mRemixPrevReadBytes = counters.mReadBytes;
+            }
+            const unsigned long long pageFaultDelta = counters.mPageFaults - mRemixPrevPageFaults;
+            const unsigned long long readOpDelta = counters.mReadOps - mRemixPrevReadOps;
+            const unsigned long long readByteDelta = counters.mReadBytes - mRemixPrevReadBytes;
+            mRemixPrevPageFaults = counters.mPageFaults;
+            mRemixPrevReadOps = counters.mReadOps;
+            mRemixPrevReadBytes = counters.mReadBytes;
+
+            if (thisFrameMs > mRemixTiming.mWorstFrameMs)
+            {
+                mRemixTiming.mWorstFrameMs = thisFrameMs;
+                mRemixTiming.mWorstFramePhases = mRemixPhases;
+                mRemixTiming.mWorstFramePageFaults = pageFaultDelta;
+                mRemixTiming.mWorstFrameReadOps = readOpDelta;
+                mRemixTiming.mWorstFrameReadBytes = readByteDelta;
+                mRemixTiming.mWorstFrameWorkingSetMiB = counters.mWorkingSetMiB;
+                mRemixTiming.mWorstFrameAvailableRamMiB = counters.mAvailableRamMiB;
+                mRemixTiming.mWorstFrameWorkQueue
+                    = mWorkQueue != nullptr ? static_cast<unsigned int>(mWorkQueue->getNumItems()) : 0u;
+                mRemixTiming.mWorstFrameWorkThreads
+                    = mWorkQueue != nullptr ? static_cast<unsigned int>(mWorkQueue->getNumActiveThreads()) : 0u;
+                mRemixTiming.mWorstFrameUnrefQueue
+                    = mUnrefQueue != nullptr ? static_cast<unsigned int>(mUnrefQueue->getSize()) : 0u;
+                mRemixTiming.mWorstFrameSubmitMs = ms(afterSubmit - beforeSubmit);
+                mRemixTiming.mWorstFramePresentMs = ms(afterPresent - afterSubmit);
+                mRemixTiming.mWorstFrameCopyMs = ms(afterCopy - afterPresent);
+                mRemixTiming.mWorstFrameReadbackMs = readbackMs;
+                mRemixTiming.mWorstFrameOsgUpdateMs = mRemixOsgUpdateMs;
+                mRemixTiming.mWorstFrameOsgRenderMs = mRemixRenderMs;
+                mRemixTiming.mWorstFrameIndex = mRemixTiming.mFrames;
+            }
 
             constexpr unsigned kTimingWindowFrames = 300;
             if (mRemixTiming.mFrames >= kTimingWindowFrames)
@@ -751,8 +1179,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 // What is left after everything measured. A large remainder means the budget is wrong and
                 // the next thing to do is measure, not optimise -- which is exactly the mistake the first
                 // pass at this made by assuming the readback dominated.
+                const double phases = mRemixTiming.mPhasesTotalMs / frames;
                 const double accounted = submit + present + (mRemixTiming.mCopyMs / frames) + readbackQueue
-                    + readbackLock + readbackCopy + osgUpdate + osgRender;
+                    + readbackLock + readbackCopy + osgUpdate + osgRender + phases;
 
                 Log(Debug::Info) << "Remix frame cost over " << mRemixTiming.mFrames
                                  << " frames, mean ms: frame " << frame << " | OpenMW update " << osgUpdate
@@ -760,11 +1189,92 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                                  << " | present " << present << " | copy to shared "
                                  << (mRemixTiming.mCopyMs / frames) << " | readback queue " << readbackQueue
                                  << " | readback lock (GPU wait) " << readbackLock << " | readback copy "
-                                 << readbackCopy << " | upload CPU->GPU " << uploadMs << " (draw thread, "
+                                 << readbackCopy << " | OpenMW simulation " << phases
+                                 << " | upload CPU->GPU " << uploadMs << " (draw thread, "
                                  << uploads << " uploads); worst single readback "
                                  << mRemixTiming.mWorstReadbackMs
                                  << "; accounted " << accounted << " of " << frame << " ("
                                  << (frame > 0.0 ? 100.0 * accounted / frame : 0.0) << "%)";
+
+                const double worstAccounted = mRemixTiming.mWorstFrameSubmitMs
+                    + mRemixTiming.mWorstFramePresentMs + mRemixTiming.mWorstFrameCopyMs
+                    + mRemixTiming.mWorstFrameReadbackMs + mRemixTiming.mWorstFrameOsgUpdateMs
+                    + mRemixTiming.mWorstFrameOsgRenderMs + mRemixTiming.mWorstFramePhases.total();
+
+                const SimulationPhases& wfp = mRemixTiming.mWorstFramePhases;
+                const SimulationPhases& wp = mRemixTiming.mWorstPhases;
+                Log(Debug::Info) << "Remix simulation phases, worst frame ms: world " << wfp.mWorld
+                                 << " | physics " << wfp.mPhysics << " | mechanics " << wfp.mMechanics
+                                 << " | lua sync " << wfp.mLuaSync << " | GUI " << wfp.mWindowManager
+                                 << " | state " << wfp.mState << " | input " << wfp.mInput << " | sound "
+                                 << wfp.mSound << " (total " << wfp.total()
+                                 << "); worst anywhere in window: world " << wp.mWorld << " | physics "
+                                 << wp.mPhysics << " | mechanics " << wp.mMechanics << " | lua sync "
+                                 << wp.mLuaSync << " | GUI " << wp.mWindowManager << " | state "
+                                 << wp.mState << " | input " << wp.mInput << " | sound " << wp.mSound
+                                 << "; nested presents (loading screens, message boxes, video) "
+                                 << mRemixTiming.mNestedPresents << " costing "
+                                 << mRemixTiming.mNestedPresentMs << " ms total, mean "
+                                 << (mRemixTiming.mNestedPresents > 0
+                                            ? mRemixTiming.mNestedPresentMs / mRemixTiming.mNestedPresents
+                                            : 0.0)
+                                 << " ms";
+
+                // Reported separately from the window figures above, and not reset with them, because a
+                // burst does not line up with a 300-frame window: a cell load is one long frame, so the
+                // whole burst lands inside a single sample. These accumulate over the session so the split
+                // is readable even when the load that produced it was several windows ago.
+                //
+                // The split is the point. If the cost is asset compilation then it sits in the traversal
+                // or in the first present alone, and rationing the presents would move the work rather
+                // than remove it. If first, worst and least are all alike, each present is paying full
+                // price for a path-traced frame and the ration is the fix.
+                // Only when something actually stalled, so an ordinary window stays quiet.
+                if (mRemixTiming.mStalls > 0)
+                {
+                    Log(Debug::Info)
+                        << "Remix stall context: " << mRemixTiming.mStalls << " frame(s) over " << kStallMs
+                        << " ms in this window; across the worst one, page faults "
+                        << mRemixTiming.mWorstFramePageFaults << ", disk reads "
+                        << mRemixTiming.mWorstFrameReadOps << " ops / "
+                        << (mRemixTiming.mWorstFrameReadBytes >> 10) << " KiB; work queue "
+                        << mRemixTiming.mWorstFrameWorkQueue << " items on "
+                        << mRemixTiming.mWorstFrameWorkThreads << " active threads, unref queue "
+                        << mRemixTiming.mWorstFrameUnrefQueue << "; working set "
+                        << mRemixTiming.mWorstFrameWorkingSetMiB << " MiB, system RAM free "
+                        << mRemixTiming.mWorstFrameAvailableRamMiB << " MiB";
+                }
+
+                const RemixRT::NestedFrameStats& nested = RemixRT::nestedFrameStats();
+                if (nested.mFrames > 0 || nested.mSkipped > 0)
+                {
+                    Log(Debug::Info)
+                        << "Remix nested frames this session: presented " << nested.mFrames << ", rationed "
+                        << nested.mSkipped << "; present " << nested.mPresentMs << " ms total (first "
+                        << nested.mFirstPresentMs << ", worst " << nested.mWorstPresentMs << ", least "
+                        << nested.mLeastPresentMs << ", mean "
+                        << (nested.mFrames > 0 ? nested.mPresentMs / nested.mFrames : 0.0)
+                        << "); traversal " << nested.mTraversalMs << " ms total (worst "
+                        << nested.mWorstTraversalMs << ")";
+                }
+                Log(Debug::Info) << "Remix worst frame in window: frame " << mRemixTiming.mWorstFrameMs
+                                 << " ms (sample " << mRemixTiming.mWorstFrameIndex << ") | OpenMW update "
+                                 << mRemixTiming.mWorstFrameOsgUpdateMs << " | OpenMW render "
+                                 << mRemixTiming.mWorstFrameOsgRenderMs << " | scene submit "
+                                 << mRemixTiming.mWorstFrameSubmitMs << " | present "
+                                 << mRemixTiming.mWorstFramePresentMs << " | copy to shared "
+                                 << mRemixTiming.mWorstFrameCopyMs << " | readback "
+                                 << mRemixTiming.mWorstFrameReadbackMs << "; accounted " << worstAccounted
+                                 << " of " << mRemixTiming.mWorstFrameMs << " ("
+                                 << (mRemixTiming.mWorstFrameMs > 0.0
+                                            ? 100.0 * worstAccounted / mRemixTiming.mWorstFrameMs
+                                            : 0.0)
+                                 << "%); worst anywhere in window: submit " << mRemixTiming.mWorstSubmitMs
+                                 << ", present " << mRemixTiming.mWorstPresentMs << ", OpenMW update "
+                                 << mRemixTiming.mWorstOsgUpdateMs << ", OpenMW render (traversal) "
+                                 << mRemixTiming.mWorstOsgRenderMs << ", post-copy (input/GUI/readback) "
+                                 << mRemixTiming.mWorstPostCopyMs << ", Lua finish "
+                                 << mRemixTiming.mWorstLuaFinishMs;
                 mRemixTiming = RemixTiming{};
             }
         }
@@ -819,6 +1329,15 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // thread, work can still be in flight when this returns. So a large number here is conclusive and a
     // small one is not, same caveat as the texture upload.
     const auto beforeRender = std::chrono::steady_clock::now();
+
+    // Everything between the Remix copy and the draw traversal, as one span.
+    //
+    // Measured freezes of four seconds accounted for 0.35% across every timer in the frame, so the cost is
+    // in a span nobody was watching. This is the largest of them: input, the GUI, uiState, readOutputPixels
+    // and probeOutputNonBlack all sit here, and the last two read GPU memory back to the CPU, which blocks.
+    mRemixPostCopyMs
+        = std::chrono::duration<double, std::milli>(beforeRender - mRemixAfterCopyStamp).count();
+
     mViewer->renderingTraversals();
     mRemixRenderMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeRender)
@@ -911,7 +1430,13 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                                     .count();
     }
 
+    // The last unmeasured thing in the frame. finishUpdate joins the Lua worker, so a script or a
+    // synchronisation inside it blocks here and would otherwise be invisible.
+    const auto beforeLuaFinish = std::chrono::steady_clock::now();
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
+    mRemixLuaFinishMs
+        = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeLuaFinish)
+              .count();
 
     return true;
 }
@@ -1573,18 +2098,87 @@ void OMW::Engine::prepareEngine()
             //
             // Only the present, deliberately: those loops submit no scene, so Remix repeats whatever
             // geometry it last had, and the overlay drawn on top is what is meant to be looked at.
-            RemixRT::setNestedFramePresenter([this]() {
+            // How much of a nested loop's wall time may go on presenting it, and how long the loop has to
+            // have been running before the first presented frame.
+            //
+            // The loading screen asks for a frame on every progress tick, gated only by
+            // 1/mTargetFrameRate -- 8.3 ms at its default of 120, and nothing lowers it unless a framerate
+            // limit is set. Under a path tracer a presented frame does not cost 8.3 ms, so that gate never
+            // engages and the loop presents as fast as it can. Measured on a cell load whose own work was
+            // around 160 ms: seven presents, 10379.7 ms.
+            //
+            // A progress indicator costing sixty times the operation it reports is not reporting on the
+            // operation, it is the operation. Stated as a share of the loop rather than as a frame rate,
+            // because a frame rate cannot be chosen without knowing what a frame costs, and that is exactly
+            // what varies. Overridable so the numbers can be measured rather than argued about.
+            const double nestedShare = envDouble("OPENMW_REMIX_NESTED_PRESENT_SHARE", 0.25);
+            const double nestedFirstDelayMs = envDouble("OPENMW_REMIX_NESTED_PRESENT_DELAY_MS", 200.0);
+
+            RemixRT::setNestedFramePresenter([this, nestedShare, nestedFirstDelayMs]() {
                 if (mRemix == nullptr || !mRemix->isReady())
                     return;
+
+                RemixRT::NestedFrameStats& stats = RemixRT::nestedFrameStats();
+                const auto now = std::chrono::steady_clock::now();
+                const auto since = [&now](const std::chrono::steady_clock::time_point& stamp) {
+                    return std::chrono::duration<double, std::milli>(now - stamp).count();
+                };
+
+                // These loops run in bursts -- one per cell load, message box or video -- and the ration is
+                // per burst. A gap longer than any single presented frame means the previous burst ended, so
+                // the next starts with a full allowance rather than inheriting a spent one.
+                constexpr double burstGapMs = 500.0;
+                if (mRemixNestedSequenceActive && since(mRemixNestedLastCall) > burstGapMs)
+                    mRemixNestedSequenceActive = false;
+
+                if (!mRemixNestedSequenceActive)
+                {
+                    mRemixNestedSequenceActive = true;
+                    mRemixNestedSequenceStart = now;
+                    mRemixNestedSequenceSpentMs = 0.0;
+                }
+                mRemixNestedLastCall = now;
+
+                const double elapsedMs = since(mRemixNestedSequenceStart);
+
+                // Nothing is shown for a loop that finishes before a human would notice it began. Without
+                // this a load whose real work is 160 ms still pays for a whole presented frame, which is
+                // most of what made short loads feel like long ones.
+                if (elapsedMs < nestedFirstDelayMs || mRemixNestedSequenceSpentMs > nestedShare * elapsedMs)
+                {
+                    stats.mSkipped += 1;
+                    return;
+                }
 
                 // The camera has to be re-sent, not just the present issued. A frame with no camera is one
                 // Remix does not raytrace, and the screen-overlay composite is at the end of that path,
                 // after tone mapping -- so without this the interface those loops draw is composited by
                 // nothing. Geometry is deliberately not submitted: see RemixScene::resubmitCamera.
+                const auto beforeNested = std::chrono::steady_clock::now();
+
                 if (mRemixScene != nullptr)
                     mRemixScene->resubmitCamera();
 
                 mRemix->present();
+
+                const double presentMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - beforeNested)
+                                             .count();
+
+                mRemixNestedSequenceSpentMs += presentMs;
+
+                if (stats.mFrames == 0)
+                {
+                    stats.mFirstPresentMs = presentMs;
+                    stats.mLeastPresentMs = presentMs;
+                }
+                stats.mLeastPresentMs = std::min(stats.mLeastPresentMs, presentMs);
+                stats.mWorstPresentMs = std::max(stats.mWorstPresentMs, presentMs);
+                stats.mPresentMs += presentMs;
+                stats.mFrames += 1;
+
+                mRemixTiming.mNestedPresents += 1;
+                mRemixTiming.mNestedPresentMs += presentMs;
             });
 
             if (mRemix != nullptr && mRemix->setOverlayEnabled(true, 1.0f))

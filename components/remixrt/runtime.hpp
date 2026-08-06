@@ -626,6 +626,32 @@ namespace RemixRT
     /// Runs whatever setNestedFramePresenter installed. Safe to call when nothing is installed, and safe
     /// to call when Remix is not in use at all -- both are no-ops.
     void presentNestedFrame();
+
+    /// What the frames drawn by those loops cost, so the engine can both report and ration them.
+    ///
+    /// A measured cell load spent 10379.7 ms across seven of these presents while the load's own work was
+    /// roughly 160 ms -- the progress bar cost sixty times what it was reporting on. Which fix that calls
+    /// for depends on where the time is, and the mean alone cannot say: a per-frame path-traced cost and a
+    /// one-off queue of asset compilation draining at the first synchronisation point produce the same
+    /// mean over seven samples. Hence first, worst and least separately, and the traversal split out from
+    /// the present -- OpenMW's incremental compile runs in the traversal, so if the cost is really asset
+    /// compilation it belongs on that side of the line or in the first present alone.
+    struct NestedFrameStats
+    {
+        unsigned int mFrames = 0;
+        unsigned int mSkipped = 0;
+        /// eventTraversal + updateTraversal + renderingTraversals, contributed by the loop itself.
+        double mTraversalMs = 0.0;
+        double mWorstTraversalMs = 0.0;
+        /// resubmitCamera + present, contributed by the presenter.
+        double mPresentMs = 0.0;
+        double mFirstPresentMs = 0.0;
+        double mWorstPresentMs = 0.0;
+        double mLeastPresentMs = 0.0;
+    };
+
+    /// The process-wide nested frame statistics. Reset by whoever reports them.
+    NestedFrameStats& nestedFrameStats();
 }
 
 #endif
