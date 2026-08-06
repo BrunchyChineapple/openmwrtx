@@ -3114,7 +3114,19 @@ namespace MWRender
         // else about it, so without this there is no way to get from a thumbnail that looks wrong to the
         // file responsible -- which was previously a dead end for exactly the sort of "these normals are
         // off" report this exists to answer.
-        if (mTexturesLogged < kTextureLogLimit)
+        // Generated terrain composites are excluded, and that is the whole point of the line rather than an
+        // exception to it: a composite has no file on disk, so there is nothing for a pasted hash to lead
+        // back to. They were also more than half the volume -- 511 of each in one two-minute run -- because
+        // they are regenerated as chunks come into view, so they were both useless here and crowding out the
+        // authored textures this exists to identify.
+        //
+        // Worth more than tidiness. Log::~Log ends in std::endl, which flushes, and the sink is a console as
+        // well as a file; one measured frame spent 811 ms inside that flush. Logging on a per-composite basis
+        // during play was itself a source of the stutter being investigated.
+        const bool generatedComposite
+            = std::string_view(image.getFileName()) == Terrain::CompositeMap::sReadbackImageName;
+
+        if (!generatedComposite && mTexturesLogged < kTextureLogLimit)
         {
             ++mTexturesLogged;
             Log(Debug::Info) << "Remix texture " << mTexturesLogged << ": " << std::hex << std::uppercase
@@ -3240,7 +3252,10 @@ namespace MWRender
         // screen alone: "alpha is not working" has three indistinguishable causes -- no cutout requested,
         // a cutout against a texture with no alpha channel, and a cutout at a threshold nothing can pass
         // -- and "everything looks like plastic" is either no rule matching or the rule being wrong.
-        if (mMaterialsLogged < kMaterialLogLimit)
+        // Composites excluded for the same reason as in textureFor: no file behind them, regenerated
+        // constantly, and the flush at the end of every log line is not free.
+        if (std::string_view(image->getFileName()) != Terrain::CompositeMap::sReadbackImageName
+            && mMaterialsLogged < kMaterialLogLimit)
         {
             ++mMaterialsLogged;
             const std::string transparencyDescription = blendType == kBlendTypeAlphaEmissive
