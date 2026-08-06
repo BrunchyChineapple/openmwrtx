@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <map>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -389,10 +390,25 @@ namespace MWLua
         const auto batchStarted = std::chrono::steady_clock::now();
         const std::size_t queued = mActionQueue.size();
 
-        // Per-name totals, so an overrunning batch says what it was full of. Only populated once the batch
-        // is already known to be long, which is why the timing is per action rather than measured here.
-        std::vector<std::pair<std::string_view, double>> costs;
-        costs.reserve(queued);
+        // Tallied inside the loop and keyed by an owning string, not a view.
+        //
+        // The first version collected string_views into each action's mName and aggregated them after
+        // mActionQueue.clear(), which destroys the strings those views point at. It printed recognisable
+        // but corrupt names -- "Create UI" came out as " reate UI" -- because the freed small-string buffer
+        // still held most of its old contents with the first byte reused. A use-after-free that produces
+        // almost-correct output is worse than one that crashes, so this owns its keys.
+        //
+        // Aggregating unconditionally rather than only for slow batches: it is a map lookup per action
+        // against a handful of distinct names, which is nothing next to the actions themselves, and the
+        // alternative is keeping per-action state alive past the point where it is valid.
+        std::map<std::string, std::pair<unsigned int, double>> byName;
+
+        // The single slowest action of the batch, kept with its traceback. A batch report can say what it
+        // was full of, but only a traceback can say which script queued it -- every ui.create is named
+        // "Create UI" whoever called it.
+        double slowestMs = -1.0;
+        std::string slowestName;
+        std::string slowestTraceback;
 
         {
             BoolScopeGuard applyingGuard(mApplyingDelayedActions);
@@ -400,9 +416,21 @@ namespace MWLua
             {
                 const auto actionStarted = std::chrono::steady_clock::now();
                 action.apply();
-                costs.emplace_back(action.name(),
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - actionStarted)
-                        .count());
+                const double actionMs
+                    = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - actionStarted)
+                          .count();
+
+                auto& entry = byName[std::string(action.name())];
+                entry.first += 1;
+                entry.second += actionMs;
+
+                if (actionMs > slowestMs)
+                {
+                    slowestMs = actionMs;
+                    slowestName = action.name();
+                    slowestTraceback = action.callerTraceback();
+                }
             }
             mActionQueue.clear();
 
@@ -417,15 +445,7 @@ namespace MWLua
         if (batchMs < batchOverrunMs || queued == 0)
             return;
 
-        std::map<std::string_view, std::pair<unsigned int, double>> byName;
-        for (const auto& [name, ms] : costs)
-        {
-            auto& entry = byName[name];
-            entry.first += 1;
-            entry.second += ms;
-        }
-
-        std::vector<std::pair<std::string_view, std::pair<unsigned int, double>>> ranked(
+        std::vector<std::pair<std::string, std::pair<unsigned int, double>>> ranked(
             byName.begin(), byName.end());
         std::sort(ranked.begin(), ranked.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.second.second > rhs.second.second; });
@@ -438,6 +458,12 @@ namespace MWLua
             Log(Debug::Warning) << "  '" << ranked[i].first << "' x" << ranked[i].second.first << " = "
                                 << ranked[i].second.second << " ms";
         }
+
+        Log(Debug::Warning) << "  slowest single action '" << slowestName << "' " << slowestMs << " ms";
+        if (slowestTraceback.empty())
+            Log(Debug::Warning) << "  set 'lua debug = true' in settings.cfg to learn which script queued it";
+        else
+            Log(Debug::Warning) << "  queued by " << slowestTraceback;
     }
 
     void LuaManager::clear()

@@ -249,6 +249,10 @@ namespace MWLua
             /// count rather than pretending to name a mod.
             std::string_view name() const { return mName; }
 
+            /// Where the action was queued from, or empty unless 'lua debug' is on. The only thing that
+            /// can attribute a generically named action to a script.
+            std::string_view callerTraceback() const { return mCallerTraceback; }
+
         private:
             std::string mCallerTraceback;
             std::function<void()> mFn;
