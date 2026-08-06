@@ -5,6 +5,7 @@
 
 #include <DbgHelp.h>
 
+#include <cstdlib>
 #include <memory>
 #include <thread>
 
@@ -170,11 +171,15 @@ namespace Crash
             // app waits for monitor start up, let it continue
             signalApp();
 
+            const char* disableFreezeDetector = std::getenv("OPENMW_DISABLE_FREEZE_DETECTOR");
+            const bool detectFreezes = disableFreezeDetector == nullptr
+                || Misc::StringUtils::toNumeric<int>(disableFreezeDetector, 0) == 0;
+
             bool running = true;
             bool frozen = false;
             while (isAppAlive() && running && !mFreezeAbort)
             {
-                if (isAppFrozen())
+                if (detectFreezes && isAppFrozen())
                 {
                     if (!frozen)
                     {
