@@ -232,11 +232,25 @@ namespace
 
         ~StallSampler()
         {
+            stop();
+            if (mThread != nullptr)
+                ::CloseHandle(mThread);
+        }
+
+        /// Disarms the watcher and waits for it. Idempotent, and it must be called before the frame loop is
+        /// left rather than left to the destructor.
+        ///
+        /// Learned by hanging a shutdown. Once the frame loop stops, so does the heartbeat, so the watcher
+        /// concludes the frame thread has stalled and suspends it -- during shutdown, when that thread is
+        /// unloading libraries and holding the loader lock. StackWalk64 then wants the same lock, from a
+        /// thread that cannot make progress until the one holding it resumes, and the process deadlocks with
+        /// no output at all. The user had to kill it. A static destructor is too late for this, because it
+        /// runs after the shutdown the watcher would be sampling.
+        void stop()
+        {
             mRunning.store(false, std::memory_order_relaxed);
             if (mWorker.joinable())
                 mWorker.join();
-            if (mThread != nullptr)
-                ::CloseHandle(mThread);
         }
 
         StallSampler(const StallSampler&) = delete;
@@ -393,20 +407,47 @@ namespace
         }
     }
 
-    /// Beats the stall sampler's heartbeat, building it on first use.
+#ifdef _WIN32
+    /// The one stall sampler, or null when it is switched off.
     ///
-    /// A function-local static rather than an Engine member because the sampler is Windows-only and lives
-    /// in this file's anonymous namespace; declaring it in the header would drag windows.h along with it.
-    /// Constructed on the first call, which happens on the frame thread -- which is precisely the thread it
-    /// needs a handle to.
+    /// A function-local static rather than an Engine member because it is Windows-only and lives in this
+    /// file's anonymous namespace; declaring it in the header would drag windows.h along with it. Built on
+    /// the first call, which happens on the frame thread -- precisely the thread it needs a handle to.
+    ///
+    /// Off unless OPENMW_REMIX_STALL_STACK_MS is set, and deliberately so. It found every stall worth
+    /// finding, but suspending the frame thread to walk its stack can deadlock against any lock that thread
+    /// holds, which is not a hazard to leave armed by default in a build meant to be shown to people. It is
+    /// a tool to reach for when something needs locating, not a permanent fixture.
+    StallSampler* stallSampler()
+    {
+        static const double thresholdMs = envDouble("OPENMW_REMIX_STALL_STACK_MS", 0.0);
+        if (thresholdMs <= 0.0)
+            return nullptr;
+
+        static StallSampler sampler(thresholdMs);
+        return &sampler;
+    }
+#endif
+
+    /// Tells the stall sampler the frame thread is still alive.
     void beatStallSampler()
     {
 #ifdef _WIN32
-        static StallSampler sampler(envDouble("OPENMW_REMIX_STALL_STACK_MS", 750.0));
-        sampler.heartbeat();
+        if (StallSampler* sampler = stallSampler())
+            sampler->heartbeat();
 #else
         // Nothing portable to do here: capturing another thread's stack has no standard spelling, and the
         // stalls being chased are on Windows.
+#endif
+    }
+
+    /// Disarms the stall sampler. Called when the frame loop is left, because a stopped heartbeat is
+    /// indistinguishable from a stall and shutdown is the worst possible moment to suspend the frame thread.
+    void stopStallSampler()
+    {
+#ifdef _WIN32
+        if (StallSampler* sampler = stallSampler())
+            sampler->stop();
 #endif
     }
 
@@ -2441,6 +2482,10 @@ void OMW::Engine::go()
 
         frameRateLimiter.limit();
     }
+
+    // Before anything else in the shutdown, because from here on the heartbeat stops and a stopped heartbeat
+    // reads as a stall. See stopStallSampler.
+    stopStallSampler();
 
     mLuaWorker->join();
 
