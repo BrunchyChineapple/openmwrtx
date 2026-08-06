@@ -350,10 +350,11 @@ namespace MWLua
                             << breakdown.mGlobalScriptUpdates << " | script unloading "
                             << breakdown.mScriptUnloading;
 
-        // Per-script attribution for the same frame. Sums every container so a script running on four
-        // hundred actors is reported once with its total, which is the number that matters here -- a
-        // cheap handler multiplied by the active actor count is a perfectly ordinary way to lose 300 ms,
-        // and it looks nothing like one expensive script in a per-instance view.
+        // Per-script attribution for the same frame, covering every way Lua gets called. Sums every
+        // container so a script running on four hundred actors is reported once with its total, which is
+        // the number that matters here -- a cheap handler multiplied by the active actor count is a
+        // perfectly ordinary way to lose 300 ms, and it looks nothing like one expensive script in a
+        // per-instance view.
         using Stats = LuaUtil::ScriptsContainer::ScriptStats;
         std::vector<Stats> stats;
         mGlobalScripts.collectStats(stats);
@@ -390,7 +391,7 @@ namespace MWLua
             const std::size_t id = order[i];
             Log msg(Debug::Warning);
             msg << "  " << stats[id].mFrameTimeMs << " ms across " << stats[id].mFrameCalls
-                << " handler call(s): ";
+                << " Lua call(s): ";
             // collectStats sizes its vector from the configuration, so this should always hold. Checked
             // anyway rather than indexed on faith, because the alternative is an out-of-range read in a
             // diagnostic that only runs when something is already going wrong.
@@ -399,11 +400,12 @@ namespace MWLua
             else
                 msg << "<script id " << id << " not in the configuration>";
         }
-        // The remainder is not slack to be ignored: it covers Lua reached other than through an engine
-        // handler -- event handlers, timer callbacks and queued callbacks -- and the spans above say which.
+        // A remainder now means time inside the engine rather than inside a script: script loading from
+        // ensureLoaded, the object list rebuild, event deserialization, and the engine bindings a script
+        // calls are all charged to the engine side of the boundary, not to Lua. The spans above say which.
         Log(Debug::Warning) << "  " << attributed << " ms of " << breakdown.mTotal
-                            << " ms attributed to engine handlers across " << calls << " call(s) in "
-                            << order.size() << " script(s); the rest is in the spans above";
+                            << " ms is script self time across " << calls << " Lua call(s) in "
+                            << order.size() << " script(s); the rest is engine work in the spans above";
     }
 
     void LuaManager::objectTeleported(const MWWorld::Ptr& ptr)

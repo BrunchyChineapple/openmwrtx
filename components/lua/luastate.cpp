@@ -84,6 +84,11 @@ namespace LuaUtil
         }
     }
 
+    void LuaState::chargeFrameTime(const ScriptId& scriptId, double ms)
+    {
+        scriptId.mContainer->addFrameTime(scriptId.mIndex, ms);
+    }
+
     void* LuaState::trackingAllocator(void* ud, void* ptr, size_t osize, size_t nsize)
     {
         LuaState* self = static_cast<LuaState*>(ud);

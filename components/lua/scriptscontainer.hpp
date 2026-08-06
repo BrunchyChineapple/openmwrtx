@@ -195,7 +195,11 @@ namespace LuaUtil
         {
             float mAvgInstructionCount = 0; // averaged number of Lua instructions per frame
             int64_t mMemoryUsage = 0; // bytes
-            /// Wall time this script's engine handlers took during the current profiler frame, in ms.
+            /// Self time this script took during the current profiler frame, in milliseconds.
+            ///
+            /// Charged in LuaUtil::call, so it covers engine handlers, event handlers and timer callbacks
+            /// alike. Self time, not total: time inside a nested call to another script is charged to that
+            /// script, so these sum to the frame's Lua cost rather than to a multiple of it.
             ///
             /// Kept because the instruction count above cannot answer "which script made the frame late".
             /// A Lua call into an engine binding is one instruction no matter how long the engine spends
@@ -207,7 +211,7 @@ namespace LuaUtil
             /// Not averaged, unlike the instruction count. The thing being diagnosed is one late frame,
             /// and a thirty-frame average of a 300 ms spike is a 10 ms line item.
             double mFrameTimeMs = 0.0;
-            /// Handler invocations behind mFrameTimeMs, so a slow script can be told from a numerous one.
+            /// Lua calls behind mFrameTimeMs, so a slow script can be told from a merely numerous one.
             unsigned int mFrameCalls = 0;
         };
         void collectStats(std::vector<ScriptStats>& stats) const;
@@ -273,15 +277,11 @@ namespace LuaUtil
         void callEngineHandlers(EngineHandlerList& handlers, const Args&... args)
         {
             ensureLoaded();
+            // Timing lives in LuaUtil::call, not here. Hooking this loop covered engine handlers only,
+            // which turned out to be 0.84 ms of a 490 ms Lua update -- the rest was event handlers and
+            // timer callbacks, and neither passes through here.
             for (Handler& handler : handlers.mList)
             {
-                // Two clock reads per handler call, unconditionally. Measured against what it buys: the
-                // frame loop was blocking for up to 346 ms waiting on this thread with no way to say which
-                // of 206 scripts was responsible. steady_clock::now is a QueryPerformanceCounter read at
-                // roughly 25 ns, so even a few thousand handler calls per frame is well under 0.1 ms --
-                // and the call count is reported alongside the time so that assumption stays checkable
-                // rather than being taken on trust.
-                const auto handlerStart = std::chrono::steady_clock::now();
                 try
                 {
                     LuaUtil::call({ this, handler.mScriptId }, handler.mFn, args...);
@@ -291,11 +291,6 @@ namespace LuaUtil
                     Log(Debug::Error) << mNamePrefix << "[" << scriptPath(handler.mScriptId) << "] " << handlers.mName
                                       << " failed. " << e.what();
                 }
-                // Charged even when the handler threw: the time was spent either way, and a handler that
-                // throws slowly is exactly the kind of thing worth seeing.
-                addFrameTime(handler.mScriptId,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - handlerStart)
-                        .count());
             }
         }
 

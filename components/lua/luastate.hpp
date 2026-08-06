@@ -1,6 +1,7 @@
 #ifndef COMPONENTS_LUA_LUASTATE_H
 #define COMPONENTS_LUA_LUASTATE_H
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <typeinfo>
@@ -185,6 +186,14 @@ namespace LuaUtil
 
         static sol::protected_function_result throwIfError(sol::protected_function_result&&);
 
+        /// Charges \a ms of self time to a script, for the per-frame attribution in ScriptStats.
+        ///
+        /// Out of line because ScriptsContainer is only forward declared here -- scriptscontainer.hpp
+        /// includes this header, so the dependency cannot run the other way. Defined in luastate.cpp,
+        /// which can see the complete type, and reachable from there because ScriptsContainer befriends
+        /// this class.
+        static void chargeFrameTime(const ScriptId& scriptId, double ms);
+
     private:
         template <typename... Args>
         friend sol::protected_function_result call(const sol::protected_function& fn, Args&&... args);
@@ -251,6 +260,17 @@ namespace LuaUtil
         }
     }
 
+    /// Wall time charged to Lua calls nested inside the one currently running, in milliseconds.
+    ///
+    /// Lua calls nest -- a handler can reach another script through an interface -- so timing each call and
+    /// summing would charge a parent for everything its children did. Subtracting this leaves self time,
+    /// which is what names a culprit and what adds up to the total instead of a multiple of it.
+    ///
+    /// A plain scalar saved and restored on the C++ stack by each call, rather than a stack container: it
+    /// costs two doubles per frame of nesting and no allocation. thread_local because Lua runs on the
+    /// worker thread for update() and on the frame thread for synchronizedUpdate().
+    inline thread_local double tlsNestedCallMs = 0.0;
+
     // Lua must be initialized through LuaUtil::LuaState, otherwise this function will segfault.
     template <typename... Args>
     sol::protected_function_result call(ScriptId scriptId, const sol::protected_function& fn, Args&&... args)
@@ -262,6 +282,41 @@ namespace LuaUtil
             luaState->mActiveScriptIdStack.push_back(scriptId);
             luaState->mWatchdogInstructionCounter = 0;
         }
+
+        // Timed here rather than at each call site, because this is the one funnel every script call goes
+        // through: engine handlers, event handlers and timer callbacks all arrive here. Hooking only
+        // callEngineHandlers, as the previous revision did, measured 0.84 ms of a 490 ms Lua update --
+        // the other 489 ms was event handlers and timers, and the report named no script at all.
+        //
+        // Unconditional, not gated on the Lua profiler, so the overrun report works on a default install.
+        // Two clock reads per call against a stall of 145-490 ms; the report prints the call count so the
+        // overhead stays checkable.
+        const double enclosingNested = tlsNestedCallMs;
+        tlsNestedCallMs = 0.0;
+        const auto callStart = std::chrono::steady_clock::now();
+
+        // Charges self time and restores the caller's nesting accumulator. A struct rather than three
+        // copies of the same lines, because there are three exits below and an early return or a rethrow
+        // that skipped it would silently corrupt every enclosing measurement.
+        struct Charge
+        {
+            const ScriptId& mScriptId;
+            const std::chrono::steady_clock::time_point mStart;
+            double mEnclosingNested;
+
+            ~Charge()
+            {
+                const double total
+                    = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mStart)
+                          .count();
+                const double self = total - tlsNestedCallMs;
+                // This call becomes part of its caller's nested time, so the caller can subtract it too.
+                tlsNestedCallMs = mEnclosingNested + total;
+                if (mScriptId.mContainer != nullptr)
+                    LuaState::chargeFrameTime(mScriptId, self > 0.0 ? self : 0.0);
+            }
+        } charge{ scriptId, callStart, enclosingNested };
+
         try
         {
             auto res = LuaState::throwIfError(fn(std::forward<Args>(args)...));
