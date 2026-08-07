@@ -267,22 +267,6 @@ namespace RemixRT
         enum InstanceCategory : unsigned int
         {
             Category_Sky = 1u << 2,
-            /// Offsets an instance off the surface it sits on, so a coincident overlay is not ambiguous.
-            ///
-            /// Needed for per-layer terrain. A terrain layer is the same triangles as the ground beneath it
-            /// at exactly the same depth, which a rasteriser resolves with a depth-equal test and a blend.
-            /// A path tracer has no such test: a blended surface sitting exactly at the opaque hit distance
-            /// is on the boundary of the transparency traversal's range, so whether it contributes at all is
-            /// decided by floating-point luck. The visible result is one layer winning outright across a
-            /// region with a hard edge where the winner changes -- which is what per-layer terrain looked
-            /// like before this, and it is not a blending failure at all.
-            ///
-            /// The runtime's own D3D9 path solves this the same way, through rtx.terrainAsDecals. That
-            /// global switch is unusable here because it can only see the Terrain category and so relabels
-            /// the base layer too, leaving decals stacked on nothing -- see the note in
-            /// rtx_fork_submit.cpp. Setting it per instance avoids that: the host knows which pass is the
-            /// ground and which are overlays.
-            Category_DecalStatic = 1u << 11,
             Category_Particle = 1u << 9,
             Category_Terrain = 1u << 16,
             Category_AnimatedWater = 1u << 17,

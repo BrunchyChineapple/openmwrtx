@@ -1706,18 +1706,11 @@ namespace
                 if (layerMesh == 0)
                     continue;
 
-                // Tagged as a decal, which the base layer is not. See Category_DecalStatic for why: these
-                // are coincident with the ground and a path tracer cannot resolve that without an offset.
-                // Category_Terrain is kept alongside it, because that is what the runtime keys the
-                // vertex-colour coverage modulation off -- dropping it would discard the coverage this
-                // whole path exists to deliver.
-                const unsigned int layerCategories = categories | RemixRT::Runtime::Category_DecalStatic;
-
                 // The base layer's distance, because that is what this is: the same chunk, submitted again
                 // with different coverage. A layer sorting away from its own base layer would let the
                 // budget admit one and reject the other, which is worse than dropping the chunk outright.
                 mScene.drawSubmitted(
-                    layerMesh, baseTransform, layerCategories, true, nullptr, mInstances + 1, distanceSquared);
+                    layerMesh, baseTransform, categories, true, nullptr, mInstances + 1, distanceSquared);
                 ++mInstances;
             }
         }
