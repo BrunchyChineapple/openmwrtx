@@ -68,6 +68,30 @@ namespace
     /// Ceiling on destroyMesh calls in one frame. See evictStaleMeshes for why a ceiling is needed at all.
     constexpr unsigned int kMeshDestroysPerFrame = 64;
 
+    /// Ceiling on createMesh calls in one frame.
+    ///
+    /// The counterpart to the destroy ceiling, and the more important of the two, because creation is the
+    /// expensive direction: each call builds an acceleration structure. meshFor described itself as bounded
+    /// per frame for a long time while nothing actually bounded it, and the cost of that showed up as whole
+    /// frames spent building:
+    ///
+    ///     2147 meshes -> 487 ms      551 -> 111 ms      283 -> 53 ms      126 -> 31 ms
+    ///
+    /// which is a flat 0.2 ms per build and says the traversal's own walk is almost free by comparison --
+    /// culling fifteen thousand drawables costs a few milliseconds, building two thousand meshes costs half
+    /// a second. Bursts like that are geometry coming into view at once, on a cell change or a corner.
+    ///
+    /// 128 is chosen against the measured standing load rather than as a round number. Ordinary play builds
+    /// around 33 a frame, so this never binds while walking about; it binds on the bursts, capping the worst
+    /// frame at roughly 26 ms and draining the remainder over the following frames.
+    ///
+    /// Deferring costs the overflow one frame of freshness: nothing is destroyed, no memo is written, the
+    /// caller simply does not submit that instance, and the next frame retries. New geometry therefore
+    /// appears a frame or two late under load, which is a much better failure than a half-second freeze --
+    /// and better than the failure the old unbounded form risked, where a device that cannot retire the
+    /// builds fails its fence sync and reports a bare device loss with no fault behind it.
+    constexpr unsigned int kMeshBuildsPerFrame = 128;
+
 
     /// Most instances handed over in a single frame.
     ///
@@ -2546,6 +2570,7 @@ namespace MWRender
         // every frame is 500 acceleration structure builds. Those are indistinguishable from the cache
         // size alone, and the difference is the dominant term in the frame.
         mMeshesCreated = 0;
+        mMeshBuildsDeferred = 0;
         mMeshesRetained = 0;
         mPrimitivesSubmitted = 0;
         mInstancesOverBudget = 0;
@@ -2736,7 +2761,8 @@ namespace MWRender
             Log(Debug::Info) << "Remix scene: handed over " << mLastInstanceCount << " instances from "
                              << mMeshes.size() << " cached meshes, " << mMeshesCreated
                              << " BUILT THIS FRAME (" << mMeshesShared
-                             << " geometries shared an existing mesh), " << mLastLightCount << " lights and "
+                             << " geometries shared an existing mesh, " << mMeshBuildsDeferred
+                             << " builds deferred to a later frame), " << mLastLightCount << " lights and "
                              << mTexturesUploaded << " textures (" << mTexturesShared
                              << " uploads avoided, content already present); " << mSkinnedInstances
                              << " instances were skinned, " << mCulled
@@ -4351,6 +4377,20 @@ namespace MWRender
         // content hash moves every frame even though the runtime is being handed everything it needs to
         // skin a static bind pose itself. Submitting the source pose makes the hash stable, the memo hit,
         // and this ceiling unnecessary.
+        // The ceiling the paragraph above describes, which until now was only described.
+        //
+        // Checked here rather than earlier so that everything cheaper than a build still happens: a memo hit
+        // and a shared mesh both return above this point, so a saturated frame still reuses every mesh it
+        // already has and only turns away genuinely new ones. Nothing is written before returning -- no
+        // primitive count, no cache entry, no identity -- so the retry next frame is an ordinary miss.
+        static const unsigned int meshBuildBudget
+            = envUInt("OPENMW_REMIX_MESH_BUILD_BUDGET", kMeshBuildsPerFrame, kMaxInstancesPerFrame);
+        if (meshBuildBudget > 0 && mMeshesCreated >= meshBuildBudget)
+        {
+            ++mMeshBuildsDeferred;
+            return 0;
+        }
+
         ++mMeshesCreated;
         // Recorded so the submission budget can weigh an instance without re-deriving its geometry. Keyed by
         // identity, which is also the handle the runtime returns, so the submit path can look it up.

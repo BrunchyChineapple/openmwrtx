@@ -839,6 +839,14 @@ namespace MWRender
         /// geometry appearing here every frame is a fault.
         unsigned int mMeshesCreated = 0;
 
+        /// Meshes the per-frame build ceiling turned away this frame, per frame.
+        ///
+        /// Reported because a deferral is otherwise invisible: the instance simply is not in the scene for a
+        /// frame, which looks like a culling or content bug rather than a budget doing its job. A number here
+        /// on a cell change is expected; a number here every frame while standing still would mean the
+        /// ceiling sits below the standing load and animation is being throttled by it.
+        unsigned int mMeshBuildsDeferred = 0;
+
         /// Drawables the traversal rejected this frame whose mesh was held resident anyway, per frame.
         ///
         /// The counter that says whether retainGeometry is doing anything: against mCulled it reads as
