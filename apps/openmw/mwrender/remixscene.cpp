@@ -985,6 +985,107 @@ namespace
         return static_cast<unsigned int>(chain.size());
     }
 
+    /// Appends mip levels 1..N to \a out, which must already hold level 0 as tightly packed RGBA8, and
+    /// returns the total level count.
+    ///
+    /// Every texture that is not block-compressed on disk arrived here with one mip level and left with one,
+    /// because the uncompressed path converts level 0 and nothing else. That has two costs, and the second is
+    /// the one that hurt.
+    ///
+    /// The first is ordinary: minification has nothing to fall back on, so those surfaces shimmer at
+    /// distance. The second is that a single-level texture cannot be partially resident, so the runtime's
+    /// texture manager has no way to demote it under pressure -- its only move is to evict the whole thing.
+    /// The same reasoning is already written down for terrain composites a few hundred lines below; it
+    /// applies to every other texture just as much, and those are the majority by count.
+    ///
+    /// It also travels: a capture exports a DDS with exactly the level count the live image has, so a
+    /// one-level upload becomes a one-level DDS, which is what the toolkit complains about and what makes it
+    /// hold every captured texture at full resolution at once.
+    ///
+    /// Unlike compressBc1WithMips this re-encodes nothing -- level 0 is left exactly as it was handed over.
+    /// That is deliberate and load-bearing: level 0's bytes are the texture's public identity, so a tag in
+    /// rtx.conf and a replacement authored against it keep working. Only levels the runtime had no way to
+    /// sample before are added.
+    unsigned int appendRgba8Mips(std::vector<unsigned char>& out, int width, int height, bool colour)
+    {
+        const SrgbTransfer& transfer = srgbTransfer();
+
+        std::size_t sourceOffset = 0;
+        int sourceWidth = width;
+        int sourceHeight = height;
+        unsigned int levels = 1;
+
+        while (sourceWidth > 1 || sourceHeight > 1)
+        {
+            const int levelWidth = std::max(1, sourceWidth / 2);
+            const int levelHeight = std::max(1, sourceHeight / 2);
+            const std::size_t destinationOffset = out.size();
+            out.resize(destinationOffset
+                + static_cast<std::size_t>(levelWidth) * static_cast<std::size_t>(levelHeight) * 4);
+
+            // Taken after the resize, because that is what invalidates them.
+            const unsigned char* const source = out.data() + sourceOffset;
+            unsigned char* const destination = out.data() + destinationOffset;
+
+            for (int y = 0; y < levelHeight; ++y)
+            {
+                // An odd extent repeats its surviving row or column rather than dropping it.
+                const int top = std::min(y * 2, sourceHeight - 1);
+                const int bottom = std::min(y * 2 + 1, sourceHeight - 1);
+                for (int x = 0; x < levelWidth; ++x)
+                {
+                    const int left = std::min(x * 2, sourceWidth - 1);
+                    const int right = std::min(x * 2 + 1, sourceWidth - 1);
+                    const unsigned char* const corner[4] = {
+                        source + (static_cast<std::size_t>(top) * sourceWidth + left) * 4,
+                        source + (static_cast<std::size_t>(top) * sourceWidth + right) * 4,
+                        source + (static_cast<std::size_t>(bottom) * sourceWidth + left) * 4,
+                        source + (static_cast<std::size_t>(bottom) * sourceWidth + right) * 4,
+                    };
+                    unsigned char* const pixel
+                        = destination + (static_cast<std::size_t>(y) * levelWidth + x) * 4;
+
+                    for (int channel = 0; channel < 3; ++channel)
+                    {
+                        if (colour)
+                        {
+                            // Averaged in linear light. Averaging sRGB values directly darkens every mip,
+                            // which reads as distant surfaces getting muddier the further away they are --
+                            // the same correction compressBc1WithMips makes for composites.
+                            const unsigned int sum = transfer.mToLinear[corner[0][channel]]
+                                + transfer.mToLinear[corner[1][channel]]
+                                + transfer.mToLinear[corner[2][channel]]
+                                + transfer.mToLinear[corner[3][channel]];
+                            pixel[channel] = transfer.mToSrgb[(sum / 4u) >> 4];
+                        }
+                        else
+                        {
+                            // Linear data -- normal maps, masks -- carries no transfer function, so it
+                            // averages directly. Normals are not renormalised: a box-filtered normal map is
+                            // the conventional result and the shader normalises what it samples anyway.
+                            pixel[channel] = static_cast<unsigned char>((corner[0][channel]
+                                                                            + corner[1][channel]
+                                                                            + corner[2][channel]
+                                                                            + corner[3][channel] + 2)
+                                / 4);
+                        }
+                    }
+
+                    // Alpha has no transfer function either way.
+                    pixel[3] = static_cast<unsigned char>(
+                        (corner[0][3] + corner[1][3] + corner[2][3] + corner[3][3] + 2) / 4);
+                }
+            }
+
+            sourceOffset = destinationOffset;
+            sourceWidth = levelWidth;
+            sourceHeight = levelHeight;
+            ++levels;
+        }
+
+        return levels;
+    }
+
     /// Alpha threshold used when OpenMW asks for a cutout but its own reference value is unusable.
     ///
     /// OpenMW expresses alpha testing through osg::AlphaFunc with a float reference; a NIF that enables
@@ -2928,6 +3029,14 @@ namespace MWRender
         // reproduced here: that hash is XXH3 over the staging buffer of subresource 0, which is mip 0 and
         // nothing else -- no dimensions, no format, no mip chain. Zero when the branch taken cannot say.
         unsigned long long mip0Size = 0;
+        // Bytes the texture's identity is hashed over, which is not necessarily everything uploaded.
+        //
+        // Kept separate from uploadSize so that appending a mip chain cannot move an identity. The fallback
+        // hash below used to read uploadSize directly, which was the same number until mips were generated
+        // for the uncompressed path -- at which point every tag in rtx.conf and every replacement authored
+        // against one of those textures would have gone dead, silently, for a change that adds nothing to
+        // level 0. Each branch sets this to exactly the span it hashed before.
+        unsigned long long identityBytes = 0;
         unsigned int mipLevels = 1;
         RemixRT::Runtime::TextureFormat format = RemixRT::Runtime::Format_RGBA8;
 
@@ -3001,6 +3110,8 @@ namespace MWRender
             uploadData = data;
             // Largest-first and contiguous, verified just above, so mip 0 is the leading levelBytes(0).
             mip0Size = levelBytes(0);
+            // Whole chain, which is what this path has always hashed.
+            identityBytes = chainBytes;
         }
         else if (dataType == kGlUnsignedByte)
         {
@@ -3076,6 +3187,9 @@ namespace MWRender
             // Distinguished in the log, because a source with no alpha channel gets 255 written into it
             // and any cutout against the result is a no-op.
             cached.mFormat = alpha >= 0 ? "RGBA8" : "RGBA8(opaque)";
+            // Level 0 alone, taken before anything is appended to it. This is the span this path has always
+            // hashed, so recording it here is what keeps the identity fixed across the mip generation below.
+            identityBytes = converted.size();
 
             // Terrain composites, and only terrain composites, are block-compressed and given a mip chain.
             //
@@ -3159,6 +3273,25 @@ namespace MWRender
                 mCompositeEncodeMs += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - encodeStart)
                                           .count();
+                // Whole BC1 chain, which is what a composite has always hashed. A composite has no file
+                // behind it and cannot be tagged or replaced, so its identity is free to be whatever is
+                // convenient -- but changing it for no reason would still churn the upload cache.
+                identityBytes = converted.size();
+            }
+            else
+            {
+                // A mip chain for everything else that arrived uncompressed.
+                //
+                // Left until here so it sees the RGBA8 result rather than the source layout, and so the
+                // composite path above -- which builds its own chain while block-compressing -- is not made
+                // to do the work twice.
+                //
+                // The chain costs a third more memory than level 0 and is built with a box filter, which is
+                // cheap next to what it buys: minification has something to sample, and the runtime can
+                // demote these under pressure instead of evicting them outright.
+                mipLevels = appendRgba8Mips(converted, width, height, colour);
+                uploadData = converted.data();
+                uploadSize = converted.size();
             }
         }
         else
@@ -3216,7 +3349,7 @@ namespace MWRender
             // flag is folded in deliberately: without it the same file uploaded as both sRGB albedo and a
             // linear normal map would collapse onto one texture, and whichever arrived second would win.
             // Nothing in Morrowind's art does that today, but the guarantee is cheap.
-            hash = RemixRT::AssetHash::bytes(uploadData, uploadSize);
+            hash = RemixRT::AssetHash::bytes(uploadData, identityBytes);
             hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(width), hash);
             hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(height), hash);
             hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(format), hash);
