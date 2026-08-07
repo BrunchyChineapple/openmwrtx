@@ -969,8 +969,27 @@ namespace RemixRT
             surface.skinning_value.blendIndices_count = static_cast<unsigned int>(expected);
         }
 
+        // OpenMW's geometry is counter-clockwise, and the runtime has to be told so.
+        //
+        // OSG follows OpenGL's convention, where a triangle faces the viewer when its vertices wind
+        // counter-clockwise, and nothing in the submission path reverses that: writeTransform only
+        // transposes into the row-major 3x4 the API wants, so the winding reaching Remix is the winding
+        // OSG built. The API assumes clockwise when no winding is declared, which is Direct3D's
+        // convention and the one its original hosts were written against.
+        //
+        // Leaving it undeclared does not look like a facing bug, which is what made this expensive to
+        // find. Ray tracing takes a triangle's facing from its winding while shading takes its normal
+        // from the normal buffer, so every surface stayed lit correctly and only the features gated on a
+        // front hit went missing. Terrain was the visible casualty: layer coverage is composited through
+        // the decal path, decals are only recorded on a front hit, so the ground kept its base layer and
+        // silently dropped every layer above it.
+        remixapi_MeshInfoWindingEXT winding = {};
+        winding.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO_WINDING_EXT;
+        winding.counterClockwise = 1;
+
         remixapi_MeshInfo mesh = {};
         mesh.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+        mesh.pNext = &winding;
         mesh.hash = hash;
         mesh.surfaces_values = &surface;
         mesh.surfaces_count = 1;
@@ -1083,7 +1102,7 @@ namespace RemixRT
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
         unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
-        int blendType, unsigned long long maskTextureHash)
+        int blendType, unsigned long long maskTextureHash, const float* maskTransform)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -1135,11 +1154,29 @@ namespace RemixRT
         // which neither this function nor anything downstream sets. The terrain baker picks it up from
         // there and composites the layer; every other consumer ignores it.
         //
-        // Deliberately not smuggled through a scalar such as anisotropy, which is read elsewhere. If this
-        // ever needs to carry more than one texture it should become a proper terrain-layer extension
-        // struct rather than claiming a second slot.
+        // Deliberately not smuggled through a scalar such as anisotropy, which is read elsewhere. The
+        // mask's *UV mapping* does not fit anywhere honest, so it travels in a real extension struct
+        // below rather than claiming a third slot.
         if (maskTextureHash != 0)
             opaque.heightTexture = maskPath;
+
+        // The mask's own UV mapping, which the height slot cannot carry and the runtime must not guess.
+        //
+        // Chained only when there is a mask to map. An older runtime that does not know this struct type
+        // walks past it, which degrades to sampling the mask in the submitted texcoord's space rather
+        // than failing -- so a version mismatch shifts the blend instead of dropping the terrain.
+        remixapi_MaterialInfoOpaqueTerrainEXT terrain = {};
+        if (maskTextureHash != 0 && maskTransform != nullptr)
+        {
+            terrain.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_TERRAIN_EXT;
+            terrain.maskTransformU[0] = maskTransform[0];
+            terrain.maskTransformU[1] = maskTransform[1];
+            terrain.maskTransformU[2] = maskTransform[2];
+            terrain.maskTransformV[0] = maskTransform[3];
+            terrain.maskTransformV[1] = maskTransform[4];
+            terrain.maskTransformV[2] = maskTransform[5];
+            opaque.pNext = &terrain;
+        }
 
         remixapi_MaterialInfo material = {};
         material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;

@@ -467,10 +467,17 @@ namespace RemixRT
         ///        Only the terrain baker consumes it. It exists because a terrain layer needs its diffuse
         ///        tiled many times across the chunk and its coverage stretched once over it, and a single
         ///        albedo slot cannot express both frequencies.
+        /// @param maskTransform six floats -- two rows of { a, b, c } applied to (u, v, 1) -- mapping the
+        ///        texcoord submitted with the mesh to the UV at which \a maskTextureHash carries this
+        ///        layer's coverage. Null for identity. Required whenever the mask is set and the two UV
+        ///        spaces differ, which for OpenMW they always do: the submitted texcoord is the chunk UV
+        ///        scaled up to tile the diffuse, while the blend map is sampled through an inset of its
+        ///        own. Sent rather than left for the runtime to work out, because the inset is this
+        ///        engine's convention and nothing in the geometry reveals it.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
             unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1,
-            unsigned long long maskTextureHash = 0);
+            unsigned long long maskTextureHash = 0, const float* maskTransform = nullptr);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

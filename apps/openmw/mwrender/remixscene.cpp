@@ -1,6 +1,7 @@
 #include "remixscene.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -251,6 +252,58 @@ namespace
 
     /// Sentinel for createTexturedMaterial's blend type meaning "do not blend at all".
     constexpr int kBlendTypeNone = -1;
+
+    /// A 2D affine as { m00, m01, m10, m11, m30, m31 }, applied to a texcoord as a row vector -- the same
+    /// six-float layout SurfaceState uses for mTexMat and mCoverageTexMat, and the same convention osg's
+    /// TexMat uses, so a matrix read out of a state set drops straight in.
+    using TexAffine = std::array<float, 6>;
+
+    constexpr TexAffine kIdentityAffine = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+
+    /// Solves for the affine taking \a from's output space to \a to's, i.e. inverse(from) composed with
+    /// \a to, and writes it as two rows of { a, b, c } evaluated as a*u + b*v + c.
+    ///
+    /// This is what lets the coverage mask be sampled correctly from a mesh that carries only one texcoord
+    /// set. OpenMW draws a terrain layer with the diffuse tiled many times across the chunk and the blend
+    /// map stretched once through an inset of its own, and the texcoords submitted to Remix have the
+    /// *diffuse* matrix already baked in, because a Remix vertex has nowhere else to put it. Going from
+    /// those texcoords back to blend map UVs therefore means undoing one matrix and applying the other.
+    ///
+    /// @return false if \a from is singular, in which case there is no such map and the caller has no
+    ///         business claiming one.
+    bool solveTexAffineBetween(const TexAffine& from, const TexAffine& to, float (&outU)[3], float (&outV)[3])
+    {
+        const float det = from[0] * from[3] - from[1] * from[2];
+        // Relative to the coefficients themselves: a terrain tiling factor is in the tens, so this is only
+        // ever true for a genuinely degenerate matrix rather than for a small one.
+        const float magnitude = std::max(
+            { std::abs(from[0]), std::abs(from[1]), std::abs(from[2]), std::abs(from[3]), 1.0f });
+        if (std::abs(det) < 1e-9f * magnitude * magnitude)
+            return false;
+
+        const float invDet = 1.0f / det;
+
+        // Linear part of inverse(from), row-vector convention.
+        const float i00 = from[3] * invDet;
+        const float i01 = -from[1] * invDet;
+        const float i10 = -from[2] * invDet;
+        const float i11 = from[0] * invDet;
+
+        // ...and its translation, which is the original translation carried through the inverted linear
+        // part and negated. Dropping this term is a silent half-texel shift, so it is spelled out.
+        const float it0 = -(from[4] * i00 + from[5] * i10);
+        const float it1 = -(from[4] * i01 + from[5] * i11);
+
+        // Compose with `to`.
+        outU[0] = i00 * to[0] + i01 * to[2];
+        outU[1] = i10 * to[0] + i11 * to[2];
+        outU[2] = it0 * to[0] + it1 * to[2] + to[4];
+
+        outV[0] = i00 * to[1] + i01 * to[3];
+        outV[1] = i10 * to[1] + i11 * to[3];
+        outV[2] = it0 * to[1] + it1 * to[3] + to[5];
+        return true;
+    }
 
     /// Distance at which \a light has faded to imperceptibility, by the runtime's own derivation.
     ///
@@ -1701,6 +1754,23 @@ namespace
                 layer.mAlphaBlend = true;
                 layer.mPreferBlend = true;
                 layer.mAlphaTestReference = 0;
+
+                // Not additive, whatever the blend function says. This is the line that made terrain refuse
+                // to blend at all.
+                //
+                // mergeState sets mAdditive from `destination == GL_ONE`, and a terrain overlay pass really
+                // does use SRC_ALPHA/ONE (Terrain::BlendFunc in components/terrain/material.cpp). But it
+                // uses it to accumulate, not to glow: getBlendmaps gives the base layer whatever coverage
+                // the overlays do not claim, so the weights sum to one across a chunk. The first pass writes
+                // base * alpha with destination ZERO and each overlay adds layer * alpha, which is a
+                // weighted average spelled as a sum.
+                //
+                // mAdditive exists to recognise flames and glows, and materialFor turns it into
+                // kBlendTypeAlphaEmissive -- a surface that emits light rather than contributing albedo.
+                // Terrain tripped that test for an unrelated reason and every overlay was handed to the
+                // runtime as an emissive blend, which adds its colour on top of the ground instead of
+                // mixing with it. No amount of correct coverage can look blended through that.
+                layer.mAdditive = false;
 
                 const unsigned long long layerMesh = mScene.submitGeometry(geometry, layer, nullptr);
                 if (layerMesh == 0)
@@ -3296,6 +3366,49 @@ namespace MWRender
         if (surface.mNormalMap != nullptr && surface.mNormalMap->getImage() != nullptr)
             normalHash = textureFor(*surface.mNormalMap->getImage(), false);
 
+        // Terrain layer coverage, uploaded as a linear mask for the runtime's terrain baker to composite.
+        //
+        // Linear, not colour: this is data, and an sRGB decode applied to a coverage ramp would bend it.
+        // The blend map is GL_ALPHA, which textureFor widens to RGBA8 with the source in the alpha channel
+        // and white elsewhere, which is exactly where the bake shader reads it from.
+        //
+        // The mask is only half of what the baker needs. The other half is the map from the texcoords
+        // submitted with this mesh to the mask's own UV space, which differ by the diffuse tiling and by
+        // OpenMW's blend map inset -- see solveTexAffineBetween. A mask with no usable map is not sent at
+        // all: sampling coverage through the wrong UVs would misplace every layer, where sending nothing
+        // falls back to the vertex-alpha path that was already there.
+        unsigned long long maskHash = 0;
+        float maskTransform[6] = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+        if (surface.mCoverageImage != nullptr)
+        {
+            const TexAffine diffuseAffine = surface.mHasTexMat
+                ? TexAffine{ surface.mTexMat[0], surface.mTexMat[1], surface.mTexMat[2], surface.mTexMat[3],
+                      surface.mTexMat[4], surface.mTexMat[5] }
+                : kIdentityAffine;
+            const TexAffine coverageAffine = surface.mHasCoverageTexMat
+                ? TexAffine{ surface.mCoverageTexMat[0], surface.mCoverageTexMat[1],
+                      surface.mCoverageTexMat[2], surface.mCoverageTexMat[3], surface.mCoverageTexMat[4],
+                      surface.mCoverageTexMat[5] }
+                : kIdentityAffine;
+
+            float rowU[3];
+            float rowV[3];
+            if (solveTexAffineBetween(diffuseAffine, coverageAffine, rowU, rowV))
+            {
+                const unsigned long long uploaded = textureFor(*surface.mCoverageImage, false);
+                if (uploaded != 0)
+                {
+                    maskHash = uploaded;
+                    maskTransform[0] = rowU[0];
+                    maskTransform[1] = rowU[1];
+                    maskTransform[2] = rowU[2];
+                    maskTransform[3] = rowV[0];
+                    maskTransform[4] = rowV[1];
+                    maskTransform[5] = rowV[2];
+                }
+            }
+        }
+
         // Everything baked into the material is part of its identity. The same texture can be a cutout on
         // one mesh and opaque on another, and can be paired with a normal map on one and not the other, so
         // any of these differing means a different material rather than a reused one.
@@ -3312,6 +3425,22 @@ namespace MWRender
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(emissive * 16.0f + 0.5f));
+        // The coverage mask and its map are part of the material's identity too, and this one is not
+        // optional the way the others arguably are: a blend map belongs to a single chunk, so two chunks
+        // sharing a land texture need two materials or the second would be drawn with the first's
+        // coverage. This is what makes terrain materials per chunk per layer, which is why releasing them
+        // with their chunk matters -- see MaterialTextures::mMask.
+        mix(maskHash);
+        if (maskHash != 0)
+        {
+            for (const float component : maskTransform)
+            {
+                unsigned int bits = 0;
+                static_assert(sizeof(bits) == sizeof(component));
+                std::memcpy(&bits, &component, sizeof(bits));
+                mix(bits);
+            }
+        }
 
         if (auto found = mMaterials.find(key); found != mMaterials.end())
             return found->second;
@@ -3369,7 +3498,8 @@ namespace MWRender
         // specific threshold in another -- and keying on the texture alone collapses each pair onto whichever
         // was created first.
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
-            metallic, alphaTestReference, normalHash, emissive, blendType);
+            metallic, alphaTestReference, normalHash, emissive, blendType, maskHash,
+            maskHash != 0 ? maskTransform : nullptr);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
@@ -3382,7 +3512,7 @@ namespace MWRender
         // The normal hash is recorded alongside purely so a release can find this material from either
         // texture. An albedo-only index cannot enumerate the materials that name a normal map, so releasing
         // one would leave a live material pointing at a destroyed texture with nothing to detect it.
-        mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash };
+        mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash, maskHash };
         return handle;
     }
 
@@ -3767,14 +3897,15 @@ namespace MWRender
 
             const unsigned long long hash = it->first;
 
-            // Materials naming this texture go first, through either slot, or they would be left pointing at
-            // a texture that no longer exists. mMaterials is keyed by surface state rather than by handle, so
+            // Materials naming this texture go first, through any of its slots, or they would be left
+            // pointing at a texture that no longer exists. mMaterials is keyed by surface state rather than by handle, so
             // it has to be searched by value; mDefaultMaterial is deliberately never matched here because it
             // is stored as the value for every material the runtime refused, and destroying it mid-session
             // would take every one of those surfaces with it.
             for (auto mat = mMaterialAlbedoHashes.begin(); mat != mMaterialAlbedoHashes.end();)
             {
-                if (mat->second.mAlbedo != hash && mat->second.mNormal != hash)
+                if (mat->second.mAlbedo != hash && mat->second.mNormal != hash
+                    && mat->second.mMask != hash)
                 {
                     ++mat;
                     continue;

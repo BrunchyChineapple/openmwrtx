@@ -559,6 +559,11 @@ namespace MWRender
             /// an albedo-only index cannot enumerate, so releasing one would strand a material on a
             /// destroyed texture with no way to notice.
             unsigned long long mNormal = 0;
+            /// The terrain layer coverage mask, recorded for the same reason as mNormal and with more at
+            /// stake. A blend map belongs to one chunk, so these come and go with the terrain rather than
+            /// living as long as the session, and every one of them is named by a live material. Leaving
+            /// the release scan unable to see them would strand a material per chunk per layer.
+            unsigned long long mMask = 0;
         };
         /// Material handle to the textures it references.
         std::unordered_map<unsigned long long, MaterialTextures> mMaterialAlbedoHashes;
