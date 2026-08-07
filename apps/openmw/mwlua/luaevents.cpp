@@ -1,5 +1,7 @@
 #include "luaevents.hpp"
 
+#include <chrono>
+
 #include <components/debug/debuglog.hpp>
 
 #include <components/esm/luascripts.hpp>
@@ -37,15 +39,33 @@ namespace MWLua
 
     void LuaEvents::callEventHandlers()
     {
+        // Two clock reads per event, against a phase that has been measured at 340 ms. Unconditional for
+        // the same reason the per-script timing is: the report it feeds has to work on a default install,
+        // not only when someone has already turned a profiler on.
+        mFrameEventCosts.clear();
+        const auto charge = [this](const std::string& name, const std::chrono::steady_clock::time_point& started) {
+            EventCost& cost = mFrameEventCosts[name];
+            cost.mMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            cost.mCalls += 1;
+        };
+
         for (const Global& e : mGlobalEventBatch)
+        {
+            const auto started = std::chrono::steady_clock::now();
             mGlobalScripts.receiveEvent(e.mEventName, e.mEventData);
+            charge(e.mEventName, started);
+        }
         mGlobalEventBatch.clear();
         for (const Local& e : mLocalEventBatch)
         {
             MWWorld::Ptr ptr = MWBase::Environment::get().getWorldModel()->getPtr(e.mDest);
             LocalScripts* scripts = ptr.isEmpty() ? nullptr : ptr.getRefData().getLuaScripts();
             if (scripts)
+            {
+                const auto started = std::chrono::steady_clock::now();
                 scripts->receiveEvent(e.mEventName, e.mEventData);
+                charge(e.mEventName, started);
+            }
             else
                 Log(Debug::Debug) << "Ignored event " << e.mEventName << " to L" << e.mDest.toString()
                                   << ". Object not found or has no attached scripts";

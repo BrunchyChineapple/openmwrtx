@@ -440,6 +440,36 @@ namespace MWLua
                             << breakdown.mGlobalScriptUpdates << " | script unloading "
                             << breakdown.mScriptUnloading;
 
+        // Which events made up the event-handler phase, worst first.
+        //
+        // The phase line above and the per-script list below leave one question open between them: a script
+        // with thirty handlers is named, but not the handler. That gap cost several runs of guessing at a
+        // 300 ms phase, so the answer is measured rather than inferred. An event sent to four hundred actors
+        // arrives here as one name with four hundred calls, which is the shape that matters -- a handler
+        // costing five milliseconds is unremarkable until something addresses every actor at once with it.
+        {
+            const auto& costs = mLuaEvents.lastFrameEventCosts();
+            std::vector<const std::pair<const std::string, LuaEvents::EventCost>*> worst;
+            worst.reserve(costs.size());
+            for (const auto& entry : costs)
+                worst.push_back(&entry);
+            std::sort(worst.begin(), worst.end(), [](const auto* a, const auto* b) {
+                return a->second.mMs > b->second.mMs;
+            });
+
+            // Enough to show a culprit and whatever is next behind it, without turning one late frame into
+            // a page of log.
+            constexpr std::size_t kReportedEvents = 5;
+            for (std::size_t i = 0; i < worst.size() && i < kReportedEvents; ++i)
+            {
+                // Sub-millisecond events are noise here; the phase is only reported at all above 100 ms.
+                if (worst[i]->second.mMs < 1.0)
+                    break;
+                Log(Debug::Warning) << "  event " << worst[i]->first << ": " << worst[i]->second.mMs
+                                    << " ms across " << worst[i]->second.mCalls << " handler call(s)";
+            }
+        }
+
         // Per-script attribution for the same frame, covering every way Lua gets called. Sums every
         // container so a script running on four hundred actors is reported once with its total, which is
         // the number that matters here -- a cheap handler multiplied by the active actor count is a

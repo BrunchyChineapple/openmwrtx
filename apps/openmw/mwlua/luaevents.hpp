@@ -55,6 +55,24 @@ namespace MWLua
         void callEventHandlers();
         void callMenuEventHandlers();
 
+        /// What one event name cost during the last callEventHandlers.
+        struct EventCost
+        {
+            double mMs = 0.0;
+            unsigned int mCalls = 0;
+        };
+
+        /// Per-event-name cost of the last callEventHandlers, for the overrun report.
+        ///
+        /// The phase breakdown says "event handlers" and the per-script attribution says which script, but
+        /// between them they still do not say which event -- and a script with thirty handlers is not a
+        /// lead. This is the one place where the name and the call are both in hand, so it is measured here
+        /// rather than reconstructed later.
+        ///
+        /// Summing is safe: an event sent from inside a handler lands in the next batch rather than nesting
+        /// inside this one, so no cost is counted twice.
+        const std::map<std::string, EventCost>& lastFrameEventCosts() const { return mFrameEventCosts; }
+
         void load(lua_State* lua, ESM::ESMReader& esm, const std::map<int, int>& contentFileMapping,
             const LuaUtil::UserdataSerializer* serializer);
         void save(ESM::ESMWriter& esm) const;
@@ -67,6 +85,7 @@ namespace MWLua
         std::vector<Global> mGlobalEventBatch;
         std::vector<Local> mLocalEventBatch;
         std::vector<Global> mMenuEvents;
+        std::map<std::string, EventCost> mFrameEventCosts;
     };
 
 }
