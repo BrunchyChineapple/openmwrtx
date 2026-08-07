@@ -170,7 +170,28 @@ namespace MWRender
         if (sky.mHaveSunDirection)
         {
             const osg::Vec3f& dir = sky.mSunDirection;
-            float elevation = std::asin(std::clamp(dir.z(), -1.0f, 1.0f)) * kRadToDeg;
+
+            // Normalised before asin, which the vector handed over is not.
+            //
+            // WeatherManager builds the orbit in Morrowind's own units and RenderingManager rewrites the
+            // height to 400 - |x| (renderingmanager.cpp, setSunDirection), so this arrives with components
+            // in the hundreds. Passing that to asin meant the clamp did all the work: z stays above 1 for
+            // every part of the orbit except the last quarter of a percent at each end, so the elevation
+            // pushed to the atmosphere was pinned at exactly 90 degrees -- the sun directly overhead -- for
+            // the whole day and, mirrored, the whole night. It then slewed through the entire real range
+            // inside the thin window where z finally drops below 1.
+            //
+            // On screen that is a sun which holds still all day and then lurches through sunrise and
+            // sunset, appearing to rise a second time as the mirror below takes effect. Normalising restores
+            // the curve the geometry already describes: zero at both horizons, near-overhead at midday, and
+            // smooth between.
+            //
+            // Only the elevation was wrong. The rotation below is an azimuth in the horizontal plane, where
+            // atan2 needs no normalisation and the constant -75 simply offsets the arc.
+            const float length = dir.length();
+            float elevation = length > 0.0f
+                ? std::asin(std::clamp(dir.z() / length, -1.0f, 1.0f)) * kRadToDeg
+                : 0.0f;
             const float rotation = std::atan2(dir.x(), dir.y()) * kRadToDeg;
 
             // OpenMW's sun never descends. WeatherManager builds the orbit as (-400*orbit, 75, -100) and
