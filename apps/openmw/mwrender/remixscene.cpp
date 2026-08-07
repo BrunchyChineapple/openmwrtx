@@ -370,12 +370,29 @@ namespace
         return static_cast<unsigned char>(std::clamp<long>(parsed, 0, 255));
     }
 
-    /// Samples an image's alpha at \a s, \a t and returns it as 0..255.
+    /// Samples an image's alpha at \a s, \a t with bilinear filtering and returns it as 0..255.
     ///
     /// Goes through osg::Image::getColor rather than indexing the data directly, because OpenMW's blend
     /// maps are not one format: they arrive as GL_ALPHA, GL_LUMINANCE_ALPHA or GL_RGBA depending on how the
     /// chunk was built, and getColor already knows how to read each. This runs once per vertex when a
-    /// terrain layer's mesh is built, not per frame, so the indirection is not on a hot path.
+    /// terrain layer's mesh is built, not per frame, so four reads instead of one is not on a hot path.
+    ///
+    /// Filtered by hand because OSG has no filtered accessor. osg::Image::getColor(Vec2) scales the
+    /// texcoord by the dimension and truncates, so it returns the nearest texel and nothing else -- the only
+    /// underlying reader is getColor(unsigned, unsigned, unsigned), which takes integer texel coordinates.
+    ///
+    /// That mattered, and it is the whole reason terrain layers looked unblended. A cell's blend map is 17
+    /// texels across against the terrain's 65 vertices, so the blend map is four times coarser than the grid
+    /// sampling it: with nearest sampling every four-by-four block of vertices read one identical coverage
+    /// value, and the ground came out as flat blocks with hard creases along the triangle edges between
+    /// them. It reads exactly like coverage that was never applied, which is what it was mistaken for --
+    /// twice, and the second time a whole GPU-readback compositor was built to work around it.
+    ///
+    /// The engine's own renderer never had this problem because it samples the blend map on the GPU with
+    /// GL_LINEAR. This is that filter, done where the coverage is baked into vertex alpha instead.
+    ///
+    /// Uses OSG's own texel-centre convention -- a texcoord of 0 and 1 land on texel 0 and n-1 -- so the
+    /// endpoints stay where getColor put them and this only adds interpolation between them.
     ///
     /// Clamped rather than wrapped: a blend map covers its chunk exactly once, so a texcoord landing
     /// outside it means the vertex is on the chunk's own edge, and wrapping there would fetch coverage from
@@ -385,10 +402,27 @@ namespace
         if (image.data() == nullptr || image.s() <= 0 || image.t() <= 0)
             return 0xFFu;
 
-        const float cs = std::clamp(s, 0.0f, 1.0f);
-        const float ct = std::clamp(t, 0.0f, 1.0f);
-        const osg::Vec4 colour = image.getColor(osg::Vec2(cs, ct));
-        return static_cast<unsigned int>(std::clamp(colour.a(), 0.0f, 1.0f) * 255.0f + 0.5f);
+        const int width = image.s();
+        const int height = image.t();
+        const float cs = std::clamp(s, 0.0f, 1.0f) * static_cast<float>(std::max(width - 1, 0));
+        const float ct = std::clamp(t, 0.0f, 1.0f) * static_cast<float>(std::max(height - 1, 0));
+
+        const int x0 = std::clamp(static_cast<int>(std::floor(cs)), 0, width - 1);
+        const int y0 = std::clamp(static_cast<int>(std::floor(ct)), 0, height - 1);
+        const int x1 = std::min(x0 + 1, width - 1);
+        const int y1 = std::min(y0 + 1, height - 1);
+        const float fx = cs - static_cast<float>(x0);
+        const float fy = ct - static_cast<float>(y0);
+
+        const auto alphaAt = [&image](int x, int y) {
+            return image.getColor(static_cast<unsigned int>(x), static_cast<unsigned int>(y)).a();
+        };
+
+        const float top = alphaAt(x0, y0) + (alphaAt(x1, y0) - alphaAt(x0, y0)) * fx;
+        const float bottom = alphaAt(x0, y1) + (alphaAt(x1, y1) - alphaAt(x0, y1)) * fx;
+        const float filtered = top + (bottom - top) * fy;
+
+        return static_cast<unsigned int>(std::clamp(filtered, 0.0f, 1.0f) * 255.0f + 0.5f);
     }
 
     /// Whether an image carries any non-zero alpha at all.
