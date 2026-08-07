@@ -13,6 +13,7 @@
 #include <components/vfs/pathutil.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 namespace MWSound
@@ -83,20 +84,72 @@ namespace MWSound
         if (sfx->getHandle() != nullptr)
             return sfx;
 
+        // Timed, and named when it overruns.
+        //
+        // This decodes the whole file to PCM on the frame thread, so the cost scales with the duration of
+        // the sound rather than with anything the player can see. That is fine for the sound effects this
+        // pool is meant to hold, and much less fine when a mod plays a long music track through
+        // playSoundFile3d: thirteen minutes of 48 kHz stereo is 144 MB of PCM and seconds of decoding, and
+        // nothing downstream would attribute the resulting hitch to a sound. Naming the file and its
+        // decoded size is enough for whoever hits it to see what they asked for.
+        constexpr double overrunMs = 20.0;
+        const auto started = std::chrono::steady_clock::now();
+
         auto [handle, size] = mOutput->loadSound(sfx->getResourceName());
         if (handle == nullptr)
             return {};
 
+        const double elapsedMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        if (elapsedMs >= overrunMs)
+            Log(Debug::Warning) << "Decoding " << sfx->getResourceName() << " held the frame thread for "
+                                << elapsedMs << " ms and produced " << (size / (1024 * 1024)) << " MB of audio";
+
         sfx->mHandle = handle;
+        sfx->mSize = size;
 
         mBufferCacheSize += size;
-        if (mBufferCacheSize > mBufferCacheMax)
+
+        // Budget the buffers that can actually be freed, rather than every loaded byte.
+        //
+        // Buffers still in use cannot be evicted, so counting them towards the ceiling made the eviction
+        // target unreachable whenever they exceeded 'buffer cache min' on their own: unloadUnused would run
+        // to exhaustion, empty the reclaimable pool, and still be over budget. Every later load then found
+        // an empty pool, freed whatever little had accumulated since, and left the next play of each of
+        // those sounds to decode from scratch -- so one large sound that keeps playing disabled caching for
+        // every other sound in the game, for as long as it played. A thirteen-minute music track played
+        // through playSoundFile3d decodes to 144 MB against a 64 MB ceiling, which is all it takes.
+        //
+        // Budgeting the reclaimable pool keeps the setting's meaning for ordinary content, where sounds are
+        // idle most of the time and nearly all of the cache is reclaimable. What changes is that memory held
+        // by sounds that are currently playing is now treated as the cost of playing them, which it is,
+        // instead of as a reason to throw away unrelated cached sounds to no benefit.
+        if (mUnusedSize + size > mBufferCacheMax)
+            unloadUnused(size);
+
+        // Report a working set larger than the cache.
+        //
+        // This is no longer harmful -- it does not purge anything now -- but it does mean the cache cannot
+        // hold what is being played, so it is worth saying once. It is also the only place a caller learns
+        // that a single sound is disproportionately large.
+        //
+        // The previous form of this test also required the unused pool to be non-empty while over the
+        // ceiling, which unloadUnused's two exit conditions make impossible, so it never fired.
+        const std::size_t inUse = mBufferCacheSize - mUnusedSize;
+        if (inUse > mBufferCacheMax)
         {
-            unloadUnused();
-            if (!mUnusedBuffers.empty() && mBufferCacheSize > mBufferCacheMax)
-                Log(Debug::Warning) << "No unused sound buffers to free, using " << mBufferCacheSize << " bytes!";
+            if (!mReportedOverBudget)
+            {
+                Log(Debug::Warning) << "Sound buffers in use total " << (inUse / (1024 * 1024)) << " MB, over the "
+                                    << (mBufferCacheMax / (1024 * 1024)) << " MB 'buffer cache max'";
+                mReportedOverBudget = true;
+            }
         }
+        else
+            mReportedOverBudget = false;
+
         mUnusedBuffers.push_front(sfx);
+        mUnusedSize += size;
 
         return sfx;
     }
@@ -148,11 +201,14 @@ namespace MWSound
             if (sfx.mHandle)
                 mOutput->unloadSound(sfx.mHandle);
             sfx.mHandle = nullptr;
+            sfx.mSize = 0;
         }
 
         mBufferFileNameMap.clear();
         mBufferNameMap.clear();
         mUnusedBuffers.clear();
+        mBufferCacheSize = 0;
+        mUnusedSize = 0;
     }
 
     SoundBuffer* SoundBufferPool::insertSound(VFS::Path::NormalizedView fileName)
@@ -221,14 +277,16 @@ namespace MWSound
         return &sfx;
     }
 
-    void SoundBufferPool::unloadUnused()
+    void SoundBufferPool::unloadUnused(std::size_t reserve)
     {
-        while (!mUnusedBuffers.empty() && mBufferCacheSize > mBufferCacheMin)
+        while (!mUnusedBuffers.empty() && mUnusedSize + reserve > mBufferCacheMin)
         {
             SoundBuffer* const unused = mUnusedBuffers.back();
 
             mBufferCacheSize -= mOutput->unloadSound(unused->getHandle());
+            mUnusedSize -= unused->mSize;
             unused->mHandle = nullptr;
+            unused->mSize = 0;
 
             mUnusedBuffers.pop_back();
         }

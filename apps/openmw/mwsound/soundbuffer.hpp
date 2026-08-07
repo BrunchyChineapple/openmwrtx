@@ -58,6 +58,9 @@ namespace MWSound
         float mMinDist;
         float mMaxDist;
         Sound_Handle mHandle = nullptr;
+        /// Decoded size in bytes while loaded, so the pool can account for this buffer leaving or joining
+        /// the reclaimable pool without asking the output layer again. Zero while unloaded.
+        std::size_t mSize = 0;
         std::size_t mUses = 0;
 
         friend class SoundBufferPool;
@@ -93,14 +96,20 @@ namespace MWSound
             {
                 const auto it = std::find(mUnusedBuffers.begin(), mUnusedBuffers.end(), &sfx);
                 if (it != mUnusedBuffers.end())
+                {
                     mUnusedBuffers.erase(it);
+                    mUnusedSize -= sfx.mSize;
+                }
             }
         }
 
         void release(SoundBuffer& sfx)
         {
             if (--sfx.mUses == 0)
+            {
                 mUnusedBuffers.push_front(&sfx);
+                mUnusedSize += sfx.mSize;
+            }
         }
 
         void clear();
@@ -114,7 +123,14 @@ namespace MWSound
         std::unordered_map<VFS::Path::Normalized, SoundBuffer*, VFS::Path::Hash, std::equal_to<>> mBufferFileNameMap;
         std::size_t mBufferCacheMax;
         std::size_t mBufferCacheMin;
+        /// Decoded bytes of every currently loaded buffer, whether in use or not. Reported, not budgeted;
+        /// see mUnusedSize.
         std::size_t mBufferCacheSize = 0;
+        /// Decoded bytes held by the buffers on mUnusedBuffers, which is what the cache budget applies to.
+        std::size_t mUnusedSize = 0;
+        /// Whether the over-budget state has already been reported, so that it is said once on entering it
+        /// rather than on every load for as long as it lasts.
+        bool mReportedOverBudget = false;
         // NOTE: unused buffers are stored in front-newest order.
         std::deque<SoundBuffer*> mUnusedBuffers;
 
@@ -123,7 +139,10 @@ namespace MWSound
         SoundBuffer* insertSound(const ESM::RefId& soundId, const ESM4::SoundReference& sound);
         SoundBuffer* insertSound(VFS::Path::NormalizedView fileName);
 
-        inline void unloadUnused();
+        /// Free unused buffers, oldest first, until the reclaimable pool plus \a reserve fits within
+        /// 'buffer cache min'. \a reserve accounts for a buffer that has been loaded but not yet added to
+        /// the pool, so that it is budgeted for without being at risk of being freed here.
+        inline void unloadUnused(std::size_t reserve);
     };
 }
 
