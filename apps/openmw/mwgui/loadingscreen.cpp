@@ -167,30 +167,6 @@ namespace MWGui
 
         mShowWallpaper = MWBase::Environment::get().getStateManager()->getState() == MWBase::StateManager::State_NoGame;
 
-        // Under Remix, every load shows splash art rather than the frame behind it.
-        //
-        // The alternative this replaces is not a stylistic preference, it is a broken path. With a game
-        // loaded, upstream keeps the last rendered frame on screen and draws the progress bar over it, which
-        // it obtains by copying OpenMW's framebuffer into a texture (setupCopyFramebufferToTextureCallback,
-        // below). That framebuffer is not what the player was looking at: Remix's output reaches the screen
-        // through the compositor at present time, and the loops that drive a load do not run it. So the copy
-        // captures whatever OpenMW's own raster pass happened to leave there, which is why in-game loads came
-        // out black rather than showing the previous frame.
-        //
-        // Wallpaper is both the correct fallback and the behaviour Morrowind itself had -- it showed a splash
-        // on every load, and this integration is meant to look like Morrowind. It also costs nothing to get
-        // right, because the art is already found and loaded for the menu case.
-        //
-        // Short loads do not flash, and the reason is worth knowing rather than assuming: the nested-frame
-        // presenter shows nothing for the first stretch of a load sequence
-        // (OPENMW_REMIX_NESTED_PRESENT_DELAY_MS), so a door transition that finishes inside that window
-        // presents no frame at all and the splash is never seen.
-        //
-        // Left conditional so a build not running through Remix keeps upstream's behaviour exactly, where the
-        // framebuffer copy does work and showing the previous frame is the nicer result.
-        if (RemixRT::hasNestedFramePresenter())
-            mShowWallpaper = true;
-
         if (mShowWallpaper)
         {
             changeWallpaper();

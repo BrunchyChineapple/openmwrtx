@@ -2139,11 +2139,6 @@ namespace RemixRT
         gNestedFramePresenter = std::move(present);
     }
 
-    bool hasNestedFramePresenter()
-    {
-        return static_cast<bool>(gNestedFramePresenter);
-    }
-
     void presentNestedFrame()
     {
         if (gNestedFramePresenter)
