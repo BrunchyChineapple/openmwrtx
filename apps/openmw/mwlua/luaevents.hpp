@@ -52,7 +52,10 @@ namespace MWLua
 
         void clear();
         void finalizeEventBatch();
-        void callEventHandlers();
+        /// Delivers the finalized batch, bounding the script instantiation it causes. \a loadBudgetMs is
+        /// decremented by the wall time spent; the remainder of the batch is carried to the next frame when
+        /// it runs out. See the comment at the local loop for why event delivery loads scripts at all.
+        void callEventHandlers(double& loadBudgetMs, bool enforceBudget);
         void callMenuEventHandlers();
 
         /// What one event name cost during the last callEventHandlers.

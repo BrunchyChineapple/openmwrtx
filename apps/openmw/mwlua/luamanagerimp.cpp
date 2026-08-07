@@ -355,7 +355,12 @@ namespace MWLua
         breakdown.mTimers = lap();
 
         // Run event handlers for events that were sent before `finalizeEventBatch`.
-        mLuaEvents.callEventHandlers();
+        //
+        // Given its own budget rather than the remainder of the shared one, for the same reason
+        // callEngineHandlers is: delivering an event to an object whose scripts are not loaded instantiates
+        // them, and a door that runs after others is starved by a shared allowance.
+        double eventHandlerLoadBudgetMs = Settings::lua().mLocalScriptLoadBudgetMs;
+        mLuaEvents.callEventHandlers(eventHandlerLoadBudgetMs, loadBudgetActive);
         breakdown.mEventHandlers = lap();
 
         mLua.protectedCall([&](LuaUtil::LuaView& lua) {
