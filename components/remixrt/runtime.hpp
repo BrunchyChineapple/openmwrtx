@@ -630,6 +630,13 @@ namespace RemixRT
     /// when Remix is what reaches the screen.
     void setNestedFramePresenter(std::function<void()> present);
 
+    /// Whether a presenter has been installed, which is the same question as "is Remix what reaches the
+    /// screen". Exists because two decisions outside the renderer depend on the answer and have no other way
+    /// to ask it: whether a loop that draws its own frames needs to present them, and whether anything that
+    /// works by reading OpenMW's own framebuffer back can be trusted -- under Remix that framebuffer is not
+    /// what the player is looking at.
+    bool hasNestedFramePresenter();
+
     /// Runs whatever setNestedFramePresenter installed. Safe to call when nothing is installed, and safe
     /// to call when Remix is not in use at all -- both are no-ops.
     void presentNestedFrame();
