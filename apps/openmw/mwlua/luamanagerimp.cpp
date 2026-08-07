@@ -372,7 +372,17 @@ namespace MWLua
             // Bounding only the other three doors was worse than useless. It moved the same work into this
             // span rather than removing it -- bookkeeping and timers dropped from 346 ms and 612 ms to
             // roughly 5 ms each, and engine events rose to 512 ms in their place.
-            mEngineEvents.callEngineHandlers(loadBudgetMs);
+            // Its own budget rather than the remainder of the shared one, because this is the door most
+            // newly active objects come through and it runs after three others that can legitimately empty
+            // the shared allowance. Sharing starved it: the queue drain above spent the whole 4 ms, engine
+            // events then fell back to its one-event floor, and a burst of a few hundred OnActive events
+            // would have taken thousands of frames to clear.
+            //
+            // The cost of the separation is that a frame can spend up to two budgets on instantiation
+            // instead of one. That is still bounded, still small next to a 30-40 ms frame, and far better
+            // than a queue that never catches up.
+            double eventLoadBudgetMs = Settings::lua().mLocalScriptLoadBudgetMs;
+            mEngineEvents.callEngineHandlers(eventLoadBudgetMs, loadBudgetActive);
             breakdown.mEngineEvents = lap();
             bool isPaused = timeManager.isPaused();
 

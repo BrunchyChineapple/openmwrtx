@@ -115,12 +115,16 @@ namespace MWLua
         /// whose NPC script pulls a megabyte of modules costs milliseconds per NPC, and entering a town
         /// activates dozens at once: measured at 512 ms in one frame.
         ///
-        /// A budget of zero means no limit, which is the behaviour this had before.
+        /// \a enforceBudget separates "the budget is switched off" from "the budget is used up", which are
+        /// opposite instructions and cannot both be spelled with a zero. The first revision of this took
+        /// only the remaining budget and treated <= 0 as no limit -- but the phases that run before this one
+        /// routinely spend all of it, so an exhausted budget arrived here as permission to do unlimited
+        /// work. Engine events then stayed at 148-459 ms while the spans either side of it sat at 4 ms.
         ///
         /// Whatever does not fit stays queued, in order, ahead of anything added later. The queue is
         /// drained from the front and always makes progress by at least one event, so nothing can be
         /// starved by a single expensive one.
-        void callEngineHandlers(double& budgetMs);
+        void callEngineHandlers(double& budgetMs, bool enforceBudget);
 
     private:
         class Visitor;

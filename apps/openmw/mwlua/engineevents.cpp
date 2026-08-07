@@ -176,7 +176,7 @@ namespace MWLua
         MWWorld::WorldModel* mWorldModel = MWBase::Environment::get().getWorldModel();
     };
 
-    void EngineEvents::callEngineHandlers(double& budgetMs)
+    void EngineEvents::callEngineHandlers(double& budgetMs, bool enforceBudget)
     {
         Visitor vis(mGlobalScripts);
 
@@ -187,7 +187,7 @@ namespace MWLua
         std::vector<Event> batch;
         batch.swap(mQueue);
 
-        if (budgetMs <= 0.0)
+        if (!enforceBudget)
         {
             for (const Event& event : batch)
                 std::visit(vis, event);
@@ -200,6 +200,10 @@ namespace MWLua
         {
             std::visit(vis, event);
             ++processed;
+            // One event always goes through even when the budget arrived already spent, so a frame whose
+            // earlier phases used everything still drains the queue rather than stalling it indefinitely.
+            if (processed == 1 && budgetMs <= 0.0 && batch.size() > 1)
+                break;
             // Checked after dispatch, not before, because whether an event instantiates anything is not
             // knowable from the event alone -- OnActive only costs something when the object's scripts are
             // not loaded yet. The cost of that is overshooting the budget by at most one event.
