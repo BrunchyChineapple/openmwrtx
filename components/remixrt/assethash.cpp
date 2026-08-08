@@ -33,6 +33,47 @@ namespace RemixRT
             return static_cast<std::uint64_t>(XXH64(&value, sizeof(value), seed));
         }
 
+        std::uint64_t fold(const void* data, std::size_t size, std::uint64_t seed)
+        {
+            if (data == nullptr || size == 0)
+                return seed;
+            return static_cast<std::uint64_t>(XXH64(data, size, seed));
+        }
+
+        std::uint64_t d3d9SphereLight(const float position[3], float radius)
+        {
+            // Reproduces RtSphereLight::updateCachedHash from the runtime, term for term:
+            //
+            //   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Sphere;
+            //   h = XXH64(&m_position[0], sizeof(m_position), h);
+            //   h = XXH64(&m_radius, sizeof(m_radius), h);
+            //   h = XXH64(&h, sizeof(h), m_shaping.getHash());
+            //
+            // Three constants are folded in from the runtime rather than passed, because for a light
+            // submitted through the API they cannot be anything else:
+            //
+            //  - The seed is lightTypeSphere, which is 0 (light_types.h). So the chain starts at zero.
+            //  - m_position is a Vector3, so exactly twelve bytes, and m_radius a float, so four.
+            //  - The final fold is seeded with RtLightShaping::getHash(), which returns 0 whenever
+            //    shaping is disabled -- and it is, since createSphereLight submits no shaping. That
+            //    makes the last step identical to combine(h, 0).
+            //
+            // Radiance is deliberately absent, and that is the property being bought here: the runtime's
+            // comment says it is excluded "to somewhat uniquely identify lights when constructed from
+            // D3D9 Lights", which is what lets a light keep its identity while it flickers, dims with an
+            // actor's fade, or changes colour with the time of day.
+            //
+            // Radius is present, so it is part of the identity. Retuning the light radius therefore
+            // renames every light and invalidates edits authored against the old names. That is not a
+            // quirk of this implementation -- the runtime has the same property for D3D9 lights, where
+            // the radius comes from rtx.lightConversionSphereLightFixedRadius -- so matching it is the
+            // point rather than a cost.
+            std::uint64_t h = 0; // lightTypeSphere
+            h = fold(position, sizeof(float) * 3, h);
+            h = fold(&radius, sizeof(radius), h);
+            return combine(h, 0);
+        }
+
         std::uint64_t d3d9Geometry(const void* positions, std::size_t positionStride,
             std::uint32_t vertexCount, const std::uint32_t* indices, std::uint32_t indexCount)
         {

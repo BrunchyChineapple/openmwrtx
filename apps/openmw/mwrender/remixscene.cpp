@@ -2500,6 +2500,14 @@ namespace MWRender
         }
 
         const int key = source.getId();
+        // Identity carried over from the cached entry when this submission has not changed it.
+        //
+        // A colour change alone leaves the hash alone, and the recreate below has to reuse the exact value
+        // the handle was made with so that it lands on the runtime's update path. Recomputing it from the
+        // current position would not be equivalent: the move test tolerates drift up to an epsilon, so a
+        // light trembling below that threshold keeps its handle while its recomputed hash would wander,
+        // and every such frame would quietly orphan a light.
+        unsigned long long reuseHash = 0;
         auto found = mLights.find(key);
         if (found != mLights.end())
         {
@@ -2529,23 +2537,56 @@ namespace MWRender
                 return;
             }
 
-            // Recreated in place, and emphatically NOT destroyed first. Creating with an existing hash
-            // *is* the runtime's update path. Destroying first cannot work: destroys are queued and
-            // drained late in the frame, while creates go straight into the command stream, and the
-            // drain builds a tombstone set from the queued destroys that suppresses any create sharing a
-            // handle with one. So destroy-then-recreate reliably ends with the light gone -- and gone for
-            // good, because this cache then believes it exists and never rebuilds it. That is what made
-            // every light die a frame or two after it first moved.
+            // Position and radius are what the hash is made of, so these two are exactly the changes
+            // that rename the light. Anything else -- colour, flicker, an actor fading out -- keeps its
+            // identity, and the recreate below has to reuse it rather than recompute it.
+            const bool reidentified = moved || resized;
+            if (!reidentified)
+                reuseHash = cached.mHash;
+
+            // Recreated in place, and emphatically NOT destroyed first, whenever the identity is
+            // unchanged. Creating with an existing hash *is* the runtime's update path. Destroying first
+            // cannot work: destroys are queued and drained late in the frame, while creates go straight
+            // into the command stream, and the drain builds a tombstone set from the queued destroys that
+            // suppresses any create sharing a handle with one. So destroy-then-recreate reliably ends with
+            // the light gone -- and gone for good, because this cache then believes it exists and never
+            // rebuilds it. That is what made every light die a frame or two after it first moved.
+            //
+            // A move or a resize is the exception, and only became one when the hash started coming from
+            // position and radius. Such a light is a different light as far as the runtime is concerned, so
+            // the create below cannot update the old handle -- and the old handle is about to become
+            // unreachable, because this cache entry is the only thing that refers to it and the end-of-frame
+            // sweep only visits entries still in the map. Left alone it would leak one light per movement
+            // per frame, which for actor-carried torches is every torch every frame.
+            //
+            // Destroying here is safe precisely because the identity differs: the tombstone set suppresses
+            // a create that shares a handle with a queued destroy, and these two do not share one.
+            if (reidentified)
+                mRuntime.destroyLight(found->second.mHandle);
             mLights.erase(found);
         }
 
-        // The hash is the identity and the handle both, so it has to be stable for a given light and
-        // distinct from every other live one. OpenMW's light id is already unique among live sources;
-        // mixing it keeps ids that differ by one from producing adjacent hashes.
-        const unsigned long long hash
-            = (static_cast<unsigned long long>(static_cast<unsigned int>(key) + 1u)
-                  * 0x9E3779B97F4A7C15ull)
-            | 1ull;
+        // The hash is the identity and the handle both, so it has to be stable for a given light -- and
+        // the previous formulation was not.
+        //
+        // It derived the hash from OpenMW's light-source id, which is a counter handed out as cells
+        // stream in. That satisfies "distinct from every other live light", which is all the old comment
+        // here claimed, but it is not identity: the same light gets a different id on the next run, and a
+        // different one again after its cell unloads and reloads within a run. Since this value is the
+        // name the toolkit stores light edits under, every edit went dead almost immediately -- which is
+        // the reported symptom, and it was a property of the hash rather than of the toolkit.
+        //
+        // AssetHash::d3d9SphereLight reproduces the runtime's own RtSphereLight hash over position and
+        // radius, so identity now follows the light rather than the order cells happened to load in.
+        // Deliberately excluding radiance, as the runtime does, keeps the identity stable while a light
+        // flickers, dims with its owner's fade, or shifts colour with the time of day.
+        //
+        // avoidZero rather than the old `| 1`: forcing the low bit would move the value off the formula
+        // and defeat the whole point, whereas zero is the one value the runtime treats as no light at
+        // all. avoidZero perturbs only that single case.
+        const unsigned long long hash = reuseHash != 0
+            ? reuseHash
+            : RemixRT::AssetHash::avoidZero(RemixRT::AssetHash::d3d9SphereLight(position, mLightRadius));
 
         const unsigned long long handle
             = mRuntime.createSphereLight(hash, position, radiance, mLightRadius);
@@ -2558,6 +2599,7 @@ namespace MWRender
         std::copy(std::begin(position), std::end(position), std::begin(cached.mPosition));
         std::copy(std::begin(radiance), std::end(radiance), std::begin(cached.mRadiance));
         cached.mRadius = mLightRadius;
+        cached.mHash = hash;
         mLights.emplace(key, cached);
 
         if (mRuntime.drawLight(handle))

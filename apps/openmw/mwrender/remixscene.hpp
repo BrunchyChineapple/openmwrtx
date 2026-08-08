@@ -436,6 +436,16 @@ namespace MWRender
             float mPosition[3] = { 0.0f, 0.0f, 0.0f };
             float mRadiance[3] = { 0.0f, 0.0f, 0.0f };
             float mRadius = 0.0f;
+            /// The identity the handle was created under.
+            ///
+            /// Kept because the hash is derived from position and radius, so it survives a colour change
+            /// but not a move. Recreating with an unchanged hash is the runtime's update path and must not
+            /// be preceded by a destroy; a changed hash is a different light and the old handle has to be
+            /// destroyed or it is never swept, since the cache entry it was reachable through is gone.
+            /// Recomputing it instead of storing it would not do: the stored value is quantised by the
+            /// move epsilon, and recomputing from a position that drifted below that threshold would
+            /// silently change identity every frame.
+            unsigned long long mHash = 0;
         };
 
         /// Releases lights not submitted this frame.

@@ -37,6 +37,27 @@ namespace RemixRT
         /// still agree with the runtime's own combination of the same parts.
         std::uint64_t combine(std::uint64_t value, std::uint64_t seed);
 
+        /// XXH64 over a memory range with a seed.
+        ///
+        /// Distinct from bytesSeeded, which is XXH3. The runtime hashes light properties with plain XXH64
+        /// over spans that are not eight bytes wide, so neither existing primitive can express it.
+        std::uint64_t fold(const void* data, std::size_t size, std::uint64_t seed);
+
+        /// The identity Remix's own D3D9 path would give a sphere light at this position and radius.
+        ///
+        /// A light's hash is its identity and its handle both: it is the key a USD light replacement is
+        /// authored against, and the name the toolkit shows and stores edits under. Deriving it from
+        /// OpenMW's light-source id -- a counter handed out as cells stream in -- made it unique among live
+        /// lights but different on every run and after every cell reload, so no toolkit edit could ever
+        /// refer to the same light twice.
+        ///
+        /// Position and radius are content, so this is stable across sessions. It is also the formula
+        /// MGE-XE's lights hash under, which is what gives a replacement pack authored against a Morrowind
+        /// capture a chance of binding -- the pack's light keys were authored at
+        /// rtx.lightConversionSphereLightFixedRadius, so matching them additionally requires submitting
+        /// that same radius.
+        std::uint64_t d3d9SphereLight(const float position[3], float radius);
+
         /// The geometry identity Remix's own D3D9 path would give this mesh, under the default
         /// rtx.geometryAssetHashRule of "positions,indices,geometrydescriptor".
         ///
