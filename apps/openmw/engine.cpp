@@ -10,6 +10,7 @@
 
 #include <osgDB/ReaderWriter>
 #include <osgDB/Registry>
+#include <osgViewer/Renderer>
 #include <osgViewer/ViewerEventHandlers>
 
 #include <SDL.h>
@@ -2382,6 +2383,7 @@ void OMW::Engine::go()
 
     // Setup viewer
     mViewer = new osgViewer::Viewer;
+    SceneUtil::disableFFPLightModelForRenderer(static_cast<osgViewer::Renderer*>(mViewer->getCamera()->getRenderer()));
     mViewer->setReleaseContextAtEndOfFrameHint(false);
 
     // Do not try to outsmart the OS thread scheduler (see bug #4785).

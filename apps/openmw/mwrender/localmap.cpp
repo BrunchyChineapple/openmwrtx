@@ -4,7 +4,6 @@
 
 #include <osg/ComputeBoundsVisitor>
 #include <osg/Fog>
-#include <osg/LightSource>
 #include <osg/PolygonMode>
 #include <osg/Texture2D>
 
@@ -16,6 +15,7 @@
 #include <components/files/memorystream.hpp>
 #include <components/misc/constants.hpp>
 #include <components/sceneutil/depth.hpp>
+#include <components/sceneutil/fog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
 #include <components/sceneutil/nodecallback.hpp>
 #include <components/sceneutil/rtt.hpp>
@@ -735,24 +735,18 @@ namespace MWRender
         if (Stereo::getMultiview())
             Stereo::setMultiviewMatrices(stateset, { mProjectionMatrix, mProjectionMatrix });
 
-        // assign large value to effectively turn off fog
-        // shaders don't respect glDisable(GL_FOG)
-        osg::ref_ptr<osg::Fog> fog(new osg::Fog);
-        fog->setStart(10000000);
-        fog->setEnd(10000000);
-        stateset->setAttributeAndModes(fog, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+        SceneUtil::disableFog(*stateset, osg::StateAttribute::ON | osg::StateAttribute::OVERRIDE);
 
         // turn of sky blending
         stateset->addUniform(new osg::Uniform("far", 10000000.0f));
         stateset->addUniform(new osg::Uniform("skyBlendingStart", 8000000.0f));
         stateset->addUniform(new osg::Uniform("screenRes", osg::Vec2f{ 1, 1 }));
 
-        osg::ref_ptr<osg::Light> light = new osg::Light;
+        osg::ref_ptr<SceneUtil::Light> light = new SceneUtil::Light;
         light->setPosition(osg::Vec4(-0.3f, -0.3f, 0.7f, 0.f));
         light->setDiffuse(osg::Vec4(0.7f, 0.7f, 0.7f, 1.f));
         light->setAmbient(osg::Vec4(0.3f, 0.3f, 0.3f, 1.f));
         light->setSpecular(osg::Vec4(0, 0, 0, 0));
-        light->setLightNum(0);
         light->setConstantAttenuation(1.f);
         light->setLinearAttenuation(0.f);
         light->setQuadraticAttenuation(0.f);

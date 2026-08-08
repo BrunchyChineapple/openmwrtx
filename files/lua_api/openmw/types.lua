@@ -356,6 +356,13 @@
 -- @return true if spell is active, false otherwise
 
 ---
+-- Get the active spell by active spell ID (see @{openmw_core#ActiveSpell.activeSpellId})
+-- @function [parent=#ActorActiveSpells] getByActiveSpellId
+-- @param self
+-- @param #string id Active spell ID
+-- @return @{openmw_core#ActiveSpell} or nil if the spell is no longer active.
+
+---
 -- Remove an active spell based on active spell ID (see @{openmw_core#ActiveSpell.activeSpellId}). Can only be used in global scripts or on self. Can only be used to remove spells with the temporary flag set (see @{openmw_core#ActiveSpell.temporary}).
 -- @function [parent=#ActorActiveSpells] remove
 -- @param self
@@ -882,7 +889,7 @@
 -- @function [parent=#ItemLevelledListRecord] getRandomId
 -- @param #ItemLevelledListRecord listRecord The list
 -- @param #number MaxLvl The maximum level to select entries for
--- @return #string An id
+-- @return #string An id (can be nil if the chanceNone roll succeeds, or if no entry is at or below the given level)
 
 
 --------------------------------------------------------------------------------
@@ -2595,7 +2602,7 @@
 -- @function [parent=#CreatureLevelledListRecord] getRandomId
 -- @param #CreatureLevelledListRecord listRecord The list
 -- @param #number MaxLvl The maximum level to select entries for
--- @return #string An id
+-- @return #string An id (can be nil if the chanceNone roll succeeds, or if no entry is at or below the given level)
 
 ---
 -- @type LevelledListItem
