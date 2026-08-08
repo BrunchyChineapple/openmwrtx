@@ -346,7 +346,10 @@ namespace
     /// for a lantern, which then squares into a radiance in the millions. Fitting an inverse-square curve
     /// over the light's actual range instead gives a distance that reflects where the light really stops
     /// mattering.
-    float lightEndDistance(const osg::Light& light, float range, float brightness)
+    /// Takes SceneUtil::Light rather than osg::Light because upstream 28fefe86d9 ("remove osg::Light*")
+    /// replaced the osg type with its own. Only the three attenuation terms are read, and they carry the
+    /// same names and meanings on the new type, so the fit below is unchanged.
+    float lightEndDistance(const SceneUtil::Light& light, float range, float brightness)
     {
         const double a = light.getQuadraticAttenuation();
         const double b = light.getLinearAttenuation();
@@ -2421,12 +2424,18 @@ namespace MWRender
 
     void RemixScene::submitLight(const SceneUtil::LightSource& source, double x, double y, double z)
     {
-        // Deliberately non-const: getLight takes a frame index because the osg::Light is double
-        // buffered for the draw thread. Reading either buffer is fine here -- this traversal runs on the
-        // update thread, before the draw -- and the frame counter is this class's own, so it only has to
-        // be stable, not aligned with OSG's.
+        // Deliberately non-const: getLight takes a frame index because the light is double buffered for
+        // the draw thread. Reading either buffer is fine here -- this traversal runs on the update
+        // thread, before the draw -- and the frame counter is this class's own, so it only has to be
+        // stable, not aligned with OSG's.
+        //
+        // SceneUtil::Light rather than osg::Light: upstream 28fefe86d9 ("remove osg::Light*") replaced
+        // the osg type with its own lightweight osg::Referenced-derived one. The two are unrelated
+        // types, so this stopped compiling on merge rather than changing behaviour quietly. Every
+        // accessor read below -- diffuse and the three attenuation terms -- carries the same name and
+        // meaning on the new type, so nothing here had to be reinterpreted.
         auto& mutableSource = const_cast<SceneUtil::LightSource&>(source);
-        const osg::Light* light = mutableSource.getLight(static_cast<size_t>(mFrame));
+        const SceneUtil::Light* light = mutableSource.getLight(static_cast<size_t>(mFrame));
         if (light == nullptr || source.getEmpty())
             return;
 
