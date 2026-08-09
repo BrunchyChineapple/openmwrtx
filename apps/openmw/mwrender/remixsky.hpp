@@ -63,6 +63,9 @@ namespace MWRender
         float mNightSkyBrightness = std::numeric_limits<float>::quiet_NaN();
         float mFogDistance = std::numeric_limits<float>::quiet_NaN();
         float mFroxelDistance = std::numeric_limits<float>::quiet_NaN();
+        /// The scattering albedo is a property of fog rather than of the weather, so it is written once.
+        /// Resending it per frame would also fight anyone tuning it in the developer menu.
+        bool mAlbedoSet = false;
         /// Held as the formatted string rather than three floats, because the option is written as one
         /// vector and comparing the formatted form is what decides whether a write is needed. Empty means
         /// nothing written yet, which no formatted colour can equal.

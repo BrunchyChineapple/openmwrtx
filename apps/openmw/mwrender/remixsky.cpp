@@ -24,6 +24,57 @@ namespace
     /// two have to agree or fog lands orders of magnitude out.
     constexpr float kUnitsPerMetre = 100.0f * 1.43f;
 
+    /// Scattering-to-absorption ratio for the fog medium.
+    ///
+    /// Near one because that is what fog is: droplets scatter light, they do not swallow it. Anything much
+    /// below this turns the medium into an absorber that darkens the scene instead of fogging it, which is
+    /// the failure this constant exists to make hard to reintroduce.
+    constexpr float kFogAlbedo = 0.99f;
+
+    /// Transmittance level at the measurement distance, before the fog's hue is applied.
+    ///
+    /// This is a reference point rather than a look: it and the measurement distance together define the
+    /// density, and fixing one lets the other be derived. A half is convenient because it puts the
+    /// measurement distance at a recognisable "half the light is gone by here".
+    constexpr float kFogTransmittance = 0.5f;
+
+    /// How opaque the view distance should be when OpenMW asks for full fog depth.
+    ///
+    /// Five percent surviving reads as fully fogged without being pure flat colour, which leaves distant
+    /// landmarks faintly legible the way Morrowind's own fog does.
+    constexpr float kFogEndTransmittance = 0.05f;
+
+    /// How much of the fog colour's hue reaches transmittanceColor.
+    ///
+    /// Partial on purpose. What looks coloured about fog is mostly the light it scatters, not a tint on what
+    /// passes through, and the scattered part is already handled by the albedo picking up the sun and sky.
+    constexpr float kFogTint = 0.5f;
+
+    float envFloat(const char* name, float fallback)
+    {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+            return fallback;
+        char* end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        return end != value ? parsed : fallback;
+    }
+
+    /// Whether OpenMW drives the fog at all.
+    ///
+    /// Exists because the host writing these options every time the weather moves is indistinguishable, from
+    /// the other side of the developer menu, from the menu being broken: a value typed there is overwritten
+    /// within seconds by the next fog colour change. Setting OPENMW_REMIX_FOG=0 hands the medium over to the
+    /// menu entirely so it can be tuned by hand, which is the only way to find numbers worth hard-coding.
+    bool fogEnabled()
+    {
+        static const bool value = []() -> bool {
+            const char* env = std::getenv("OPENMW_REMIX_FOG");
+            return env == nullptr || (*env != '\0' && *env != '0');
+        }();
+        return value;
+    }
+
     /// Morrowind's ten weather IDs, mapped to the preset names the runtime's weather blender knows.
     ///
     /// Indexed by the weather's script ID, which is Morrowind's own numbering and is what OpenMW reports
@@ -265,36 +316,92 @@ namespace MWRender
         // and this drives the medium's own parameters instead -- which is the better description anyway,
         // since Remix's volumetrics is a participating medium rather than a distance blend.
         //
-        // singleScatteringAlbedo is what the medium scatters, so that is where OpenMW's fog COLOUR
-        // belongs: it is the colour distant geometry fades toward, which is exactly what in-scattering
-        // looks like. transmittanceMeasurementDistanceMeters carries the density, because that is the
-        // distance over which transmittanceColor survives -- shorter means thicker.
+        // Three parameters, three separate jobs, and an earlier version of this conflated the first two.
         //
-        // fogDepth is a fraction of view distance, not a distance: FogManager derives
-        // landFogStart = viewDistance * (1 - fogDepth) with the end always at viewDistance. So the span
-        // over which the scene goes from clear to fully fogged is viewDistance * fogDepth, and that span
-        // is what sets the density. This mapping is a calibration rather than a derivation and is the
-        // first thing to adjust if fog reads too thick or too thin.
-        if (sky.mHaveWeather)
+        // singleScatteringAlbedo is NOT a colour. The option's own documentation calls it "the ratio of
+        // scattering to absorption... more of a mathematical albedo... treated as linearly encoded data
+        // (not gamma)". Feeding OpenMW's fog colour into it therefore does not tint the fog, it decides how
+        // much light the medium destroys instead of scattering: a dark fog colour makes a nearly pure
+        // ABSORBER, which eats the scene and returns nothing. That is why daylight went black while the fog
+        // itself stayed invisible, and why the density had to be pushed to a few metres before anything
+        // showed -- that was an absorber being forced to in-scatter. Fog scatters almost everything it
+        // interacts with, so this belongs near white and stays there.
+        //
+        // transmittanceColor is the colour slot, documented as sRGB and gamma encoded, so OpenMW's fog
+        // colour goes here. Its magnitude is part of the density though, not just its hue: transmittance
+        // falls as transmittanceColor raised to (distance / measurementDistance). Handing it a raw fog
+        // colour would therefore smuggle a density in with the tint, so the hue is taken and the level is
+        // set deliberately below.
+        //
+        // Where the day/night/sunrise/sunset variation comes from: OpenMW already blends it. This colour is
+        // weather.mFogColor, which the weather system has already interpolated between Morrowind's four
+        // per-phase fog colours, so the phases arrive for free once the value reaches a slot that tints
+        // rather than one that absorbs. Scattered sunlight does the rest -- a white-albedo medium under a
+        // midday sun reads bright and under stars reads dark, without either being asked for.
+        if (sky.mHaveWeather && fogEnabled())
         {
+            // Written once and left alone. Fog scatters; it does not absorb.
+            if (!mAlbedoSet)
+            {
+                mAlbedoSet = true;
+                const float albedo = std::clamp(envFloat("OPENMW_REMIX_FOG_ALBEDO", kFogAlbedo), 0.0f, 1.0f);
+                char value[64];
+                std::snprintf(value, sizeof(value), "%.4f, %.4f, %.4f", static_cast<double>(albedo),
+                    static_cast<double>(albedo), static_cast<double>(albedo));
+                mRuntime.setConfigVariable("rtx.volumetrics.singleScatteringAlbedo", value);
+            }
+
+            // Hue without level: the fog colour is normalised by its own largest component so it carries
+            // only its tint, then blended toward white. Fog is barely coloured in transmission -- what
+            // looks coloured about it is the light it scatters -- so a partial tint is the honest amount.
+            const float tintStrength
+                = std::clamp(envFloat("OPENMW_REMIX_FOG_TINT", kFogTint), 0.0f, 1.0f);
+            const float level
+                = std::clamp(envFloat("OPENMW_REMIX_FOG_TRANSMITTANCE", kFogTransmittance), 0.01f, 0.99f);
+            const float peak = std::max({ sky.mFogColor.x(), sky.mFogColor.y(), sky.mFogColor.z(), 1e-4f });
+
+            float rgb[3] = { sky.mFogColor.x(), sky.mFogColor.y(), sky.mFogColor.z() };
+            for (float& c : rgb)
+            {
+                const float hue = c / peak;
+                c = level * (1.0f - tintStrength + tintStrength * hue);
+            }
+
             // The option is a three-component vector, so it goes as one string and is compared as one
             // value. Formatting first and comparing the formatted result means a colour that rounds to the
             // same four decimals is never resent.
             char colour[64];
-            std::snprintf(colour, sizeof(colour), "%.4f, %.4f, %.4f",
-                static_cast<double>(sky.mFogColor.x()), static_cast<double>(sky.mFogColor.y()),
-                static_cast<double>(sky.mFogColor.z()));
+            std::snprintf(colour, sizeof(colour), "%.4f, %.4f, %.4f", static_cast<double>(rgb[0]),
+                static_cast<double>(rgb[1]), static_cast<double>(rgb[2]));
             if (std::strcmp(colour, mFogColour) != 0)
             {
                 std::snprintf(mFogColour, sizeof(mFogColour), "%s", colour);
-                mRuntime.setConfigVariable("rtx.volumetrics.singleScatteringAlbedo", colour);
+                mRuntime.setConfigVariable("rtx.volumetrics.transmittanceColor", colour);
             }
 
-            const float span = viewDistance * sky.mFogDepth;
+            // Density, derived rather than calibrated by eye.
+            //
+            // A uniform medium has no start distance, so OpenMW's fogDepth cannot be honoured as one:
+            // FogManager reads it as landFogStart = viewDistance * (1 - fogDepth) with the end always at
+            // viewDistance, which is a ramp position, not a density. What survives the translation is how
+            // opaque the far plane should be -- fogDepth of 1 means fully fogged by the view distance and a
+            // tenth of that means a light haze -- so optical depth at the view distance is made
+            // proportional to fogDepth.
+            //
+            // Solving transmittance = level^(distance / measurement) for the measurement distance that puts
+            // kFogEndTransmittance at the view distance gives the ratio below. Written as the two named
+            // constants rather than the number they produce, so changing either stays consistent.
+            const float endTransmittance = std::clamp(
+                envFloat("OPENMW_REMIX_FOG_END_TRANSMITTANCE", kFogEndTransmittance), 0.001f, 0.99f);
+            const float opticalDepths = std::log(endTransmittance) / std::log(level);
+            const float viewMetres = viewDistance / kUnitsPerMetre;
+
             // A fogDepth of zero means "no fog" in OpenMW, which as a density would be infinitely thick
             // rather than absent. Substituting a very long measurement distance is the same statement in
             // the medium's own terms.
-            const float distance = span > 1.0f ? span / kUnitsPerMetre : 100000.0f;
+            const float distance = sky.mFogDepth > 0.001f && opticalDepths > 0.001f
+                ? viewMetres / (opticalDepths * sky.mFogDepth)
+                : 100000.0f;
             pushFloat("rtx.volumetrics.transmittanceMeasurementDistanceMeters", distance, mFogDistance);
 
             // How far the medium actually exists, which the density above says nothing about.
