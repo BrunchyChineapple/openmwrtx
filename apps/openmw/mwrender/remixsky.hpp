@@ -38,8 +38,7 @@ namespace MWRender
         /// strings for a dozen options every frame is waste, but more importantly re-pushing the weather
         /// target resets the runtime's blender mid-interpolation, so a preset written unconditionally
         /// would hold the weather permanently at the start of its transition.
-        void update(const SkyManager::State& sky, bool exterior, bool underwater, int weatherId,
-            int nextWeatherId,
+        void update(const SkyManager::State& sky, bool exterior, int weatherId, int nextWeatherId,
             float weatherTransition, float viewDistance);
 
     private:
@@ -67,11 +66,6 @@ namespace MWRender
         /// The scattering albedo is a property of fog rather than of the weather, so it is written once.
         /// Resending it per frame would also fight anyone tuning it in the developer menu.
         bool mAlbedoSet = false;
-        /// Last published fog condition, as the runtime's FogCondition value. Negative means never sent.
-        int mFogCondition = -1;
-        /// Previous sun elevation, which is what separates sunrise from sunset -- they occupy the same band of
-        /// elevations and differ only in which way the sun is travelling through it.
-        float mPrevSunElevation = std::numeric_limits<float>::quiet_NaN();
         /// Held as the formatted string rather than three floats, because the option is written as one
         /// vector and comparing the formatted form is what decides whether a write is needed. Empty means
         /// nothing written yet, which no formatted colour can equal.
