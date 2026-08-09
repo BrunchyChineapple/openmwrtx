@@ -83,16 +83,33 @@ namespace
     /// culling fifteen thousand drawables costs a few milliseconds, building two thousand meshes costs half
     /// a second. Bursts like that are geometry coming into view at once, on a cell change or a corner.
     ///
-    /// 128 is chosen against the measured standing load rather than as a round number. Ordinary play builds
-    /// around 33 a frame, so this never binds while walking about; it binds on the bursts, capping the worst
-    /// frame at roughly 26 ms and draining the remainder over the following frames.
-    ///
     /// Deferring costs the overflow one frame of freshness: nothing is destroyed, no memo is written, the
     /// caller simply does not submit that instance, and the next frame retries. New geometry therefore
     /// appears a frame or two late under load, which is a much better failure than a half-second freeze --
     /// and better than the failure the old unbounded form risked, where a device that cannot retire the
     /// builds fails its fence sync and reports a bare device loss with no fault behind it.
-    constexpr unsigned int kMeshBuildsPerFrame = 128;
+    ///
+    /// 128 was chosen against the measured standing load of about 33 builds a frame, which it clears
+    /// comfortably. What it does not clear is arrival: walking into a town measured up to 1,476 builds
+    /// deferred in a single frame, non-zero in twelve of eighteen sampled frames. At 128 a frame that
+    /// backlog takes a dozen frames to drain, and everything still queued is not merely late -- meshFor
+    /// returns nothing, so the instance is not submitted and the object is absent. The visible result was
+    /// buildings and actors blinking in a few at a time on entering Pelagiad, and it read as memory pressure
+    /// because that is what missing geometry usually is.
+    ///
+    /// 512 at the measured 0.2 ms a build puts the worst arrival frame near 100 ms rather than 26. That is a
+    /// deliberate trade of a brief hitch on arrival for geometry that is present when it should be: a stutter
+    /// is honest about being one frame, whereas absent geometry looks like a defect. The standing load is far
+    /// below either figure, so this still never binds during ordinary play.
+    ///
+    /// Raising the eviction window would be the wrong companion change. Arrival is new geometry rather than
+    /// geometry being rebuilt after eviction, so a longer window buys nothing here, and kMeshEvictionFrames
+    /// is short on purpose -- see its own note on superseded meshes from animated drawables accumulating one
+    /// acceleration structure per drawable per frame.
+    ///
+    /// Overridable through OPENMW_REMIX_MESH_BUILD_BUDGET, which is how the figures above were obtained and
+    /// how a device that cannot sustain 512 can be brought back down without a rebuild.
+    constexpr unsigned int kMeshBuildsPerFrame = 512;
 
 
     /// Most instances handed over in a single frame.
