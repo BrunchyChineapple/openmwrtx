@@ -2119,35 +2119,83 @@ namespace
         /// precedence for attributes that carry no override flag.
         static void mergeState(const osg::StateSet& stateSet, MWRender::RemixScene::SurfaceState& surface)
         {
-            if (const auto* texture = dynamic_cast<const osg::Texture2D*>(
-                    stateSet.getTextureAttribute(0, osg::StateAttribute::TEXTURE)))
-            {
-                surface.mTexture = texture;
-            }
-
             // Every unit is examined for a role tag, and the unit index is deliberately not assumed.
             // Shader::ShaderVisitor binds an auto-detected normal map at `texAttributes.size()` -- the
             // next free unit, whatever that happens to be for this state set -- and records what it is by
             // attaching a SceneUtil::TextureType naming it. The tag is the only reliable identification.
+            //
+            // The albedo is now resolved the same way, and used not to be. It was read from unit 0
+            // unconditionally, which is wrong for precisely the reason above: "the next free unit" is unit 0
+            // for a state set that binds no diffuse, so an auto-detected normal map lands there and was then
+            // taken as the base colour. That is a tangent-space normal map rendered as albedo -- the
+            // iridescent purple surface, in the toolkit and in game alike -- and the very same texture was
+            // also bound as the normal, which is what made it look as though the normal had been assigned
+            // twice.
+            //
+            // An untagged unit 0 is still accepted, and has to be: fixed-function state sets carry no tags
+            // at all and their unit 0 genuinely is the diffuse. What is no longer accepted is a unit 0 whose
+            // tag says it is something else. Nothing is assigned in that case, so the surface keeps the
+            // albedo inherited from an outer state set -- which is the right answer, since the parent's
+            // diffuse is still the diffuse.
+            //
+            // Roles other than diffuse and normal are recognised by OpenMW but not consumed here:
+            // specularMap and glossMap are tagged by ShaderVisitor and would give per-texel roughness
+            // instead of the constant taken from the SurfaceRule table. That is a separate change, because
+            // mapping OpenMW's specular convention onto Remix's roughness and metallic inputs is a
+            // judgement call with visual consequences for every material that ships one.
             const unsigned int units = static_cast<unsigned int>(stateSet.getTextureAttributeList().size());
+
+            const osg::Texture2D* taggedDiffuse = nullptr;
+            const osg::Texture2D* taggedNormal = nullptr;
+            const SceneUtil::TextureType* unitZeroRole = nullptr;
+
             for (unsigned int unit = 0; unit < units; ++unit)
             {
                 const auto* type = dynamic_cast<const SceneUtil::TextureType*>(
                     stateSet.getTextureAttribute(unit, SceneUtil::TextureType::AttributeType));
+                if (unit == 0)
+                    unitZeroRole = type;
                 if (type == nullptr)
                     continue;
 
+                const auto* texture = dynamic_cast<const osg::Texture2D*>(
+                    stateSet.getTextureAttribute(unit, osg::StateAttribute::TEXTURE));
+                if (texture == nullptr)
+                    continue;
+
+                const std::string& role = type->getName();
+
+                if (role == "diffuseMap")
+                {
+                    // First tagged diffuse wins, so a later unit cannot displace it.
+                    if (taggedDiffuse == nullptr)
+                        taggedDiffuse = texture;
+                }
                 // "normalHeightMap" is a normal map with height in alpha. The normal half is what Remix is
                 // being given; the height half would need Remix's separate heightTexture slot and a
                 // channel split, which is not done here.
-                if (type->getName() != "normalMap" && type->getName() != "normalHeightMap")
-                    continue;
-
-                if (const auto* normal = dynamic_cast<const osg::Texture2D*>(
-                        stateSet.getTextureAttribute(unit, osg::StateAttribute::TEXTURE)))
+                else if (role == "normalMap" || role == "normalHeightMap")
                 {
-                    surface.mNormalMap = normal;
+                    taggedNormal = texture;
                 }
+            }
+
+            if (taggedDiffuse != nullptr)
+            {
+                surface.mTexture = taggedDiffuse;
+            }
+            else if (unitZeroRole == nullptr)
+            {
+                if (const auto* texture = dynamic_cast<const osg::Texture2D*>(
+                        stateSet.getTextureAttribute(0, osg::StateAttribute::TEXTURE)))
+                {
+                    surface.mTexture = texture;
+                }
+            }
+
+            if (taggedNormal != nullptr)
+            {
+                surface.mNormalMap = taggedNormal;
             }
 
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
