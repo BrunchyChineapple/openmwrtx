@@ -732,6 +732,10 @@ namespace MWRender
         mCamera->update(dt, paused);
 
         bool isUnderwater = mWater->isUnderwater(mCamera->getPosition());
+        // Recorded for Remix's volumetrics, which splits its fog at the water plane per froxel and so needs
+        // the plane rather than a submerged flag. The sentinel has to be far below anything real: the runtime
+        // treats a value under -1e8 as "no water here" and leaves the split inert.
+        mWaterPlaneHeight = mWater->isEnabled() ? mWater->getHeight() : -1.0e9f;
 
         float fogStart = mFog->getFogStart(isUnderwater);
         float fogEnd = mFog->getFogEnd(isUnderwater);

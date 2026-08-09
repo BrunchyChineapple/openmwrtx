@@ -113,6 +113,15 @@ namespace MWRender
 
         void changeCell(const MWWorld::CellStore* store);
         void setHeight(const float height);
+
+        /// World-space height of the water surface, and whether there is any water to speak of.
+        ///
+        /// Both exist for the Remix fog, which splits its medium at the water plane in the shader rather
+        /// than being told whether the camera is submerged. It therefore needs the plane itself, in world
+        /// units, and needs to know when there is no plane at all -- an interior with no water would
+        /// otherwise report whatever height the last cell happened to leave behind.
+        float getHeight() const { return mTop; }
+        bool isEnabled() const { return mEnabled && mToggled; }
         void setRainIntensity(const float rainIntensity);
 
         void update(float dt, bool paused);

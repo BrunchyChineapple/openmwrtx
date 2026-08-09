@@ -195,6 +195,10 @@ namespace MWRender
 
         SkyManager* getSkyManager();
 
+        /// Water surface height for Remix's volumetric water split, or a very low sentinel for no water.
+        /// Taken from the value already computed to configure OpenMW's own fog, so the two cannot disagree.
+        float getWaterPlaneHeight() const { return mWaterPlaneHeight; }
+
         void spawnEffect(VFS::Path::NormalizedView model, std::string_view texture, const osg::Vec3f& worldPosition,
             float scale = 1.f, bool isMagicVFX = true, bool useAmbientLight = true, std::string_view effectId = {},
             bool loop = false);
@@ -356,6 +360,9 @@ namespace MWRender
         float mNearClip;
         float mViewDistance;
         bool mFieldOfViewOverridden;
+        /// Water surface height as of the last update, or a very low sentinel when the cell has no water.
+        /// Published to Remix so its volumetrics can split the medium at the surface.
+        float mWaterPlaneHeight = -1.0e9f;
         float mFieldOfViewOverride;
         float mFieldOfView;
         float mFirstPersonFieldOfView;

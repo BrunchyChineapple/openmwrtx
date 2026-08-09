@@ -38,7 +38,8 @@ namespace MWRender
         /// strings for a dozen options every frame is waste, but more importantly re-pushing the weather
         /// target resets the runtime's blender mid-interpolation, so a preset written unconditionally
         /// would hold the weather permanently at the start of its transition.
-        void update(const SkyManager::State& sky, bool exterior, int weatherId, int nextWeatherId,
+        void update(const SkyManager::State& sky, bool exterior, float waterPlaneHeight, int weatherId,
+            int nextWeatherId,
             float weatherTransition, float viewDistance);
 
     private:
@@ -63,6 +64,10 @@ namespace MWRender
         float mNightSkyBrightness = std::numeric_limits<float>::quiet_NaN();
         float mFogDistance = std::numeric_limits<float>::quiet_NaN();
         float mFroxelDistance = std::numeric_limits<float>::quiet_NaN();
+        float mWaterPlane = std::numeric_limits<float>::quiet_NaN();
+        /// The density/colour decouple is a one-time statement about how this host drives fog, not a
+        /// per-frame value, so it is published once rather than fought over with the developer menu.
+        bool mFogModeSet = false;
         /// The scattering albedo is a property of fog rather than of the weather, so it is written once.
         /// Resending it per frame would also fight anyone tuning it in the developer menu.
         bool mAlbedoSet = false;

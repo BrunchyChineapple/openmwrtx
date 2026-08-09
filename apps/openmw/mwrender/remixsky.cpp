@@ -172,7 +172,8 @@ namespace MWRender
         mRuntime.setConfigVariable(key, value ? "True" : "False");
     }
 
-    void RemixSky::update(const SkyManager::State& sky, bool exterior, int weatherId, int nextWeatherId,
+    void RemixSky::update(const SkyManager::State& sky, bool exterior, float waterPlaneHeight, int weatherId,
+        int nextWeatherId,
         float weatherTransition, float viewDistance)
     {
         if (!mLoggedOnce)
@@ -316,6 +317,27 @@ namespace MWRender
         // and this drives the medium's own parameters instead -- which is the better description anyway,
         // since Remix's volumetrics is a participating medium rather than a distance blend.
         //
+        // The water surface, so the runtime can split its medium at it.
+        //
+        // Remix decides underwater per froxel in the shader by comparing altitude against this plane, rather
+        // than being handed a submerged flag, which is what makes the surface itself look right from either
+        // side. The plane goes in world units along the up axis -- Z here, matching rtx.zUp -- and a value
+        // far below anything real means the cell has no water and leaves the split inert.
+        pushFloat("rtx.volumetrics.waterPlaneWorldZ", waterPlaneHeight, mWaterPlane);
+
+        // Fog density is decoupled from fog colour for this host, permanently.
+        //
+        // Left coupled, extinction comes out as -ln(fogColour)/measurementDistance, so Morrowind's dark
+        // weather fog colours both thicken the fog and eat the daylight -- one number doing two jobs, with no
+        // setting of it that gives thick fog and a lit scene at once. Decoupled, the colour only tints and
+        // the density comes from the reference transmittance, which is what the per-weather day/night values
+        // drive. Published once at startup because it describes the integration rather than the weather.
+        if (!mFogModeSet)
+        {
+            mFogModeSet = true;
+            mRuntime.setConfigVariable("rtx.volumetrics.fogDensityDecoupleFromColor", "True");
+        }
+
         // Three parameters, three separate jobs, and an earlier version of this conflated the first two.
         //
         // singleScatteringAlbedo is NOT a colour. The option's own documentation calls it "the ratio of
