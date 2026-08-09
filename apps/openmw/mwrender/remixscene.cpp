@@ -1572,6 +1572,13 @@ namespace
                 // not reach. The symptom is an actor whose animation runs only while OpenMW's camera
                 // happens to be refreshing it and freezes the moment it does not, which tracks camera
                 // angle and distance rather than anything the animation is doing.
+                //
+                // The node path goes with it because a rig that has never been bound to a skeleton has to be
+                // bound before its pose means anything, and the path is all that takes. Without that the
+                // skin reported not-ready, drawSubmitted dropped the instance, and a freshly rebuilt actor
+                // -- one that just changed equipment, or whose cell just loaded -- was invisible until
+                // OpenMW's own cull reached it. Worn items that are not skinned kept rendering throughout,
+                // which is what made it look like bodies were losing their parts.
                 rig->refreshPose(getNodePath(), static_cast<unsigned int>(mScene.frameNumber()));
             }
 

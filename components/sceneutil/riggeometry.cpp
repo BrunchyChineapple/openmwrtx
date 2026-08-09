@@ -117,10 +117,22 @@ namespace SceneUtil
 
     void RigGeometry::refreshPose(const osg::NodePath& nodePath, unsigned int frame)
     {
-        // No skeleton yet means the skin has not been initialised against one, which needs a NodeVisitor
-        // this entry point does not have. getBoneMatrices reports that as not-ready and the caller drops
-        // the instance for the frame; OpenMW's own traversal resolves it shortly after a cell loads.
-        if (!mSkeleton || !mData)
+        if (!mData)
+            return;
+
+        // Initialise against the skeleton here rather than waiting for a traversal that will.
+        //
+        // This used to give up when mSkeleton was null, on the grounds that finding a skeleton needs a
+        // NodeVisitor. It does not: initFromParentSkeleton reads nothing from the visitor except its node
+        // path, and this entry point is handed the same path. Giving up meant getBoneMatrices reported
+        // not-ready and the caller dropped the instance for the frame -- so an actor whose rig had just been
+        // rebuilt was invisible until OpenMW's own cull happened to reach it. That is why bodies and
+        // creatures blinked out while the items they wore stayed put: worn geometry that is not skinned kept
+        // being submitted, and everything that deforms did not.
+        //
+        // Doing the work here is what OpenMW's own cull already does when it finds no skeleton, so this is
+        // the same recovery one step earlier.
+        if (!mSkeleton && !initFromParentSkeleton(nodePath))
             return;
 
         mSkeleton->refreshBoneMatrices(frame);
@@ -154,7 +166,11 @@ namespace SceneUtil
 
     bool RigGeometry::initFromParentSkeleton(osg::NodeVisitor* nv)
     {
-        const osg::NodePath& path = nv->getNodePath();
+        return initFromParentSkeleton(nv->getNodePath());
+    }
+
+    bool RigGeometry::initFromParentSkeleton(const osg::NodePath& path)
+    {
         for (osg::NodePath::const_reverse_iterator it = path.rbegin() + 1; it != path.rend(); ++it)
         {
             osg::Node* node = *it;

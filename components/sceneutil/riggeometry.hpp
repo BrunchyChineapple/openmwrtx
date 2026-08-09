@@ -97,6 +97,13 @@ namespace SceneUtil
         ///         in which case \a boneMatrices is untouched.
         bool getBoneMatrices(std::vector<osg::Matrixf>& boneMatrices) const;
 
+        /// Finds the parent skeleton along \a path and binds this skin's bones to it.
+        ///
+        /// Split from the NodeVisitor overload because the visitor was never needed for anything but its
+        /// node path, and a traversal that has a path but is neither a cull nor an update visit -- the Remix
+        /// submission, for one -- could not initialise a skin without it.
+        bool initFromParentSkeleton(const osg::NodePath& path);
+
         /// Brings the pose getBoneMatrices reads up to date from a traversal that is neither a cull nor an
         /// update visit.
         ///
