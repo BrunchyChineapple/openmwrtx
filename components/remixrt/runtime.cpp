@@ -1103,7 +1103,7 @@ namespace RemixRT
         unsigned long long textureHash, float roughness, float metallic,
         unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
         int blendType, unsigned long long maskTextureHash, const float* maskTransform,
-        unsigned long long roughnessTextureHash)
+        unsigned long long roughnessTextureHash, unsigned long long emissiveTextureHash)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -1124,6 +1124,9 @@ namespace RemixRT
         wchar_t roughnessPath[32] = {};
         if (roughnessTextureHash != 0)
             std::swprintf(roughnessPath, std::size(roughnessPath), L"0x%llx", roughnessTextureHash);
+        wchar_t emissivePath[32] = {};
+        if (emissiveTextureHash != 0)
+            std::swprintf(emissivePath, std::size(emissivePath), L"0x%llx", emissiveTextureHash);
 
         remixapi_MaterialInfoOpaqueEXT opaque = {};
         opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -1197,10 +1200,16 @@ namespace RemixRT
             material.normalTexture = normalPath;
         if (emissive > 0.0f)
         {
-            // The albedo doubles as the emissive colour, so a flame's own texture drives what it emits
-            // rather than a flat tint. Radiance scale rather than colour, for the same reason the light
-            // conversion separates the two.
-            material.emissiveTexture = pseudoPath;
+            // A glow map when the mesh has one, and the albedo when it does not.
+            //
+            // The albedo standing in is right for a flame quad, where the whole surface emits, and wrong
+            // for everything Morrowind actually ships a glow map for: a lantern, a rune, a glowing pod, all
+            // of which have one emitting region on an otherwise ordinary texture. Handing the albedo over
+            // for those makes the entire object a light source. A glow map is black where it does not emit,
+            // so the multiply does the masking on its own and no separate mask is needed.
+            //
+            // Radiance scale rather than colour, for the same reason the light conversion separates the two.
+            material.emissiveTexture = emissiveTextureHash != 0 ? emissivePath : pseudoPath;
             material.emissiveIntensity = emissive;
             material.emissiveColorConstant = { 1.0f, 1.0f, 1.0f };
         }

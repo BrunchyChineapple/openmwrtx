@@ -263,6 +263,17 @@ namespace
     /// altogether -- it takes no shadow and picks up no bounce colour, so smoke stops behaving like smoke
     /// rather than merely looking too bright.
     constexpr float kParticleEmissive = 6.0f;
+    /// Radiance scale for a surface carrying a glow map.
+    ///
+    /// Well below kParticleEmissive, because the two are doing different jobs. That figure has to make a
+    /// flat quad read as fire across its whole area; a glow map is already black everywhere that should not
+    /// emit, so this only scales the texels that do -- a lantern's glass, a rune, the gills of a glowing
+    /// plant. Overstating it does not make those brighter so much as it turns small bright regions into
+    /// light sources that wash the room and drag auto-exposure down with them.
+    ///
+    /// Tunable through OPENMW_REMIX_GLOW_INTENSITY, because the defensible value depends on the exposure the
+    /// rest of the scene settles at and that is a judgement to make against the screen, not in a header.
+    constexpr float kGlowEmissive = 2.0f;
 
     /// Remix BlendType values, from BlendType in the runtime's surface_shared.h.
     ///
@@ -2220,16 +2231,16 @@ namespace
             // albedo inherited from an outer state set -- which is the right answer, since the parent's
             // diffuse is still the diffuse.
             //
-            // Roles other than diffuse and normal are recognised by OpenMW but not consumed here:
-            // specularMap and glossMap are tagged by ShaderVisitor and would give per-texel roughness
-            // instead of the constant taken from the SurfaceRule table. That is a separate change, because
-            // mapping OpenMW's specular convention onto Remix's roughness and metallic inputs is a
-            // judgement call with visual consequences for every material that ships one.
+            // Four roles are consumed: diffuseMap, normalMap/normalHeightMap, specularMap and emissiveMap.
+            // The rest are recognised by OpenMW and deliberately left alone -- see the note by glossMap at
+            // the end of the loop for why picking up a map because its name sounds right is how the
+            // normal-as-albedo defect happened in the first place.
             const unsigned int units = static_cast<unsigned int>(stateSet.getTextureAttributeList().size());
 
             const osg::Texture2D* taggedDiffuse = nullptr;
             const osg::Texture2D* taggedNormal = nullptr;
             const osg::Texture2D* taggedSpecular = nullptr;
+            const osg::Texture2D* taggedEmissive = nullptr;
             const SceneUtil::TextureType* unitZeroRole = nullptr;
 
             for (unsigned int unit = 0; unit < units; ++unit)
@@ -2265,6 +2276,14 @@ namespace
                 {
                     taggedSpecular = texture;
                 }
+                // The one PBR-ish map vanilla Morrowind actually ships. It comes from a NiTexturingProperty
+                // glow slot rather than a filename pattern, so unlike the normal and specular maps it needs
+                // no texture pack to be present -- lanterns, runes, glowing plants and enchanted items all
+                // carry one in the base game.
+                else if (role == "emissiveMap")
+                {
+                    taggedEmissive = texture;
+                }
                 // "glossMap" is deliberately not read, despite the name. OpenMW multiplies it into the
                 // environment-map term (objects.frag: envEffect *= texture2D(glossMap, ...).xyz), so it is
                 // an env-map mask rather than a glossiness map, and feeding it to roughness would be wrong
@@ -2294,6 +2313,11 @@ namespace
             if (taggedSpecular != nullptr)
             {
                 surface.mSpecularMap = taggedSpecular;
+            }
+
+            if (taggedEmissive != nullptr)
+            {
+                surface.mEmissiveMap = taggedEmissive;
             }
 
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
@@ -3783,6 +3807,25 @@ namespace MWRender
         if (surface.mSpecularMap != nullptr && surface.mSpecularMap->getImage() != nullptr)
             roughnessHash = roughnessTextureFor(*surface.mSpecularMap->getImage());
 
+        // Glow map, uploaded as colour because it names an emitted colour rather than a scalar.
+        //
+        // This is the one map vanilla Morrowind supplies in quantity. It comes from a NiTexturingProperty
+        // glow slot instead of a filename convention, so no texture pack is needed for it to exist -- and
+        // until now OpenMW read it off the mesh, tagged it, and this function dropped it. The runtime's
+        // emissive slot was only ever fed the albedo, and only for additive particles.
+        unsigned long long glowHash = 0;
+        if (surface.mEmissiveMap != nullptr && surface.mEmissiveMap->getImage() != nullptr)
+            glowHash = textureFor(*surface.mEmissiveMap->getImage(), true);
+
+        // A glow map does nothing without an intensity beside it: emissiveIntensity is what decides whether
+        // the runtime treats the material as emitting at all, and every surface arriving here that is not an
+        // additive particle brings zero. A figure the caller supplied still wins, so a flame that also
+        // carries a glow map keeps the particle scale rather than being dimmed to this one.
+        static const float glowIntensity = envFloat("OPENMW_REMIX_GLOW_INTENSITY", kGlowEmissive);
+        float emissiveIntensity = emissive;
+        if (glowHash != 0 && emissiveIntensity <= 0.0f)
+            emissiveIntensity = glowIntensity;
+
         // Terrain layer coverage, uploaded as a linear mask for the runtime's terrain baker to composite.
         //
         // Linear, not colour: this is data, and an sRGB decode applied to a coverage ramp would bend it.
@@ -3844,7 +3887,11 @@ namespace MWRender
         mix(roughnessHash);
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
-        mix(static_cast<unsigned long long>(emissive * 16.0f + 0.5f));
+        mix(static_cast<unsigned long long>(emissiveIntensity * 16.0f + 0.5f));
+        // Folded in for the same reason as the normal and the specular: one albedo appears with a glow map on
+        // one mesh and without on another, and those are two materials. Only materials that carry a glow map
+        // move -- everything else mixes a zero here, exactly as before.
+        mix(glowHash);
         // The coverage mask and its map are part of the material's identity too, and this one is not
         // optional the way the others arguably are: a blend map belongs to a single chunk, so two chunks
         // sharing a land texture need two materials or the second would be drawn with the first's
@@ -3918,8 +3965,8 @@ namespace MWRender
         // specific threshold in another -- and keying on the texture alone collapses each pair onto whichever
         // was created first.
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
-            metallic, alphaTestReference, normalHash, emissive, blendType, maskHash,
-            maskHash != 0 ? maskTransform : nullptr, roughnessHash);
+            metallic, alphaTestReference, normalHash, emissiveIntensity, blendType, maskHash,
+            maskHash != 0 ? maskTransform : nullptr, roughnessHash, glowHash);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
@@ -3932,7 +3979,7 @@ namespace MWRender
         // The normal hash is recorded alongside purely so a release can find this material from either
         // texture. An albedo-only index cannot enumerate the materials that name a normal map, so releasing
         // one would leave a live material pointing at a destroyed texture with nothing to detect it.
-        mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash, maskHash };
+        mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash, glowHash, maskHash };
 
         // Coverage summary, reported every 64 materials rather than per material.
         //
@@ -3949,8 +3996,10 @@ namespace MWRender
             ++mMaterialsWithNormal;
         if (roughnessHash != 0)
             ++mMaterialsWithRoughness;
-        if (emissive > 0.0f)
+        if (emissiveIntensity > 0.0f)
             ++mMaterialsWithEmissive;
+        if (glowHash != 0)
+            ++mMaterialsWithGlow;
 
         if (mMaterialsBuilt - mMaterialSummaryAt >= 64)
         {
@@ -3961,8 +4010,10 @@ namespace MWRender
             Log(Debug::Info) << "[Remix PBR] " << mMaterialsBuilt << " materials built; normal map "
                              << mMaterialsWithNormal << " (" << percent(mMaterialsWithNormal)
                              << "%), roughness from specular " << mMaterialsWithRoughness << " ("
-                             << percent(mMaterialsWithRoughness) << "%), emissive "
-                             << mMaterialsWithEmissive << " (" << percent(mMaterialsWithEmissive) << "%)";
+                             << percent(mMaterialsWithRoughness) << "%), glow map "
+                             << mMaterialsWithGlow << " (" << percent(mMaterialsWithGlow)
+                             << "%), emissive " << mMaterialsWithEmissive << " ("
+                             << percent(mMaterialsWithEmissive) << "%)";
         }
         return handle;
     }
@@ -4356,7 +4407,7 @@ namespace MWRender
             for (auto mat = mMaterialAlbedoHashes.begin(); mat != mMaterialAlbedoHashes.end();)
             {
                 if (mat->second.mAlbedo != hash && mat->second.mNormal != hash
-                    && mat->second.mMask != hash)
+                    && mat->second.mGlow != hash && mat->second.mMask != hash)
                 {
                     ++mat;
                     continue;

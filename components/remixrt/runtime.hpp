@@ -476,11 +476,16 @@ namespace RemixRT
         ///        engine's convention and nothing in the geometry reveals it.
         /// @param roughnessTextureHash per-texel roughness, red channel, linear. Overrides \a roughness
         ///        wherever it is bound; the scalar remains the fallback for surfaces without a map.
+        /// @param emissiveTextureHash optional glow map, uploaded as *colour*, naming which texels emit and
+        ///        in what colour. Zero falls back to the albedo standing in as the emissive colour, which is
+        ///        right for a flame quad -- the whole quad glows -- and wrong for a lantern, where only the
+        ///        glass should. \a emissive still scales it, so this slot decides where the light comes from
+        ///        and that scalar decides how much.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
             unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1,
             unsigned long long maskTextureHash = 0, const float* maskTransform = nullptr,
-            unsigned long long roughnessTextureHash = 0);
+            unsigned long long roughnessTextureHash = 0, unsigned long long emissiveTextureHash = 0);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

@@ -105,6 +105,14 @@ namespace MWRender
             /// which describes a surface by roughness rather than by a specular lobe. See
             /// roughnessTextureFor for the conversion and why the tint is dropped.
             const osg::Texture2D* mSpecularMap = nullptr;
+            /// Glow map, when the mesh provides one.
+            ///
+            /// Morrowind's own way of saying "this part of the surface emits light": a NiTexturingProperty
+            /// glow slot, which OpenMW binds and tags as emissiveMap. It is not a filename convention like
+            /// the normal and specular maps, so it needs no pack to exist -- vanilla meshes carry these on
+            /// lanterns, runes, glowing plants and enchanted items. Uploaded as colour rather than data,
+            /// because it names an emitted colour and not a scalar.
+            const osg::Texture2D* mEmissiveMap = nullptr;
             /// Alpha-test threshold, 0..255. Zero means no cutout, i.e. fully opaque.
             unsigned char mAlphaTestReference = 0;
             /// Whether the surface is alpha blended.
@@ -592,6 +600,11 @@ namespace MWRender
             /// an albedo-only index cannot enumerate, so releasing one would strand a material on a
             /// destroyed texture with no way to notice.
             unsigned long long mNormal = 0;
+            /// The glow map, recorded for the same reason as mNormal. Its image belongs to the scene and can
+            /// die while the albedo lives, so without this the release scan would leave a material naming a
+            /// destroyed texture. The derived roughness map needs no equivalent: those images are owned by
+            /// the cache that builds them and outlive every material that references one.
+            unsigned long long mGlow = 0;
             /// The terrain layer coverage mask, recorded for the same reason as mNormal and with more at
             /// stake. A blend map belongs to one chunk, so these come and go with the terrain rather than
             /// living as long as the session, and every one of them is named by a live material. Leaving
@@ -635,6 +648,9 @@ namespace MWRender
         std::uint64_t mMaterialsWithNormal = 0;
         std::uint64_t mMaterialsWithRoughness = 0;
         std::uint64_t mMaterialsWithEmissive = 0;
+        /// Counted apart from mMaterialsWithEmissive, which a surface also joins by being an additive
+        /// particle. Only this one says the mesh shipped a glow map.
+        std::uint64_t mMaterialsWithGlow = 0;
         std::uint64_t mMaterialSummaryAt = 0;
 
         /// Classifies a texture's path into a surface response, or returns the memoised answer.
