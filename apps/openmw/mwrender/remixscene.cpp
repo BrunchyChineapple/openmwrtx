@@ -1674,7 +1674,15 @@ namespace
             {
                 const auto& passes = terrain->getPasses();
                 if (!passes.empty() && passes.front() != nullptr)
+                {
                     mergeState(*passes.front(), surface);
+
+                    // Assigned only when the pass actually has one, matching how mergeState treats a tagged
+                    // normal, so a layer without a normal map keeps whatever the graph above it established
+                    // rather than being forced back to none.
+                    if (const osg::Texture2D* normal = terrainNormalMap(*passes.front()))
+                        surface.mNormalMap = normal;
+                }
 
                 // Distant chunks need one more step, and this is what was putting white patches along
                 // the horizon.
@@ -1697,6 +1705,29 @@ namespace
                 // materialFor turns blending into a cutout, which would punch the land through wherever
                 // a layer texture happened to carry alpha.
                 surface.mAlphaBlend = false;
+
+                if (terrain->getCompositeMap() != nullptr)
+                    ++sChunksComposite;
+                else
+                    ++sChunksLayered;
+                if (surface.mNormalMap != nullptr)
+                    ++sChunksBaseNormal;
+
+                const unsigned int chunks = sChunksComposite + sChunksLayered;
+                if (chunks >= sNextTerrainReport)
+                {
+                    // Multiplied rather than incremented, so a long session reports a handful of times
+                    // instead of once per fixed block of chunks -- terrain is re-submitted every frame, so a
+                    // fixed interval would fill the log.
+                    sNextTerrainReport = chunks * 4;
+                    const auto percent = [chunks](unsigned int n) { return chunks > 0 ? 100 * n / chunks : 0; };
+                    Log(Debug::Info)
+                        << "[Remix terrain] " << chunks << " chunk submissions; composite "
+                        << sChunksComposite << " (" << percent(sChunksComposite) << "%), per-layer "
+                        << sChunksLayered << " (" << percent(sChunksLayered) << "%); base normal map "
+                        << sChunksBaseNormal << " (" << percent(sChunksBaseNormal) << "%); overlay layers "
+                        << sLayersSubmitted << ", of those with a normal map " << sLayersWithNormal;
+                }
             }
 
             const unsigned long long mesh = mScene.submitGeometry(*geometry, surface, rig);
@@ -1802,6 +1833,12 @@ namespace
                 MWRender::RemixScene::SurfaceState layer = currentSurface();
                 mergeState(*passes[pass], layer);
 
+                // Each overlay layer has its own normal map, at unit 2 of its own pass. Without this the
+                // overlays would inherit the base layer's normal -- or none at all -- and the ground would
+                // keep the base layer's relief wherever another texture was painted over it.
+                if (const osg::Texture2D* normal = terrainNormalMap(*passes[pass]))
+                    layer.mNormalMap = normal;
+
                 // Unit 1 is the blend map -- see components/terrain/material.cpp, which binds the layer
                 // diffuse at unit 0 and the blend map at unit 1 with its own texture matrix. Without an
                 // image behind it there is no coverage to read and the layer would cover the whole chunk
@@ -1899,6 +1936,13 @@ namespace
                 // runtime as an emissive blend, which adds its colour on top of the ground instead of
                 // mixing with it. No amount of correct coverage can look blended through that.
                 layer.mAdditive = false;
+
+                // Counted here rather than where the normal map is read, so these describe layers that were
+                // actually handed to the runtime -- the reads above happen before the coverage tests, which
+                // discard close to half of them.
+                ++sLayersSubmitted;
+                if (layer.mNormalMap != nullptr)
+                    ++sLayersWithNormal;
 
                 const unsigned long long layerMesh = mScene.submitGeometry(geometry, layer, nullptr);
                 if (layerMesh == 0)
@@ -2113,6 +2157,44 @@ namespace
                     surface.mTexMat[i] *= composite.mBaseLayerTiling;
                 surface.mHasTexMat = true;
             }
+        }
+
+        /// What the ground is actually made of, counted over the whole session.
+        ///
+        /// These exist because the per-chunk diagnostic below logs the first two dozen chunks it happens to
+        /// see and then stops, which is too small and too early a sample to conclude anything from: scene
+        /// traversal order decides which chunks those are, and a run in which all of them came back
+        /// composite says nothing about the ground the player is standing on. Session-long counters separate
+        /// the two explanations that look identical on screen -- terrain having no normal maps to give, and
+        /// terrain having them but not passing them on.
+        static inline unsigned int sChunksComposite = 0;
+        static inline unsigned int sChunksLayered = 0;
+        static inline unsigned int sChunksBaseNormal = 0;
+        static inline unsigned int sLayersSubmitted = 0;
+        static inline unsigned int sLayersWithNormal = 0;
+        static inline unsigned int sNextTerrainReport = 4000;
+
+        /// Terrain's normal map, which no role tag identifies.
+        ///
+        /// Terrain::createPasses builds its state sets by hand instead of going through
+        /// Shader::ShaderVisitor, so it attaches no SceneUtil::TextureType to anything -- and mergeState
+        /// identifies maps only by tag, so it finds no normal map on any terrain pass and never has. That is
+        /// the ground looking flat while objects picked their normals up.
+        ///
+        /// The unit is fixed by construction rather than guessed at: components/terrain/material.cpp binds
+        /// the layer diffuse at unit 0, the blend map at unit 1 and the normal map at unit 2, and binds
+        /// nothing else at any unit. Reading unit 2 is therefore exact for terrain and only for terrain,
+        /// which is why this is kept out of mergeState -- unit 2 of an object state set is whatever
+        /// ShaderVisitor happened to put there, and assuming otherwise is how the normal-as-albedo defect
+        /// happened.
+        ///
+        /// Composite passes never carry one, and cannot: they are drawn by the terrain_composite program
+        /// from a render target that was already blended on the GPU, and createPasses skips the normal-map
+        /// branch entirely when building them. Distant chunks therefore stay as they are.
+        static const osg::Texture2D* terrainNormalMap(const osg::StateSet& pass)
+        {
+            return dynamic_cast<const osg::Texture2D*>(
+                pass.getTextureAttribute(2, osg::StateAttribute::TEXTURE));
         }
 
         /// Folds one state set into \a surface. Later calls override earlier ones, which matches OSG's
