@@ -17,6 +17,7 @@ namespace osg
 {
     class Camera;
     class Drawable;
+    class FrameStamp;
     class Geometry;
     class Image;
     class Texture2D;
@@ -27,6 +28,7 @@ namespace SceneUtil
     class LightSource;
     class MorphGeometry;
     class RigGeometry;
+    class StateSetUpdater;
 }
 
 namespace osgParticle
@@ -75,7 +77,22 @@ namespace MWRender
         /// submitted. Returns the number of instances handed over, which is the single most useful
         /// number when the frame comes out empty: zero means the traversal found nothing, and anything
         /// else moves the question downstream.
-        unsigned int submit(osg::Node* sceneRoot, const osg::Camera& camera);
+        /// @param frameStamp the viewer's, needed because the state set controllers evaluated during the
+        ///        traversal read their time from the visitor's frame stamp -- an AutoPlay controller's source
+        ///        is a SceneUtil::FrameTimeSource, which reads simulation time straight off it. Without one
+        ///        those controllers cannot be evaluated at all, and using anything other than the viewer's
+        ///        would run every animated effect on a clock of its own.
+        unsigned int submit(osg::Node* sceneRoot, const osg::Camera& camera, osg::FrameStamp* frameStamp);
+
+        /// A state set for \a updater to write its animated attributes into.
+        ///
+        /// Public because the submission traversal is what discovers these, and it is a separate class.
+        ///
+        /// Seeded with setDefaults on first use, which is not optional: the controllers mutate the attributes
+        /// setDefaults installs rather than adding their own, and UVController::apply static_casts the TexMat
+        /// straight out of the state set and calls setMatrix on it. An unseeded state set is a null
+        /// dereference, not a missing animation.
+        osg::StateSet& animatedStateFor(SceneUtil::StateSetUpdater& updater);
 
         /// Instances submitted on the last call to submit().
         unsigned int lastInstanceCount() const { return mLastInstanceCount; }
@@ -475,6 +492,20 @@ namespace MWRender
 
         /// Releases particle meshes whose system was not submitted this frame.
         void releaseStaleParticleMeshes();
+
+        /// Drops animated state sets whose updater was not visited this frame.
+        ///
+        /// Keyed by a raw updater pointer, so an entry outlives the node it came from. Cells change
+        /// constantly, and without this the map would accumulate one entry per animated effect ever seen.
+        void pruneAnimatedStates();
+
+        /// One animated effect's evaluated state, kept across frames so setDefaults runs once.
+        struct AnimatedState
+        {
+            osg::ref_ptr<osg::StateSet> mStateSet;
+            std::uint64_t mLastUsedFrame = 0;
+        };
+        std::unordered_map<const void*, AnimatedState> mAnimatedStates;
 
         /// One particle system's mesh, rebuilt every frame it is visible.
         struct ParticleMesh

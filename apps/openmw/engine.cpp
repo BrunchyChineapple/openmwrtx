@@ -834,7 +834,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             // Submits the camera and the visible scene together, because they have to agree: the camera
             // goes over as parameters rather than matrices, and geometry in the same units.
-            cameraOk = mRemixScene->submit(mViewer->getSceneData(), *camera) > 0;
+            cameraOk = mRemixScene->submit(mViewer->getSceneData(), *camera, mViewer->getFrameStamp()) > 0;
 
             // The sky is configuration rather than geometry, so it goes separately and its result does not
             // bear on whether there is a scene to raytrace. Driven from the values OpenMW's own sky was

@@ -27,12 +27,14 @@
 #include <osg/BlendFunc>
 #include <osg/Image>
 #include <osg/Light>
+#include <osg/FrameStamp>
 #include <osg/StateSet>
 #include <osg/TexMat>
 #include <osg/Texture2D>
 
 #include <components/debug/debuglog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
+#include <components/sceneutil/statesetupdater.hpp>
 #include <osgParticle/Particle>
 #include <osgParticle/ParticleSystem>
 
@@ -2373,6 +2375,40 @@ namespace
             MWRender::RemixScene::SurfaceState surface = currentSurface();
             if (const osg::StateSet* stateSet = node.getStateSet())
                 mergeState(*stateSet, surface);
+
+            // State that animates, which until now only existed inside OpenMW's cull traversal.
+            //
+            // NIF state set animation -- scrolling UVs, texture flipbooks, alpha and material colour fades --
+            // is driven by SceneUtil::StateSetUpdater. For a node carrying AnimFlag_AutoPlay, which is what
+            // every always-running ambient effect is, nifloader attaches that updater as a *cull* callback
+            // (see nifloader.cpp, the AutoPlay branch). StateSetUpdater::applyCull then writes the result
+            // into a state set it keeps per CullVisitor and pushes onto that visitor's stack -- it never
+            // touches node->getStateSet(). This traversal is not a CullVisitor and reads the node's own state
+            // set, so it saw only the identity matrix setDefaults installed and nothing after it. Every such
+            // effect arrived frozen on its first frame, and an effect whose entire motion IS the animated
+            // state arrived completely static: candle smoke is a plane that moves only by scrolling its UVs.
+            //
+            // Evaluated into a state set this scene owns. The alternatives are worse: the updater's per-cull
+            // map is private, and invoking the callback the way a non-cull visitor would drives its *update*
+            // path, which assigns to the node -- mutating the graph from here would fight the traversal that
+            // legitimately owns it.
+            // Guarded on the frame stamp rather than assuming one: SceneUtil::FrameTimeSource::getValue
+            // dereferences it without checking, so evaluating a controller without one is a crash, not a
+            // frame of missing animation.
+            for (osg::Callback* callback = getFrameStamp() != nullptr ? node.getCullCallback() : nullptr;
+                 callback != nullptr; callback = callback->getNestedCallback())
+            {
+                auto* updater = dynamic_cast<SceneUtil::StateSetUpdater*>(callback);
+                if (updater == nullptr)
+                    continue;
+
+                // Merged after the node's own state set so the animated value wins, which is the precedence
+                // the cull path produces by pushing it on top.
+                osg::StateSet& animated = mScene.animatedStateFor(*updater);
+                updater->apply(&animated, this);
+                mergeState(animated, surface);
+            }
+
             mSurfaceStack.push_back(surface);
         }
 
@@ -2881,7 +2917,30 @@ namespace MWRender
         mRuntime.drawInstance(mProbeMesh, transform, 0, true);
     }
 
-    unsigned int RemixScene::submit(osg::Node* sceneRoot, const osg::Camera& camera)
+    osg::StateSet& RemixScene::animatedStateFor(SceneUtil::StateSetUpdater& updater)
+    {
+        AnimatedState& entry = mAnimatedStates[&updater];
+        if (entry.mStateSet == nullptr)
+        {
+            entry.mStateSet = new osg::StateSet;
+            updater.setDefaults(entry.mStateSet);
+        }
+        entry.mLastUsedFrame = mFrame;
+        return *entry.mStateSet;
+    }
+
+    void RemixScene::pruneAnimatedStates()
+    {
+        for (auto it = mAnimatedStates.begin(); it != mAnimatedStates.end();)
+        {
+            if (it->second.mLastUsedFrame == mFrame)
+                ++it;
+            else
+                it = mAnimatedStates.erase(it);
+        }
+    }
+
+    unsigned int RemixScene::submit(osg::Node* sceneRoot, const osg::Camera& camera, osg::FrameStamp* frameStamp)
     {
         mLastInstanceCount = 0;
         mLastLightCount = 0;
@@ -3018,6 +3077,10 @@ namespace MWRender
                 static_cast<float>(right.z())),
             osg::Vec3f(static_cast<float>(up.x()), static_cast<float>(up.y()), static_cast<float>(up.z())),
             frustum);
+        // The state set controllers evaluated in pushState read their time from this. An AutoPlay
+        // controller's source is a SceneUtil::FrameTimeSource, which takes simulation time straight off the
+        // visitor's frame stamp, so without one there is nothing to evaluate them against.
+        visitor.setFrameStamp(frameStamp);
         const auto traversalStart = std::chrono::steady_clock::now();
         sceneRoot->accept(visitor);
         const auto flushStart = std::chrono::steady_clock::now();
@@ -3062,6 +3125,7 @@ namespace MWRender
         evictStaleMeshes();
         releaseStaleLights();
         releaseStaleParticleMeshes();
+        pruneAnimatedStates();
         // Runs after the traversal, never during it. A destroy issued mid-traversal could be followed by a
         // create of the same hash in the same frame, which the runtime's tombstone set suppresses rather
         // than honours -- that is why the previous attempt at this turned surfaces permanently white.
