@@ -3851,6 +3851,37 @@ namespace MWRender
         // texture. An albedo-only index cannot enumerate the materials that name a normal map, so releasing
         // one would leave a live material pointing at a destroyed texture with nothing to detect it.
         mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash, maskHash };
+
+        // Coverage summary, reported every 64 materials rather than per material.
+        //
+        // The per-material lines above stop at kMaterialLogLimit and describe individual surfaces, which
+        // cannot answer the question that actually matters: how much of this scene's art is supplying PBR
+        // maps at all. A count with no denominator cannot either -- "214 normals" means nothing without
+        // knowing whether that is out of 300 materials or 3000 -- so both are reported together.
+        //
+        // Sixty-four because material creation is bursty: a cell load builds hundreds at once and then the
+        // count sits still for minutes, so a per-material line would flood and a timer would mostly report
+        // nothing new.
+        ++mMaterialsBuilt;
+        if (normalHash != 0)
+            ++mMaterialsWithNormal;
+        if (roughnessHash != 0)
+            ++mMaterialsWithRoughness;
+        if (emissive > 0.0f)
+            ++mMaterialsWithEmissive;
+
+        if (mMaterialsBuilt - mMaterialSummaryAt >= 64)
+        {
+            mMaterialSummaryAt = mMaterialsBuilt;
+            const auto percent = [total = mMaterialsBuilt](std::uint64_t n) {
+                return total != 0 ? static_cast<int>((n * 100 + total / 2) / total) : 0;
+            };
+            Log(Debug::Info) << "[Remix PBR] " << mMaterialsBuilt << " materials built; normal map "
+                             << mMaterialsWithNormal << " (" << percent(mMaterialsWithNormal)
+                             << "%), roughness from specular " << mMaterialsWithRoughness << " ("
+                             << percent(mMaterialsWithRoughness) << "%), emissive "
+                             << mMaterialsWithEmissive << " (" << percent(mMaterialsWithEmissive) << "%)";
+        }
         return handle;
     }
 

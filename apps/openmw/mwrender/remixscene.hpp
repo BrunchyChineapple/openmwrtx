@@ -624,6 +624,19 @@ namespace MWRender
         /// every upload that refers to it. A specular map shared by many meshes is converted once.
         std::unordered_map<const osg::Image*, osg::ref_ptr<osg::Image>> mDerivedRoughness;
 
+        /// Running tally of what the materials actually ended up carrying.
+        ///
+        /// Exists because "are the PBR textures being used" was previously answerable only by looking at a
+        /// screenshot and guessing. The per-material log lines stop after a fixed limit and say nothing
+        /// about coverage, so a pack supplying maps for a tenth of its textures and one supplying none look
+        /// identical from the outside. These are reported as a proportion of materials built, which is the
+        /// number that distinguishes "not wired up" from "wired up, and this scene has few maps".
+        std::uint64_t mMaterialsBuilt = 0;
+        std::uint64_t mMaterialsWithNormal = 0;
+        std::uint64_t mMaterialsWithRoughness = 0;
+        std::uint64_t mMaterialsWithEmissive = 0;
+        std::uint64_t mMaterialSummaryAt = 0;
+
         /// Classifies a texture's path into a surface response, or returns the memoised answer.
         ///
         /// Worth memoising because it is pure string work -- a lowercased copy of the path, then a
