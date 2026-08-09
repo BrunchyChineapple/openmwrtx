@@ -68,7 +68,19 @@ namespace
     constexpr std::uint64_t kMeshEvictionFrames = 30;
 
     /// Ceiling on destroyMesh calls in one frame. See evictStaleMeshes for why a ceiling is needed at all.
-    constexpr unsigned int kMeshDestroysPerFrame = 64;
+    ///
+    /// Has to be read together with kMeshBuildsPerFrame, because the two are the inflow and the outflow of
+    /// the same cache and a mismatch is unbounded growth rather than a slower steady state. Measured over a
+    /// long session: around 250 meshes built every frame -- morph geometry and particles re-hash constantly,
+    /// since the API offers createMesh with no update counterpart -- against 64 retired. The cache climbed
+    /// from nothing to 393,689 entries and was still gaining 26,940 per report at the end, dipping
+    /// occasionally but never catching up.
+    ///
+    /// Matched to the build ceiling rather than set to some fraction of it. A destroy releases an
+    /// acceleration structure where a build constructs one, so retirement is the cheaper direction; there is
+    /// no reason for it to be the narrower one. The device-stall concern that put a ceiling here in the first
+    /// place is about retiring thousands at once with no frame submitted in between, which this still bounds.
+    constexpr unsigned int kMeshDestroysPerFrame = 512;
 
     /// Ceiling on createMesh calls in one frame.
     ///
