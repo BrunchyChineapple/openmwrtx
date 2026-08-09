@@ -443,6 +443,15 @@ namespace MWRender
             // Keep link to original mesh to keep it in cache
             group->getOrCreateUserDataContainer()->addUserObject(new Resource::TemplateRef(temp));
 
+            // Which grass model this subtree came from, recorded for the Remix submission path.
+            //
+            // Grass reaches Remix as one mesh per model plus an instance per copy, and a replacement pack is
+            // keyed on that mesh's hash. In the toolkit those hashes are anonymous, so swapping a region's
+            // grass for other assets means matching hundreds of them by trial and error. This is the only
+            // place both facts are known at once -- the path here, the hash at submission -- so the path is
+            // carried on the node for the submission to read back and report the pairing.
+            node->setUserValue("remixGroundcoverModel", std::string(model.value()));
+
             InstancingVisitor visitor(entries, worldCenter);
             node->accept(visitor);
             group->addChild(node);

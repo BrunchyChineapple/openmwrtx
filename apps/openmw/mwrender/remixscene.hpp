@@ -84,6 +84,14 @@ namespace MWRender
         ///        would run every animated effect on a clock of its own.
         unsigned int submit(osg::Node* sceneRoot, const osg::Camera& camera, osg::FrameStamp* frameStamp);
 
+        /// Records a grass model against the mesh hash a replacement pack would bind to, and logs the pairing
+        /// the first time each mesh is seen.
+        ///
+        /// One line per distinct grass model rather than per frame or per chunk: there are a few hundred
+        /// groundcover models installed and only the handful in the current region are ever submitted, so this
+        /// amounts to a short list of exactly what a region's grass consists of.
+        void noteGroundcoverModel(unsigned long long mesh, const std::string& model, unsigned int copies);
+
         /// A state set for \a updater to write its animated attributes into.
         ///
         /// Public because the submission traversal is what discovers these, and it is a separate class.
@@ -506,6 +514,8 @@ namespace MWRender
             std::uint64_t mLastUsedFrame = 0;
         };
         std::unordered_map<const void*, AnimatedState> mAnimatedStates;
+        /// Grass mesh hashes already reported, so the pairing is logged once per model rather than per frame.
+        std::unordered_set<unsigned long long> mLoggedGroundcoverModels;
 
         /// One particle system's mesh, rebuilt every frame it is visible.
         struct ParticleMesh

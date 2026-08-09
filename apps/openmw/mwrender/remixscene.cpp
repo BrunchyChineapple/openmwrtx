@@ -2062,6 +2062,22 @@ namespace
             if (offsets == nullptr || offsets->size() < copies)
                 return false;
 
+            // Report which grass model this mesh is, once per mesh.
+            //
+            // The hash is what a replacement pack binds to and the model path is what a person can recognise;
+            // pairing them is the difference between authoring a region's grass and guessing at hashes. The
+            // path is tagged onto the cloned subtree by Groundcover::createChunk, so it sits above this
+            // drawable in the traversal's node path.
+            for (auto it = getNodePath().rbegin(); it != getNodePath().rend(); ++it)
+            {
+                std::string model;
+                if ((*it)->getUserValue("remixGroundcoverModel", model))
+                {
+                    mScene.noteGroundcoverModel(mesh, model, copies);
+                    break;
+                }
+            }
+
             static const bool enabled = envFlag("OPENMW_REMIX_GROUNDCOVER", true);
             // Bounded by the per-frame instance ceiling, because that is what this budget counts: one
             // grass copy is one instance, and the loop below is already stopped by kMaxInstancesPerFrame.
@@ -2915,6 +2931,16 @@ namespace MWRender
         }
 
         mRuntime.drawInstance(mProbeMesh, transform, 0, true);
+    }
+
+    void RemixScene::noteGroundcoverModel(
+        unsigned long long mesh, const std::string& model, unsigned int copies)
+    {
+        if (!mLoggedGroundcoverModels.insert(mesh).second)
+            return;
+
+        Log(Debug::Info) << "[Remix grass] " << model << " -> mesh 0x" << std::hex << mesh << std::dec
+                         << ", " << copies << " copies in the chunk that introduced it";
     }
 
     osg::StateSet& RemixScene::animatedStateFor(SceneUtil::StateSetUpdater& updater)
