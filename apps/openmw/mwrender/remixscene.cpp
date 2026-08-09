@@ -2073,7 +2073,13 @@ namespace
                 std::string model;
                 if ((*it)->getUserValue("remixGroundcoverModel", model))
                 {
-                    mScene.noteGroundcoverModel(mesh, model, copies);
+                    // The blade's own size, which is what a replacement asset has to be matched against.
+                    // Taken from the geometry rather than the instance, so the per-copy scale is excluded.
+                    const osg::BoundingBox& box = geometry.getBoundingBox();
+                    const float extent[3] = { box.valid() ? box.xMax() - box.xMin() : 0.0f,
+                        box.valid() ? box.yMax() - box.yMin() : 0.0f,
+                        box.valid() ? box.zMax() - box.zMin() : 0.0f };
+                    mScene.noteGroundcoverModel(mesh, model, copies, extent);
                     break;
                 }
             }
@@ -2933,14 +2939,15 @@ namespace MWRender
         mRuntime.drawInstance(mProbeMesh, transform, 0, true);
     }
 
-    void RemixScene::noteGroundcoverModel(
-        unsigned long long mesh, const std::string& model, unsigned int copies)
+    void RemixScene::noteGroundcoverModel(unsigned long long mesh, const std::string& model,
+        unsigned int copies, const float (&extent)[3])
     {
         if (!mLoggedGroundcoverModels.insert(mesh).second)
             return;
 
         Log(Debug::Info) << "[Remix grass] " << model << " -> mesh 0x" << std::hex << mesh << std::dec
-                         << ", " << copies << " copies in the chunk that introduced it";
+                         << ", " << copies << " copies in the chunk that introduced it; blade extent "
+                         << extent[0] << " x " << extent[1] << " x " << extent[2] << " units";
     }
 
     osg::StateSet& RemixScene::animatedStateFor(SceneUtil::StateSetUpdater& updater)

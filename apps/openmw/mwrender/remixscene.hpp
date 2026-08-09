@@ -90,7 +90,11 @@ namespace MWRender
         /// One line per distinct grass model rather than per frame or per chunk: there are a few hundred
         /// groundcover models installed and only the handful in the current region are ever submitted, so this
         /// amounts to a short list of exactly what a region's grass consists of.
-        void noteGroundcoverModel(unsigned long long mesh, const std::string& model, unsigned int copies);
+        /// @param extent the blade's own width, depth and height in game units, before any per-copy scale.
+        ///        Reported because a replacement asset has to be scaled to match it, and guessing that factor
+        ///        costs a build and a play session per attempt where measuring costs neither.
+        void noteGroundcoverModel(unsigned long long mesh, const std::string& model, unsigned int copies,
+            const float (&extent)[3]);
 
         /// A state set for \a updater to write its animated attributes into.
         ///
