@@ -4298,10 +4298,41 @@ namespace MWRender
             if (!(half > 0.0f))
                 continue;
 
-            const osg::Vec3f across = cameraRight * half;
-            const osg::Vec3f down = cameraUp * half;
+            // Rotated in the billboard plane by the particle's own angle, which osgParticle integrates from
+            // the NIF's rotation speed. Without it every puff in a plume shares the camera basis exactly, so
+            // thirty quads read as one sprite stamped thirty times instead of a turning volume.
+            osg::Vec3f across = cameraRight * half;
+            osg::Vec3f down = cameraUp * half;
+            if (const float angle = particle->getAngle().z(); angle != 0.0f)
+            {
+                const float cosine = std::cos(angle);
+                const float sine = std::sin(angle);
+                const osg::Vec3f rotatedAcross = across * cosine + down * sine;
+                down = down * cosine - across * sine;
+                across = rotatedAcross;
+            }
             // Facing the camera, which for a billboard is the direction the quad is built against.
             const osg::Vec3f normal = (cameraRight ^ cameraUp);
+
+            // The particle's own colour, and more importantly its alpha.
+            //
+            // osgParticle interpolates both across a particle's lifetime, and that fade is how a puff appears
+            // and dissipates. Left at the zero a default-constructed Vertex carries, every particle was
+            // handed black at zero alpha and none of the lifetime shaping reached the runtime at all -- which
+            // is not a subtle loss, since Remix binds this as color0 in B8G8R8A8_UNORM and the struct is
+            // layout-compatible with remixapi_HardcodedVertex, so it is read verbatim.
+            //
+            // Colour and alpha are separate in osgParticle -- _current_color carries the colour range and
+            // _current_alpha the alpha range -- and are combined by multiplying, which is what its own
+            // rendering does. Multiplying also means whichever of the two a NIF actually animates comes
+            // through, rather than depending on which one it chose.
+            const osg::Vec4f particleColour = particle->getCurrentColor();
+            const auto toByte = [](float value) {
+                return static_cast<unsigned int>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+            };
+            const unsigned int packedColour = (toByte(particleColour.w() * particle->getCurrentAlpha()) << 24)
+                | (toByte(particleColour.x()) << 16) | (toByte(particleColour.y()) << 8)
+                | toByte(particleColour.z());
 
             const unsigned int base = static_cast<unsigned int>(mVertexScratch.size());
             const osg::Vec3f corners[4] = { centre - across - down, centre + across - down,
@@ -4319,6 +4350,7 @@ namespace MWRender
                 vertex.mNormal[2] = normal.z();
                 vertex.mTexcoord[0] = texcoords[corner][0];
                 vertex.mTexcoord[1] = texcoords[corner][1];
+                vertex.mColor = packedColour;
                 mVertexScratch.push_back(vertex);
             }
 
