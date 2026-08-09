@@ -2147,6 +2147,7 @@ namespace
 
             const osg::Texture2D* taggedDiffuse = nullptr;
             const osg::Texture2D* taggedNormal = nullptr;
+            const osg::Texture2D* taggedSpecular = nullptr;
             const SceneUtil::TextureType* unitZeroRole = nullptr;
 
             for (unsigned int unit = 0; unit < units; ++unit)
@@ -2178,6 +2179,16 @@ namespace
                 {
                     taggedNormal = texture;
                 }
+                else if (role == "specularMap")
+                {
+                    taggedSpecular = texture;
+                }
+                // "glossMap" is deliberately not read, despite the name. OpenMW multiplies it into the
+                // environment-map term (objects.frag: envEffect *= texture2D(glossMap, ...).xyz), so it is
+                // an env-map mask rather than a glossiness map, and feeding it to roughness would be wrong
+                // in a way that looks plausible. Nor are darkMap, detailMap, decalMap, bumpMap or envMap
+                // consumed: each needs its own decision about where it belongs, and guessing is what
+                // produced the normal-as-albedo defect above.
             }
 
             if (taggedDiffuse != nullptr)
@@ -2196,6 +2207,11 @@ namespace
             if (taggedNormal != nullptr)
             {
                 surface.mNormalMap = taggedNormal;
+            }
+
+            if (taggedSpecular != nullptr)
+            {
+                surface.mSpecularMap = taggedSpecular;
             }
 
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
@@ -3064,6 +3080,57 @@ namespace MWRender
         return meshFor(geometry, materialFor(surface), surface, rig);
     }
 
+    unsigned long long RemixScene::roughnessTextureFor(const osg::Image& specular)
+    {
+        if (auto found = mDerivedRoughness.find(&specular); found != mDerivedRoughness.end())
+            return found->second != nullptr ? textureFor(*found->second, false) : 0;
+
+        // Only uncompressed sources are converted, because the conversion is per-texel and this code does
+        // not decode block formats. A specular map is small and mods ship them uncompressed far more often
+        // than not; a compressed one simply keeps the constant roughness from the surface rule, which is
+        // the behaviour that existed before any of this. Recorded as a null entry so the same image is not
+        // examined again every frame.
+        const GLenum pixelFormat = specular.getPixelFormat();
+        const bool convertible = specular.getDataType() == GL_UNSIGNED_BYTE
+            && (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA)
+            && specular.data() != nullptr && specular.s() > 0 && specular.t() > 0;
+        if (!convertible)
+        {
+            mDerivedRoughness.emplace(&specular, osg::ref_ptr<osg::Image>());
+            return 0;
+        }
+
+        osg::ref_ptr<osg::Image> derived = new osg::Image;
+        derived->allocateImage(specular.s(), specular.t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        derived->setInternalTextureFormat(GL_RGBA8);
+        // Named so the surface-rule classifier and any log line have something meaningful to show; the
+        // suffix keeps it from colliding with the source in a rule match.
+        derived->setFileName(specular.getFileName() + "@roughness");
+
+        const unsigned char* src = specular.data();
+        unsigned char* dst = derived->data();
+        const int texels = specular.s() * specular.t();
+        // Alpha is the last byte in both RGBA and BGRA, which is the only channel read here, so the two
+        // formats need no separate handling.
+        for (int i = 0; i < texels; ++i)
+        {
+            // objects.frag reads a normalised alpha and multiplies by 255 to recover the exponent, so the
+            // stored byte is already the shininess and no rescaling is needed.
+            const float shininess = static_cast<float>(src[i * 4 + 3]);
+            // Blinn-Phong exponent to GGX roughness. Clamped away from zero so a fully smooth texel does
+            // not produce a perfectly specular surface, which reads as a mirror and fireflies badly.
+            const float roughness = std::clamp(std::sqrt(2.0f / (shininess + 2.0f)), 0.03f, 1.0f);
+            const auto value = static_cast<unsigned char>(std::lround(roughness * 255.0f));
+            dst[i * 4 + 0] = value; // red: the channel the runtime samples
+            dst[i * 4 + 1] = value;
+            dst[i * 4 + 2] = value;
+            dst[i * 4 + 3] = 255;
+        }
+
+        const osg::Image* stored = mDerivedRoughness.emplace(&specular, derived).first->second.get();
+        return textureFor(*stored, false);
+    }
+
     unsigned long long RemixScene::textureFor(const osg::Image& image, bool colour)
     {
         // Keyed on the image *and* the colour interpretation. The same bytes uploaded as sRGB and as
@@ -3624,6 +3691,16 @@ namespace MWRender
         if (surface.mNormalMap != nullptr && surface.mNormalMap->getImage() != nullptr)
             normalHash = textureFor(*surface.mNormalMap->getImage(), false);
 
+        // Per-texel roughness, derived from the mesh's specular map when it has one.
+        //
+        // Without this every surface took the single constant above, classified from the texture's file
+        // path by kSurfaceRules -- so a texture pack shipping real specular data had it discarded and got a
+        // guess based on its name instead. The constant remains the fallback and still feeds
+        // roughnessConstant, which the runtime uses wherever no map is bound.
+        unsigned long long roughnessHash = 0;
+        if (surface.mSpecularMap != nullptr && surface.mSpecularMap->getImage() != nullptr)
+            roughnessHash = roughnessTextureFor(*surface.mSpecularMap->getImage());
+
         // Terrain layer coverage, uploaded as a linear mask for the runtime's terrain baker to composite.
         //
         // Linear, not colour: this is data, and an sRGB decode applied to a coverage ramp would bend it.
@@ -3680,6 +3757,9 @@ namespace MWRender
         // would collide on one cache entry, and whichever was built first would win for both.
         mix(static_cast<unsigned long long>(blendType + 1));
         mix(normalHash);
+        // Folded in for the same reason as the normal: one albedo can appear with a specular map on one
+        // mesh and without on another, and those are different materials.
+        mix(roughnessHash);
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(emissive * 16.0f + 0.5f));
@@ -3757,7 +3837,7 @@ namespace MWRender
         // was created first.
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
             metallic, alphaTestReference, normalHash, emissive, blendType, maskHash,
-            maskHash != 0 ? maskTransform : nullptr);
+            maskHash != 0 ? maskTransform : nullptr, roughnessHash);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.

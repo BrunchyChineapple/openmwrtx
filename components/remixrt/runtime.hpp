@@ -474,10 +474,13 @@ namespace RemixRT
         ///        scaled up to tile the diffuse, while the blend map is sampled through an inset of its
         ///        own. Sent rather than left for the runtime to work out, because the inset is this
         ///        engine's convention and nothing in the geometry reveals it.
+        /// @param roughnessTextureHash per-texel roughness, red channel, linear. Overrides \a roughness
+        ///        wherever it is bound; the scalar remains the fallback for surfaces without a map.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
             unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1,
-            unsigned long long maskTextureHash = 0, const float* maskTransform = nullptr);
+            unsigned long long maskTextureHash = 0, const float* maskTransform = nullptr,
+            unsigned long long roughnessTextureHash = 0);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///

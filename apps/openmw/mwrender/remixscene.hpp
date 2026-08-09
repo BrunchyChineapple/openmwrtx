@@ -98,6 +98,13 @@ namespace MWRender
             /// Albedo texture, or null for the untextured fallback material. Const because it is read
             /// out of state sets reached through const traversal; nothing here modifies the scene.
             const osg::Texture2D* mTexture = nullptr;
+            /// Specular map, when the mesh provides one.
+            ///
+            /// OpenMW stores a Blinn-Phong exponent in the alpha channel (objects.frag: shininess =
+            /// specTex.a * 255) and a specular tint in RGB. Only the exponent has anywhere to go in Remix,
+            /// which describes a surface by roughness rather than by a specular lobe. See
+            /// roughnessTextureFor for the conversion and why the tint is dropped.
+            const osg::Texture2D* mSpecularMap = nullptr;
             /// Alpha-test threshold, 0..255. Zero means no cutout, i.e. fully opaque.
             unsigned char mAlphaTestReference = 0;
             /// Whether the surface is alpha blended.
@@ -505,6 +512,22 @@ namespace MWRender
         ///        supposed to be vector components tilts every normal toward the surface.
         unsigned long long textureFor(const osg::Image& image, bool colour);
 
+        /// Uploads a roughness texture derived from a specular map, and returns its identity.
+        ///
+        /// OpenMW's specular map is not a roughness map and cannot be handed over as one: its alpha holds a
+        /// Blinn-Phong exponent, so bright means *smooth*, which is the inverse of what Remix reads. The
+        /// conversion is the standard one, roughness = sqrt(2 / (shininess + 2)), evaluated per texel into
+        /// the red channel because that is the channel the runtime samples
+        /// (opaque_surface_material_interaction.slangh: `roughness = roughnessSample.x`).
+        ///
+        /// The RGB specular tint is discarded. Remix's opaque material is a metalness workflow and has no
+        /// specular-colour input, so there is nothing honest to map it to; inventing metallic from its
+        /// luminance would turn every shiny painted surface into metal.
+        ///
+        /// Derived images are cached and owned here, because textureFor keys its upload cache on the image
+        /// address and a temporary would both churn uploads and alias freed memory.
+        unsigned long long roughnessTextureFor(const osg::Image& specular);
+
         /// Releases meshes not submitted for a while.
         void evictStaleMeshes();
 
@@ -594,6 +617,12 @@ namespace MWRender
         /// Keyed by osg::Image address, with the same never-evicted lifetime reasoning as mTextures above:
         /// the answer depends only on the image's own filename, which does not change while it is alive.
         std::unordered_map<const osg::Image*, CachedSurfaceResponse> mSurfaceResponses;
+
+        /// Roughness images derived from specular maps, keyed on the specular image they came from.
+        ///
+        /// Owns them: textureFor keys its cache on the image address, so a derived image has to outlive
+        /// every upload that refers to it. A specular map shared by many meshes is converted once.
+        std::unordered_map<const osg::Image*, osg::ref_ptr<osg::Image>> mDerivedRoughness;
 
         /// Classifies a texture's path into a surface response, or returns the memoised answer.
         ///

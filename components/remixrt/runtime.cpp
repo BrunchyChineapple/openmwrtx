@@ -1102,7 +1102,8 @@ namespace RemixRT
     unsigned long long Runtime::createTexturedMaterial(unsigned long long hash,
         unsigned long long textureHash, float roughness, float metallic,
         unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
-        int blendType, unsigned long long maskTextureHash, const float* maskTransform)
+        int blendType, unsigned long long maskTextureHash, const float* maskTransform,
+        unsigned long long roughnessTextureHash)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -1120,6 +1121,9 @@ namespace RemixRT
         wchar_t maskPath[32] = {};
         if (maskTextureHash != 0)
             std::swprintf(maskPath, std::size(maskPath), L"0x%llx", maskTextureHash);
+        wchar_t roughnessPath[32] = {};
+        if (roughnessTextureHash != 0)
+            std::swprintf(roughnessPath, std::size(roughnessPath), L"0x%llx", roughnessTextureHash);
 
         remixapi_MaterialInfoOpaqueEXT opaque = {};
         opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -1129,6 +1133,12 @@ namespace RemixRT
         opaque.opacityConstant = 1.0f;
         opaque.roughnessConstant = roughness;
         opaque.metallicConstant = metallic;
+        // A bound roughness map supersedes the constant per texel; the constant still covers every surface
+        // without one, which is most of Morrowind's art. The runtime samples the red channel
+        // (opaque_surface_material_interaction.slangh: `roughness = roughnessSample.x`), which is what
+        // RemixScene::roughnessTextureFor writes.
+        if (roughnessTextureHash != 0)
+            opaque.roughnessTexture = roughnessPath;
         // See createFlatMaterial: zero is kNever, which rejects every hit and makes the surface
         // invisible. kAlways when no cutout is wanted, kGreater when one is.
         opaque.alphaTestType = alphaTestReference != 0 ? 4 /* kGreater */ : 7 /* kAlways */;
