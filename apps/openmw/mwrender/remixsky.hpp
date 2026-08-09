@@ -62,6 +62,7 @@ namespace MWRender
         float mStarBrightness = std::numeric_limits<float>::quiet_NaN();
         float mNightSkyBrightness = std::numeric_limits<float>::quiet_NaN();
         float mFogDistance = std::numeric_limits<float>::quiet_NaN();
+        float mFroxelDistance = std::numeric_limits<float>::quiet_NaN();
         /// Held as the formatted string rather than three floats, because the option is written as one
         /// vector and comparing the formatted form is what decides whether a write is needed. Empty means
         /// nothing written yet, which no formatted colour can equal.

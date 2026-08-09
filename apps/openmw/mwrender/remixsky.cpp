@@ -296,6 +296,27 @@ namespace MWRender
             // the medium's own terms.
             const float distance = span > 1.0f ? span / kUnitsPerMetre : 100000.0f;
             pushFloat("rtx.volumetrics.transmittanceMeasurementDistanceMeters", distance, mFogDistance);
+
+            // How far the medium actually exists, which the density above says nothing about.
+            //
+            // The froxel grid is what carries volumetric scattering, and rtx.volumetrics
+            // .froxelMaxDistanceMeters defaults to 20 metres -- 2860 units at this scene scale, against a
+            // Morrowind view distance of tens of thousands. Everything past that bubble has no participating
+            // medium at all, whatever density it was given, which is why the fog read as present but barely
+            // volumetric: only the ground at the player's feet was inside it.
+            //
+            // Costed before being widened, because the obvious worry is that a bigger volume is a more
+            // expensive one. It is not: the grid's resolution is fixed by froxelGridResolutionScale and
+            // froxelDepthSlices, so this changes what each cell covers rather than how many there are. The
+            // trade is near-field detail for far-field coverage, and froxelDepthSliceDistributionExponent is
+            // 2.0, which already biases slices toward the camera and softens that trade.
+            //
+            // Held just inside the far plane rather than at it. The option's own documentation warns the
+            // grid clips to the far plane if it reaches past it, and OpenMW's far plane is the view
+            // distance, so asking for exactly that invites the clip this is trying to avoid.
+            constexpr float kFroxelCoverage = 0.95f;
+            const float froxelMetres = std::max(20.0f, viewDistance * kFroxelCoverage / kUnitsPerMetre);
+            pushFloat("rtx.volumetrics.froxelMaxDistanceMeters", froxelMetres, mFroxelDistance);
         }
 
         // The weather preset drives the runtime's own blender, which interpolates between presets on its
