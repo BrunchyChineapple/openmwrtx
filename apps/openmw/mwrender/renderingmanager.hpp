@@ -195,6 +195,14 @@ namespace MWRender
 
         SkyManager* getSkyManager();
 
+        /// Whether the camera was under water as of the last update.
+        ///
+        /// Exposed for the Remix fog, which needs to know that the medium is water rather than air. The
+        /// answer is already computed every frame to configure OpenMW's own fog, so this reports that rather
+        /// than testing again -- two tests could disagree for a frame at the surface, which is exactly where
+        /// a fog change is most visible.
+        bool isUnderwater() const { return mIsUnderwater; }
+
         void spawnEffect(VFS::Path::NormalizedView model, std::string_view texture, const osg::Vec3f& worldPosition,
             float scale = 1.f, bool isMagicVFX = true, bool useAmbientLight = true, std::string_view effectId = {},
             bool loop = false);
@@ -356,6 +364,7 @@ namespace MWRender
         float mNearClip;
         float mViewDistance;
         bool mFieldOfViewOverridden;
+        bool mIsUnderwater = false;
         float mFieldOfViewOverride;
         float mFieldOfView;
         float mFirstPersonFieldOfView;

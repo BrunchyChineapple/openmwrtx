@@ -172,7 +172,8 @@ namespace MWRender
         mRuntime.setConfigVariable(key, value ? "True" : "False");
     }
 
-    void RemixSky::update(const SkyManager::State& sky, bool exterior, int weatherId, int nextWeatherId,
+    void RemixSky::update(const SkyManager::State& sky, bool exterior, bool underwater, int weatherId,
+        int nextWeatherId,
         float weatherTransition, float viewDistance)
     {
         if (!mLoggedOnce)
@@ -316,6 +317,62 @@ namespace MWRender
         // and this drives the medium's own parameters instead -- which is the better description anyway,
         // since Remix's volumetrics is a participating medium rather than a distance blend.
         //
+        // Which condition the fog is in, published so the runtime can apply that condition's own density and
+        // tint on top of what is driven below.
+        //
+        // Decided here rather than in the runtime because everything it needs is on this side: the cell type,
+        // whether the camera is in water, and where the sun is. The runtime only has a medium.
+        //
+        // Sunrise and sunset occupy the same band of elevations and differ only in which way the sun is
+        // moving through it, so direction is tracked rather than the clock being read. That keeps it correct
+        // when a mod changes the day length or a script sets the time outright, neither of which a fixed pair
+        // of hours would survive.
+        {
+            // Wide enough to cover the part of the sky's colour change that reads as dawn or dusk, rather
+            // than the astronomical definition, since this exists to hang a look on.
+            constexpr float kTwilightDegrees = 10.0f;
+
+            // Matches the runtime's FogCondition enum in rtx_global_volumetrics.h. Kept as plain ints
+            // because the runtime's headers are not visible from here -- the two agreeing is a contract, so
+            // the names are spelled out rather than left as bare numbers at the call site.
+            enum Condition
+            {
+                Interior = 0,
+                Night = 1,
+                Sunrise = 2,
+                Day = 3,
+                Sunset = 4,
+                Underwater = 5,
+            };
+
+            const float elevation = mSunElevation;
+            const bool rising = !(elevation < mPrevSunElevation); // NaN-safe: an unknown previous reads as rising
+
+            int condition;
+            // Underwater first, and above the interior test: submerged in an interior is still water, and
+            // water is the condition that least resembles any air preset.
+            if (underwater)
+                condition = Underwater;
+            else if (!exterior)
+                condition = Interior;
+            else if (!(elevation > -kTwilightDegrees)) // NaN falls through to Night, matching an unlit sky
+                condition = Night;
+            else if (elevation < kTwilightDegrees)
+                condition = rising ? Sunrise : Sunset;
+            else
+                condition = Day;
+
+            if (condition != mFogCondition)
+            {
+                mFogCondition = condition;
+                char value[16];
+                std::snprintf(value, sizeof(value), "%d", condition);
+                mRuntime.setConfigVariable("rtx.volumetrics.condition.activeCondition", value);
+            }
+
+            mPrevSunElevation = elevation;
+        }
+
         // Three parameters, three separate jobs, and an earlier version of this conflated the first two.
         //
         // singleScatteringAlbedo is NOT a colour. The option's own documentation calls it "the ratio of

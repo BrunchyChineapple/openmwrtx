@@ -732,6 +732,9 @@ namespace MWRender
         mCamera->update(dt, paused);
 
         bool isUnderwater = mWater->isUnderwater(mCamera->getPosition());
+        // Kept so the Remix fog can ask. It is decided here from the camera position rather than the
+        // player's, which is the distinction that matters in third person with the camera above the surface.
+        mIsUnderwater = isUnderwater;
 
         float fogStart = mFog->getFogStart(isUnderwater);
         float fogEnd = mFog->getFogEnd(isUnderwater);

@@ -849,7 +849,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 {
                     const MWWorld::Weather* next = world->getNextWeather();
                     mRemixSky->update(sky->getState(), world->isCellExterior(),
-                        world->getCurrentWeatherScriptId(),
+                        rendering->isUnderwater(), world->getCurrentWeatherScriptId(),
                         next != nullptr ? next->mScriptId : -1, world->getWeatherTransition(),
                         Settings::camera().mViewingDistance);
                 }
