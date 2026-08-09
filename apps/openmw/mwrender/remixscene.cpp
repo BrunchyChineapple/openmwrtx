@@ -2073,13 +2073,38 @@ namespace
                 std::string model;
                 if ((*it)->getUserValue("remixGroundcoverModel", model))
                 {
-                    // The blade's own size, which is what a replacement asset has to be matched against.
-                    // Taken from the geometry rather than the instance, so the per-copy scale is excluded.
-                    const osg::BoundingBox& box = geometry.getBoundingBox();
-                    const float extent[3] = { box.valid() ? box.xMax() - box.xMin() : 0.0f,
-                        box.valid() ? box.yMax() - box.yMin() : 0.0f,
-                        box.valid() ? box.zMax() - box.zMin() : 0.0f };
-                    mScene.noteGroundcoverModel(mesh, model, copies, extent);
+                    // The blade's own size, measured over its vertices.
+                    //
+                    // NOT from getBoundingBox(): Groundcover::InstancingVisitor deliberately expands the
+                    // geometry's bound to enclose every copy in the chunk so that culling works on the
+                    // instanced set as a whole. Reading it back reported a single blade as 4530 x 4405 x 1062
+                    // units -- over half a cell wide -- which is the bound of a few hundred blades scattered
+                    // across the chunk, not one of them. The vertex array is the only place the blade's own
+                    // dimensions still exist.
+                    float extent[3] = { 0.0f, 0.0f, 0.0f };
+                    float base = 0.0f;
+                    if (const auto* verts = dynamic_cast<const osg::Vec3Array*>(geometry.getVertexArray());
+                        verts != nullptr && !verts->empty())
+                    {
+                        osg::Vec3f low = (*verts)[0];
+                        osg::Vec3f high = (*verts)[0];
+                        for (const osg::Vec3f& v : *verts)
+                        {
+                            low.x() = std::min(low.x(), v.x());
+                            low.y() = std::min(low.y(), v.y());
+                            low.z() = std::min(low.z(), v.z());
+                            high.x() = std::max(high.x(), v.x());
+                            high.y() = std::max(high.y(), v.y());
+                            high.z() = std::max(high.z(), v.z());
+                        }
+                        extent[0] = high.x() - low.x();
+                        extent[1] = high.y() - low.y();
+                        extent[2] = high.z() - low.z();
+                        // Carried too, because a replacement inherits the blade's pivot: OpenMW's blades sit
+                        // on the origin and grow up, and an asset that straddles zero sinks by the difference.
+                        base = low.z();
+                    }
+                    mScene.noteGroundcoverModel(mesh, model, copies, extent, base);
                     break;
                 }
             }
@@ -2940,14 +2965,15 @@ namespace MWRender
     }
 
     void RemixScene::noteGroundcoverModel(unsigned long long mesh, const std::string& model,
-        unsigned int copies, const float (&extent)[3])
+        unsigned int copies, const float (&extent)[3], float base)
     {
         if (!mLoggedGroundcoverModels.insert(mesh).second)
             return;
 
         Log(Debug::Info) << "[Remix grass] " << model << " -> mesh 0x" << std::hex << mesh << std::dec
                          << ", " << copies << " copies in the chunk that introduced it; blade extent "
-                         << extent[0] << " x " << extent[1] << " x " << extent[2] << " units";
+                         << extent[0] << " x " << extent[1] << " x " << extent[2] << " units, base z "
+                         << base;
     }
 
     osg::StateSet& RemixScene::animatedStateFor(SceneUtil::StateSetUpdater& updater)

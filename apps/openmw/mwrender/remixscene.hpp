@@ -93,8 +93,10 @@ namespace MWRender
         /// @param extent the blade's own width, depth and height in game units, before any per-copy scale.
         ///        Reported because a replacement asset has to be scaled to match it, and guessing that factor
         ///        costs a build and a play session per attempt where measuring costs neither.
+        /// @param base the blade's lowest vertex on Z, which is the height a replacement's own pivot has to
+        ///        agree with or it floats or sinks by the difference.
         void noteGroundcoverModel(unsigned long long mesh, const std::string& model, unsigned int copies,
-            const float (&extent)[3]);
+            const float (&extent)[3], float base);
 
         /// A state set for \a updater to write its animated attributes into.
         ///
