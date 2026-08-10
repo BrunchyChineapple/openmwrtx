@@ -60,6 +60,12 @@ namespace MWLua
         // The parallelism can be turned off in the settings.
         void update();
 
+        // \brief Performs one incremental garbage collection step.
+        //
+        // Returns true if the step finished a collection cycle. Touches the Lua state:
+        // never run concurrently with anything else that does.
+        bool gcStep(int steps);
+
         /// Wall-clock cost of one update(), split so an overrun can be attributed to a part of it.
         ///
         /// The spans tile update() completely rather than sampling the parts that looked suspicious. That
@@ -68,7 +74,6 @@ namespace MWLua
         /// frame at all.
         struct UpdateBreakdown
         {
-            double mGarbageCollect = 0.0;
             /// Object list rebuild, auto-started scripts, dead container sweep, per-script stat rollover.
             double mBookkeeping = 0.0;
             double mTimers = 0.0;
@@ -83,6 +88,7 @@ namespace MWLua
             double mTotal = 0.0;
             unsigned int mActiveLocalScripts = 0;
         };
+
 
         // \brief Executes latency-critical and scene graph related Lua logic.
         //

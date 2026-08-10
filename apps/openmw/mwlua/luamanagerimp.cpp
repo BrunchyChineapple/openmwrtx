@@ -247,11 +247,10 @@ namespace MWLua
         // window is exactly the span the frame loop waits on, no wider and no narrower.
         LuaUtil::ScriptsContainer::beginProfilerFrame();
 
+        // Garbage collection is no longer part of this function's cost: Worker::gc runs it after the
+        // frame's Lua update instead, on the Lua thread when there is one and synchronously at the end of
+        // the frame when there is not. The breakdown below therefore has no collection span.
         UpdateBreakdown breakdown;
-
-        if (const int steps = Settings::lua().mGcStepsPerFrame; steps > 0)
-            lua_gc(mLua.unsafeState(), LUA_GCSTEP, steps);
-        breakdown.mGarbageCollect = lap();
 
         if (mPlayer.isEmpty())
             return; // The game is not started yet.
@@ -435,8 +434,7 @@ namespace MWLua
 
         Log(Debug::Warning) << "Lua update held the frame thread for " << breakdown.mTotal << " ms across "
                             << breakdown.mActiveLocalScripts
-                            << " active local script container(s): garbage collect "
-                            << breakdown.mGarbageCollect << " | bookkeeping " << breakdown.mBookkeeping
+                            << " active local script container(s): bookkeeping " << breakdown.mBookkeeping
                             << " | timers " << breakdown.mTimers << " | event handlers "
                             << breakdown.mEventHandlers << " | queued callbacks "
                             << breakdown.mQueuedCallbacks << " | engine events "
@@ -531,6 +529,11 @@ namespace MWLua
         Log(Debug::Warning) << "  " << attributed << " ms of " << breakdown.mTotal
                             << " ms is script self time across " << calls << " Lua call(s) in "
                             << order.size() << " script(s); the rest is engine work in the spans above";
+    }
+
+    bool LuaManager::gcStep(int steps)
+    {
+        return lua_gc(mLua.unsafeState(), LUA_GCSTEP, steps) == 1;
     }
 
     void LuaManager::objectTeleported(const MWWorld::Ptr& ptr)
