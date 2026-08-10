@@ -95,6 +95,7 @@
 #include <windows.h>
 
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #include <psapi.h>
 
 #undef near
@@ -204,8 +205,9 @@ namespace
     class StallSampler
     {
     public:
-        explicit StallSampler(double thresholdMs)
+        StallSampler(double thresholdMs, double hangThresholdMs)
             : mThresholdMs(thresholdMs)
+            , mHangThresholdMs(hangThresholdMs)
         {
             if (mThresholdMs <= 0.0)
                 return;
@@ -229,6 +231,9 @@ namespace
 
             Log(Debug::Info) << "Remix: capturing a frame-thread stack for any frame over " << mThresholdMs
                              << " ms (OPENMW_REMIX_STALL_STACK_MS=0 to disable)";
+            if (mHangThresholdMs > 0.0)
+                Log(Debug::Info) << "Remix: capturing every thread's stack for any frame over "
+                                 << mHangThresholdMs << " ms (OPENMW_REMIX_HANG_STACK_MS)";
         }
 
         ~StallSampler()
@@ -268,6 +273,8 @@ namespace
         /// caller. A cap that swallows the answer is worse than no cap, and these are captured once per
         /// stall so the extra depth costs nothing worth counting.
         static constexpr std::size_t kMaxFrames = 192;
+        /// Enough for every thread this process runs, without turning one hang into a thousand lines.
+        static constexpr std::size_t kMaxThreads = 48;
 
         static double nowMs()
         {
@@ -298,24 +305,36 @@ namespace
                     continue;
 
                 mFrames.clear();
+                const double stalledMs = nowMs() - beat;
                 if (capture())
                 {
                     reported = beat;
-                    report(nowMs() - beat, process);
+                    report(stalledMs, process);
+                    // Long enough to be a hang rather than a slow frame, and the frame thread's own
+                    // stack cannot say which other thread stopped making progress.
+                    if (mHangThresholdMs > 0.0 && stalledMs >= mHangThresholdMs)
+                        captureOtherThreads(process);
                 }
             }
 
             ::SymCleanup(process);
         }
 
-        bool capture()
+        bool capture() { return captureThread(mThread, mFrames); }
+
+        /// Suspend one thread, unwind it, resume it.
+        ///
+        /// Parameterised on the thread and its buffer so the same unwinding serves the frame thread and,
+        /// on a hang, every other thread. Never suspends more than one at a time, and resolves no names
+        /// while one is suspended -- see the note above about the DbgHelp lock.
+        bool captureThread(HANDLE thread, std::vector<DWORD64>& out)
         {
-            if (::SuspendThread(mThread) == static_cast<DWORD>(-1))
+            if (thread == nullptr || ::SuspendThread(thread) == static_cast<DWORD>(-1))
                 return false;
 
             CONTEXT context{};
             context.ContextFlags = CONTEXT_FULL;
-            const bool haveContext = ::GetThreadContext(mThread, &context) != FALSE;
+            const bool haveContext = ::GetThreadContext(thread, &context) != FALSE;
 
             if (haveContext)
             {
@@ -331,35 +350,95 @@ namespace
                 // directory, which is what SymFunctionTableAccess64 provides. They touch module tables
                 // rather than PDBs, so this stays off the symbol-loading path; name resolution waits until
                 // after the resume below.
-                while (mFrames.size() < kMaxFrames
-                    && ::StackWalk64(IMAGE_FILE_MACHINE_AMD64, ::GetCurrentProcess(), mThread, &frame,
+                while (out.size() < kMaxFrames
+                    && ::StackWalk64(IMAGE_FILE_MACHINE_AMD64, ::GetCurrentProcess(), thread, &frame,
                            &context, nullptr, ::SymFunctionTableAccess64, ::SymGetModuleBase64, nullptr))
                 {
                     if (frame.AddrPC.Offset == 0)
                         break;
-                    mFrames.push_back(frame.AddrPC.Offset);
+                    out.push_back(frame.AddrPC.Offset);
                 }
             }
 
-            ::ResumeThread(mThread);
-            return haveContext && !mFrames.empty();
+            ::ResumeThread(thread);
+            return haveContext && !out.empty();
+        }
+
+        /// Every other thread's stack, once, when a stall has lasted long enough to be a hang.
+        ///
+        /// A wait in SyncFrameLatency says an earlier frame never signalled its completion; it cannot say
+        /// which thread failed to signal it. That answer is on the submission and presenter threads. An
+        /// AppHangB1 leaves nothing else to read -- no exception was raised so no handler ran, and no
+        /// device was lost so Aftermath wrote no dump.
+        ///
+        /// Behind a far higher threshold than an ordinary stall, because walking every thread is much more
+        /// intrusive than walking one: any thread suspended here may hold the loader lock. Several seconds
+        /// in, the process is already lost and the trade is worth it; at 300 ms it would not be.
+        void captureOtherThreads(HANDLE process)
+        {
+            const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snapshot == INVALID_HANDLE_VALUE)
+                return;
+
+            const DWORD pid = ::GetCurrentProcessId();
+            const DWORD self = ::GetCurrentThreadId();
+            std::vector<std::pair<DWORD, std::vector<DWORD64>>> captured;
+            THREADENTRY32 entry{};
+            entry.dwSize = sizeof(entry);
+            if (::Thread32First(snapshot, &entry))
+            {
+                do
+                {
+                    // Skipping this watcher matters: suspending it would suspend the only thread left
+                    // that can resume anything.
+                    if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self)
+                        continue;
+                    if (captured.size() >= kMaxThreads)
+                        break;
+                    const HANDLE thread = ::OpenThread(
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                        entry.th32ThreadID);
+                    if (thread == nullptr)
+                        continue;
+                    std::vector<DWORD64> frames;
+                    frames.reserve(kMaxFrames);
+                    if (captureThread(thread, frames))
+                        captured.emplace_back(entry.th32ThreadID, std::move(frames));
+                    ::CloseHandle(thread);
+                } while (::Thread32Next(snapshot, &entry));
+            }
+            ::CloseHandle(snapshot);
+
+            // Everything is resumed by now, so naming frames is safe.
+            Log(Debug::Warning) << "Remix hang: stacks for " << captured.size()
+                                << " other thread(s), innermost first:";
+            for (const auto& walked : captured)
+            {
+                Log(Debug::Warning) << "  --- thread " << walked.first;
+                resolve(walked.second, process);
+            }
         }
 
         void report(double stalledMs, HANDLE process)
         {
-            // One line per frame rather than one long line, because these are read by eye and a
-            // forty-deep stack on one line is unreadable.
             Log(Debug::Warning) << "Remix stall stack: frame thread has been busy for " << stalledMs
                                 << " ms; innermost first:";
+            resolve(mFrames, process);
+        }
+
+        /// One line per frame rather than one long line, because these are read by eye and a forty-deep
+        /// stack on one line is unreadable.
+        void resolve(const std::vector<DWORD64>& frames, HANDLE process)
+        {
 
             alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
             auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
             symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
             symbol->MaxNameLen = MAX_SYM_NAME;
 
-            for (std::size_t i = 0; i < mFrames.size(); ++i)
+            for (std::size_t i = 0; i < frames.size(); ++i)
             {
-                const DWORD64 address = mFrames[i];
+                const DWORD64 address = frames[i];
                 std::string name = "??";
                 DWORD64 displacement = 0;
                 if (::SymFromAddr(process, address, &displacement, symbol))
@@ -380,6 +459,9 @@ namespace
         }
 
         double mThresholdMs = 0.0;
+        /// Ordinary stalls report the frame thread alone; past this, every thread is walked. See
+        /// captureOtherThreads for why the two thresholds sit so far apart.
+        double mHangThresholdMs = 0.0;
         HANDLE mThread = nullptr;
         std::atomic<double> mHeartbeat{ 0.0 };
         std::atomic<bool> mRunning{ false };
@@ -431,7 +513,10 @@ namespace
         if (thresholdMs <= 0.0)
             return nullptr;
 
-        static StallSampler sampler(thresholdMs);
+        // Defaulted rather than opt-in: once stall stacks are armed at all, a stall that never ends is
+        // exactly the case worth capturing, and it is the one an ordinary stall stack cannot explain.
+        static const double hangThresholdMs = envDouble("OPENMW_REMIX_HANG_STACK_MS", 4000.0);
+        static StallSampler sampler(thresholdMs, hangThresholdMs);
         return &sampler;
     }
 #endif
