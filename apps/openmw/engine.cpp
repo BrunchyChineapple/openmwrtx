@@ -705,6 +705,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
     try
     {
+        // Stop the background GC started at the previous frame's end.
+        // Input handling can run Lua (the menu key does), so the state
+        // must not be collected from this point on.
+        mLuaWorker->finishGc();
+
         // update input
         {
             ScopedProfile<UserStatsType::Input> profile(frameStart, frameNumber, *timer, *stats);
@@ -759,9 +764,6 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             ScopedProfile<UserStatsType::LuaSyncUpdate> profile(frameStart, frameNumber, *timer, *stats);
             PhaseTimer phase(mRemixPhases.mLuaSync);
-            // Stop the background garbage collection started at the previous frame's
-            // end: from here on the main thread touches the Lua state.
-            mLuaWorker->finishGc();
             // Should be called after input manager update and before any change to the game world.
             // It applies to the game world queued changes from the previous frame.
             mLuaManager->synchronizedUpdate();
@@ -1584,9 +1586,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeLuaFinish)
               .count();
 
-    // The Lua state is unused until the next frame's synchronized update: the worker
-    // collects garbage through the frame tail, the framerate-limiter sleep, and the
-    // next frame's input and sound updates.
+    // The Lua state is unused until the next frame starts: the worker collects
+    // garbage through the frame tail and the framerate-limiter sleep.
     mLuaWorker->gc();
 
     return true;
