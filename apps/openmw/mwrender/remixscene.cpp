@@ -355,6 +355,59 @@ namespace
     /// Order is the whole content of this function, so it is named rather than spelled inline at the one
     /// call site. Texcoords here are row vectors, so composing "first then second" is the product
     /// first * second, which is the reverse of the column-vector convention most matrix code uses.
+    /// Content hashes for the stage-bake cache, memoised by address.
+    ///
+    /// An address is the wrong key for a bake. The same texture and the same texcoords reach the submit as
+    /// different objects across instances and across reloads, so keying on where they live re-does work
+    /// already done -- measured at 175 bakes of one texture in a single session. Content collapses them, and
+    /// it is also the only kind of key an offline bake could ever share, since a tool walking the VFS has no
+    /// addresses in common with a running game.
+    ///
+    /// Memoised by address because the content cannot change under a given object here: the images and arrays
+    /// backing submitted geometry are immutable for the object's lifetime. So the steady-state cost is a
+    /// pointer lookup and only a first sighting hashes anything.
+    ///
+    /// Deliberately not RemixScene::textureFor, which also returns a content hash: that uploads the texture
+    /// to the runtime as a side effect. A stage image is consumed by the bake and never submitted on its own,
+    /// so asking for its hash that way would put every dark and detail map in VRAM to no purpose.
+    ///
+    /// Unsynchronised statics, like the other per-submit caches in this file: the Remix submit runs on the
+    /// frame thread after osgViewer's update traversal, single-threaded by construction.
+    unsigned long long imageContentHash(const osg::Image* image)
+    {
+        if (image == nullptr || image->data() == nullptr)
+            return 0;
+
+        static std::unordered_map<const void*, unsigned long long> sHashes;
+        const auto [entry, inserted] = sHashes.try_emplace(image, 0ull);
+        if (inserted)
+        {
+            // Dimensions and format alongside the texels: two images can share a byte pattern while meaning
+            // different pictures, and a compressed source's block data says nothing about its extent.
+            unsigned long long hash = RemixRT::AssetHash::bytes(
+                image->data(), static_cast<std::size_t>(image->getTotalSizeInBytes()));
+            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->s()), hash);
+            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->t()), hash);
+            hash = RemixRT::AssetHash::combine(
+                static_cast<unsigned long long>(image->getPixelFormat()), hash);
+            entry->second = RemixRT::AssetHash::avoidZero(hash);
+        }
+        return entry->second;
+    }
+
+    unsigned long long coordContentHash(const osg::Vec2Array* coords)
+    {
+        if (coords == nullptr || coords->empty())
+            return 0;
+
+        static std::unordered_map<const void*, unsigned long long> sHashes;
+        const auto [entry, inserted] = sHashes.try_emplace(coords, 0ull);
+        if (inserted)
+            entry->second = RemixRT::AssetHash::avoidZero(RemixRT::AssetHash::bytes(
+                coords->getDataPointer(), static_cast<std::size_t>(coords->getTotalDataSize())));
+        return entry->second;
+    }
+
     TexAffine composeTexAffine(const TexAffine& first, const TexAffine& second)
     {
         return {
@@ -2527,23 +2580,21 @@ namespace
             if (stages.empty())
                 return;
 
-            // Keyed on the images and the coordinate arrays rather than on the drawable, so instances of one
-            // window share a bake and two windows that differ only in mapping do not.
+            // Addresses, used only to memoise the content key computed below -- never to key the bake itself.
             //
-            // The controller's ADDRESS was part of this key and must not be. It is stable across frames,
-            // which is what the previous reasoning checked, but NifOsg clones a controller per instance so
-            // that each object animates independently -- so it is not stable across instances, and every
-            // window in the world missed the cache and baked its own copy. Measured: 187 bakes from 6 distinct
-            // source textures, 175 of them the same one, each producing an 8192x1024 sprite sheet at roughly
-            // 0.7 s. That is the load stall, and it is entirely self-inflicted.
+            // Keying the bake on addresses is what made every window in the world bake its own copy: NifOsg
+            // clones a controller per instance so each object animates independently, and the same textures
+            // and texcoords arrive as different objects anyway. 187 bakes from 6 distinct source textures in
+            // one session, 175 of them the same texture, each an 8192x1024 sheet at roughly 0.7 s.
             //
-            // What the bake actually consumes from the controller is the sampled phase list, folded in below
-            // once it exists. Two controllers that produce the same phases produce the same image and should
-            // share it however many objects own them.
-            std::size_t key = std::hash<const void*>{}(baseImage) ^ std::hash<const void*>{}(baseCoords);
+            // The controller's address belongs in THIS key even though it must stay out of the content key:
+            // two surfaces sharing every image and array but animated differently need separate memo entries,
+            // or the second would be handed the first's content key and with it the first's animation.
+            std::size_t memoKey = std::hash<const void*>{}(baseImage) ^ std::hash<const void*>{}(baseCoords);
             for (const auto& stage : stages)
-                key = key * 1099511628211ull ^ std::hash<const void*>{}(stage.mImage)
+                memoKey = memoKey * 1099511628211ull ^ std::hash<const void*>{}(stage.mImage)
                     ^ std::hash<const void*>{}(stage.mCoords);
+            memoKey = memoKey * 1099511628211ull ^ std::hash<const void*>{}(surface.mUvController);
 
             // Triangles, because the stage mapping is solved per triangle rather than per surface. Collected
             // through the same functor the mesh path uses, which decomposes strips, fans and quads -- doing
@@ -2559,7 +2610,7 @@ namespace
 
             // Unsynchronised, like the other per-submit statics in this traversal: the Remix submit runs on
             // the frame thread after osgViewer's update traversal, single-threaded by construction.
-            static std::unordered_map<std::size_t, MWRender::RemixStageBake::Result> sCache;
+            static std::unordered_map<unsigned long long, MWRender::RemixStageBake::Result> sCache;
             // This frame's matrix, which is all a static surface needs and one frame of what an animated one
             // needs. Deliberately not part of the cache key: an animated value changes every frame, and
             // keying on it would bake a fresh image per frame.
@@ -2636,30 +2687,60 @@ namespace
                 }
             }
 
-            // Fold the controller's contribution in now that it is expressed as phases rather than as an
-            // address, and only when those phases are loop-derived.
+            // The content key: everything the bake reads, and nothing about where any of it lives.
             //
-            // A built sheet samples fixed positions in the loop (i * period / frames), so the values are a
-            // property of the animation and identical for every instance of it -- safe to key on, and it
-            // separates two assets whose animations genuinely differ.
-            //
-            // When no sheet was built, phases holds this frame's live matrix, and keying on that would bake a
-            // fresh image every frame -- the trap the original comment was guarding against. A constant goes
-            // in instead, so all instances share one frozen bake. That is what the frozen path already
-            // promises: the matrix is folded in at whatever phase was seen first, and freezing a slow drift
-            // reads better than stepping it.
-            if (sheetFps > 0)
+            // Computed once per distinct set of addresses and remembered, so the steady-state cost of all this
+            // hashing is one lookup. Two surfaces whose textures, texcoords, triangles and phases match now
+            // land on the same key however many objects own them, which is both the fix for the repeated
+            // bakes and the precondition for ever loading these from disk.
+            static std::unordered_map<std::size_t, unsigned long long> sContentKeys;
+            auto memoised = sContentKeys.find(memoKey);
+            if (memoised == sContentKeys.end())
             {
-                for (const TexAffine& phase : phases)
-                    for (const float component : phase)
-                        key = key * 1099511628211ull
-                            ^ std::hash<std::uint32_t>{}(std::bit_cast<std::uint32_t>(component));
-                key = key * 1099511628211ull ^ std::hash<unsigned int>{}(sheetFps);
+                unsigned long long content = imageContentHash(baseImage);
+                content = RemixRT::AssetHash::combine(coordContentHash(baseCoords), content);
+                for (const auto& stage : stages)
+                {
+                    content = RemixRT::AssetHash::combine(imageContentHash(stage.mImage), content);
+                    content = RemixRT::AssetHash::combine(coordContentHash(stage.mCoords), content);
+                    // The multiplier and the factorisation flag both change the texels produced, so two
+                    // otherwise identical stage sets that differ in either are different bakes.
+                    content = RemixRT::AssetHash::combine(
+                        std::bit_cast<std::uint32_t>(stage.mMultiplier), content);
+                    content = RemixRT::AssetHash::combine(stage.mSharesBaseTransform ? 1ull : 0ull, content);
+                }
+                // Per triangle, because the stage mapping is solved per triangle: the same texcoords wound
+                // into different triangles bake differently.
+                content = RemixRT::AssetHash::fold(
+                    triangles.data(), triangles.size() * sizeof(unsigned int), content);
+
+                // The phases, and only when they are loop-derived.
+                //
+                // A built sheet samples fixed positions in the loop (i * period / frames), so those values
+                // are a property of the animation and identical for every instance of it: safe to key on, and
+                // they separate two assets whose animations genuinely differ.
+                //
+                // When no sheet was built, phases holds this frame's live matrix. Keying on that would bake a
+                // fresh image every frame, which is the trap that made the controller's address look like the
+                // safe choice in the first place. A constant goes in instead, so instances share one frozen
+                // bake -- exactly what the frozen path already promises, folding the matrix in at whichever
+                // phase was seen first.
+                if (sheetFps > 0)
+                {
+                    for (const TexAffine& phase : phases)
+                        for (const float component : phase)
+                            content
+                                = RemixRT::AssetHash::combine(std::bit_cast<std::uint32_t>(component), content);
+                    content = RemixRT::AssetHash::combine(static_cast<unsigned long long>(sheetFps), content);
+                }
+                else
+                {
+                    content = RemixRT::AssetHash::combine(0x9e3779b97f4a7c15ull, content);
+                }
+
+                memoised = sContentKeys.emplace(memoKey, RemixRT::AssetHash::avoidZero(content)).first;
             }
-            else
-            {
-                key = key * 1099511628211ull ^ 0x9e3779b97f4a7c15ull;
-            }
+            const unsigned long long key = memoised->second;
 
             auto found = sCache.find(key);
             if (found == sCache.end())
