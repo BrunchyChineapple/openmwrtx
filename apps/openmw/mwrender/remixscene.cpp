@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <functional>
 #include <set>
@@ -2529,15 +2530,20 @@ namespace
             // Keyed on the images and the coordinate arrays rather than on the drawable, so instances of one
             // window share a bake and two windows that differ only in mapping do not.
             //
-            // The controller is part of the key as well, and unlike its current matrix it is safe to key on:
-            // the phases below sample its whole loop rather than the moment this frame happens to be at, so
-            // the result is stable across frames. Two surfaces sharing every texture but animated by
-            // different controllers are genuinely different bakes.
+            // The controller's ADDRESS was part of this key and must not be. It is stable across frames,
+            // which is what the previous reasoning checked, but NifOsg clones a controller per instance so
+            // that each object animates independently -- so it is not stable across instances, and every
+            // window in the world missed the cache and baked its own copy. Measured: 187 bakes from 6 distinct
+            // source textures, 175 of them the same one, each producing an 8192x1024 sprite sheet at roughly
+            // 0.7 s. That is the load stall, and it is entirely self-inflicted.
+            //
+            // What the bake actually consumes from the controller is the sampled phase list, folded in below
+            // once it exists. Two controllers that produce the same phases produce the same image and should
+            // share it however many objects own them.
             std::size_t key = std::hash<const void*>{}(baseImage) ^ std::hash<const void*>{}(baseCoords);
             for (const auto& stage : stages)
                 key = key * 1099511628211ull ^ std::hash<const void*>{}(stage.mImage)
                     ^ std::hash<const void*>{}(stage.mCoords);
-            key = key * 1099511628211ull ^ std::hash<const void*>{}(surface.mUvController);
 
             // Triangles, because the stage mapping is solved per triangle rather than per surface. Collected
             // through the same functor the mesh path uses, which decomposes strips, fans and quads -- doing
@@ -2554,7 +2560,6 @@ namespace
             // Unsynchronised, like the other per-submit statics in this traversal: the Remix submit runs on
             // the frame thread after osgViewer's update traversal, single-threaded by construction.
             static std::unordered_map<std::size_t, MWRender::RemixStageBake::Result> sCache;
-            auto found = sCache.find(key);
             // This frame's matrix, which is all a static surface needs and one frame of what an animated one
             // needs. Deliberately not part of the cache key: an animated value changes every frame, and
             // keying on it would bake a fresh image per frame.
@@ -2631,6 +2636,32 @@ namespace
                 }
             }
 
+            // Fold the controller's contribution in now that it is expressed as phases rather than as an
+            // address, and only when those phases are loop-derived.
+            //
+            // A built sheet samples fixed positions in the loop (i * period / frames), so the values are a
+            // property of the animation and identical for every instance of it -- safe to key on, and it
+            // separates two assets whose animations genuinely differ.
+            //
+            // When no sheet was built, phases holds this frame's live matrix, and keying on that would bake a
+            // fresh image every frame -- the trap the original comment was guarding against. A constant goes
+            // in instead, so all instances share one frozen bake. That is what the frozen path already
+            // promises: the matrix is folded in at whatever phase was seen first, and freezing a slow drift
+            // reads better than stepping it.
+            if (sheetFps > 0)
+            {
+                for (const TexAffine& phase : phases)
+                    for (const float component : phase)
+                        key = key * 1099511628211ull
+                            ^ std::hash<std::uint32_t>{}(std::bit_cast<std::uint32_t>(component));
+                key = key * 1099511628211ull ^ std::hash<unsigned int>{}(sheetFps);
+            }
+            else
+            {
+                key = key * 1099511628211ull ^ 0x9e3779b97f4a7c15ull;
+            }
+
+            auto found = sCache.find(key);
             if (found == sCache.end())
             {
                 MWRender::RemixStageBake::Result baked = MWRender::RemixStageBake::combine(
