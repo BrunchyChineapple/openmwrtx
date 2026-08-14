@@ -12,6 +12,7 @@
 #include <osg/Vec3f>
 
 #include <components/debug/debuglog.hpp>
+#include <components/settings/values.hpp>
 #include <components/remixrt/runtime.hpp>
 
 namespace
@@ -69,8 +70,12 @@ namespace
     bool fogEnabled()
     {
         static const bool value = []() -> bool {
+            // Setting first, environment override second, matching every other knob in [Remix]. Absent
+            // variable defers to the setting; present means the variable decides, and "0" disables.
             const char* env = std::getenv("OPENMW_REMIX_FOG");
-            return env == nullptr || (*env != '\0' && *env != '0');
+            if (env == nullptr)
+                return Settings::remix().mFog.get();
+            return *env != '\0' && *env != '0';
         }();
         return value;
     }
@@ -109,10 +114,15 @@ namespace
         return rotX * rotZ * osg::Vec3f(0.0f, 1.0f, 0.0f);
     }
 
-    /// Remix's phase parameter runs 0 = new, 0.5 = full, 1 = new again, so it needs to know waxing from
-    /// waning. OpenMW's Phase enum distinguishes them; MoonState::phaseToInt does not -- it folds the two
-    /// crescents onto 1 and the two quarters onto 2, because the vanilla moon texture is symmetric and the
-    /// renderer only needs to pick a sprite. Using that would light both halves of the month identically.
+    /// Remix's phase parameter runs 0 = new, 0.5 = full, 1 = new again. OpenMW's Phase enum distinguishes
+    /// waxing from waning; MoonState::phaseToInt does not -- it folds the two crescents onto 1 and the two
+    /// quarters onto 2, because the vanilla moon texture is symmetric and the renderer only needs to pick a
+    /// sprite. Keeping the distinction costs nothing, so the honest value goes across.
+    ///
+    /// It is not what mirrors the moon, though. The runtime places the terminator at cos(phase * 2pi), which
+    /// is symmetric about full, so 0.125 and 0.875 light the same fraction of the disk and always will. What
+    /// separates the two halves of the month on screen is that the terminator is oriented toward the sun,
+    /// and the sun sits on the other side of the sky in each.
     float remixMoonPhase(MWRender::MoonState::Phase phase)
     {
         switch (phase)
@@ -259,6 +269,33 @@ namespace MWRender
             pushFloat("rtx.atmosphere.sunElevation", elevation, mSunElevation);
             pushFloat("rtx.atmosphere.sunRotation", rotation, mSunRotation);
             pushFloat("rtx.atmosphere.sunIntensity", 1.0f, mSunIntensity);
+
+            // Logged on every day/night changeover, because the mirror above is the one claim in this file
+            // that has never been checked against a running game.
+            //
+            // OpenMW's sun does not descend -- RenderingManager rewrites its height to 400 - |x|, so the
+            // orbit is a dome traced twice a day -- and the comment above asserts that negating the elevation
+            // puts it correctly below the horizon at night. If that is wrong, the runtime lights the sky with
+            // a sun at or near the horizon all night, and no night-sky option can be seen against it: airglow
+            // and stars are small additive terms next to sun-scattered sky, which is exactly what "the slider
+            // does nothing" looks like from the outside.
+            //
+            // Printing the inputs alongside the result so the arithmetic can be checked rather than trusted:
+            // a night elevation that is not strongly negative is the bug, and the raw direction says whether
+            // the fault is the mirror or the direction feeding it.
+            const int night = sky.mNight ? 1 : 0;
+            if (night != mLoggedNight)
+            {
+                mLoggedNight = night;
+                Log(Debug::Info) << "Remix sky: " << (sky.mNight ? "NIGHT" : "DAY")
+                                 << " -- sunDirection (" << dir.x() << ", " << dir.y() << ", " << dir.z()
+                                 << ") len " << length << "; elevation " << elevation << " deg, rotation "
+                                 << rotation << " deg"
+                                 << (sky.mNight && elevation > -10.0f
+                                            ? "  <-- sun is NOT below the horizon at night; the sky is being"
+                                              " lit as twilight and no night-sky option can be seen against it"
+                                            : "");
+            }
         }
 
         // Secunda is moon0 and Masser is moon1, matching the Morrowind Remix project's assignment so the
@@ -307,8 +344,29 @@ namespace MWRender
 
         // Stars and airglow follow OpenMW's own day/night decision rather than the sun's elevation, so
         // they change over at the same moment the game's sky does.
-        pushFloat("rtx.atmosphere.starBrightness", sky.mNight ? 1.0f : 0.0f, mStarBrightness);
-        pushFloat("rtx.atmosphere.nightSkyBrightness", sky.mNight ? 0.008f : 0.0f, mNightSkyBrightness);
+        // Night brightness is a value here, not a flag. starBrightness multiplies the star field and the
+        // blue cloud night-glow coupled to it, and its tuned default is 0.5 -- which no rtx.conf in this
+        // project or the Morrowind Remix reference overrides. Writing 1.0 to mean "stars are on" therefore
+        // doubled the night sky against the very default both configurations rely on, and that was the whole
+        // of this host reading brighter at night. Day still writes 0, because off is off rather than a
+        // brightness.
+        pushFloat("rtx.atmosphere.starBrightness",
+            sky.mNight ? envFloat("OPENMW_REMIX_NIGHT_STARS", Settings::remix().mNightStarBrightness) : 0.0f,
+            mStarBrightness);
+
+        // nightSkyBrightness is deliberately not written from here, and this is now measured rather than
+        // argued.
+        //
+        // The runtime's weather blender assigns it from its per-preset table every frame with no varies-gate
+        // (rtx_fork_weather.cpp), so a host write is discarded within the same frame. The confirmation came
+        // from the game rather than the source: the Night Sky Brightness slider in Remix's own developer menu
+        // has no effect at either extreme, which is what an option being rewritten every frame looks like from
+        // the outside. It is owned by rtx.conf as rtx.weather.preset.<name>.<name>_nightSkyBrightness, set to
+        // 0.001 across all twelve presets here and in the Morrowind Remix reference alike.
+        //
+        // Restored briefly on the grounds that the removal was untested, then removed again once the slider
+        // settled it. Writing it changed the value the runtime held at night from 0.001 to 0.008 for as long
+        // as that lasted.
 
         // Fog, driven into the volumetric medium directly.
         //
@@ -362,14 +420,35 @@ namespace MWRender
         // midday sun reads bright and under stars reads dark, without either being asked for.
         if (sky.mHaveWeather && fogEnabled())
         {
-            // Written once and left alone. Fog scatters; it does not absorb.
+            // Written once and left alone, and written per channel rather than as one grey level.
+            //
+            // The paragraph above argues this belongs near white because fog scatters rather than absorbs.
+            // That is true of daylight and it is what made a value near one look right, but it is only half
+            // the story, and the missing half is what produced a night nothing could darken.
+            //
+            // Albedo is how much light survives each scatter event. At 0.99 the medium is very nearly
+            // lossless, so light entering it bounces many times before being absorbed and multiple scattering
+            // smears it into an even veil over the whole scene. With Remix's own sky feeding the medium, that
+            // veil is the floor on how dark night can get: turning off the moons, the stars and the airglow
+            // changes what enters the fog, not the fog's willingness to keep passing it around. Which is
+            // exactly what "there is just some glow everywhere" looks like, and why no sky control touched it.
+            //
+            // The Morrowind Remix reference sets rtx.volumetrics.singleScatteringAlbedo to
+            // (0.90, 0.92, 0.96) and its nights are the ones being matched. That is four to ten times more
+            // absorption per bounce than 0.99, and it is tilted: red is absorbed most and blue least, which is
+            // what makes those nights read cold rather than washed. A single grey level cannot express that,
+            // so the setting is the blue channel -- the largest -- and the other two keep the reference's
+            // ratios against it. At the default of 0.96 this reproduces the reference exactly.
             if (!mAlbedoSet)
             {
                 mAlbedoSet = true;
-                const float albedo = std::clamp(envFloat("OPENMW_REMIX_FOG_ALBEDO", kFogAlbedo), 0.0f, 1.0f);
+                const float albedo
+                    = std::clamp(envFloat("OPENMW_REMIX_FOG_ALBEDO", Settings::remix().mFogAlbedo), 0.0f, 1.0f);
+                // 0.90 / 0.96 and 0.92 / 0.96, so one knob moves the level and the tilt rides along.
                 char value[64];
-                std::snprintf(value, sizeof(value), "%.4f, %.4f, %.4f", static_cast<double>(albedo),
-                    static_cast<double>(albedo), static_cast<double>(albedo));
+                std::snprintf(value, sizeof(value), "%.4f, %.4f, %.4f",
+                    static_cast<double>(albedo * 0.9375f), static_cast<double>(albedo * 0.958333f),
+                    static_cast<double>(albedo));
                 mRuntime.setConfigVariable("rtx.volumetrics.singleScatteringAlbedo", value);
             }
 
@@ -377,9 +456,9 @@ namespace MWRender
             // only its tint, then blended toward white. Fog is barely coloured in transmission -- what
             // looks coloured about it is the light it scatters -- so a partial tint is the honest amount.
             const float tintStrength
-                = std::clamp(envFloat("OPENMW_REMIX_FOG_TINT", kFogTint), 0.0f, 1.0f);
+                = std::clamp(envFloat("OPENMW_REMIX_FOG_TINT", Settings::remix().mFogTint), 0.0f, 1.0f);
             const float level
-                = std::clamp(envFloat("OPENMW_REMIX_FOG_TRANSMITTANCE", kFogTransmittance), 0.01f, 0.99f);
+                = std::clamp(envFloat("OPENMW_REMIX_FOG_TRANSMITTANCE", Settings::remix().mFogTransmittance), 0.01f, 0.99f);
             const float peak = std::max({ sky.mFogColor.x(), sky.mFogColor.y(), sky.mFogColor.z(), 1e-4f });
 
             float rgb[3] = { sky.mFogColor.x(), sky.mFogColor.y(), sky.mFogColor.z() };
@@ -414,7 +493,7 @@ namespace MWRender
             // kFogEndTransmittance at the view distance gives the ratio below. Written as the two named
             // constants rather than the number they produce, so changing either stays consistent.
             const float endTransmittance = std::clamp(
-                envFloat("OPENMW_REMIX_FOG_END_TRANSMITTANCE", kFogEndTransmittance), 0.001f, 0.99f);
+                envFloat("OPENMW_REMIX_FOG_END_TRANSMITTANCE", Settings::remix().mFogEndTransmittance), 0.001f, 0.99f);
             const float opticalDepths = std::log(endTransmittance) / std::log(level);
             const float viewMetres = viewDistance / kUnitsPerMetre;
 
@@ -443,9 +522,63 @@ namespace MWRender
             // Held just inside the far plane rather than at it. The option's own documentation warns the
             // grid clips to the far plane if it reaches past it, and OpenMW's far plane is the view
             // distance, so asking for exactly that invites the clip this is trying to avoid.
+            // Everything above is why the volume was widened. What it missed is what widening it costs.
+            //
+            // The grid's cell count is fixed, so a bigger volume is not more expensive -- that part was
+            // measured and holds. But it is emphatically not free: the froxel grid is where volumetric
+            // in-scattering accumulates, so its depth is how far light travels through participating medium
+            // before reaching the eye. Deriving it from the view distance gave
+            // 65000 * 0.95 / 143 -- about 430 metres against the runtime's 20 metre default, and the Morrowind
+            // Remix project never overrides that default at all. Twenty-one times the medium depth, with the
+            // sky as the light entering it, is a uniform glow across the entire scene.
+            //
+            // It is also invisible to every control that looks like it should govern it. nightSkyBrightness,
+            // starBrightness and the moon gains change what light enters the medium; none of them changes how
+            // far it then travels through it. That is why maxing or zeroing each of them in turn did nothing,
+            // and why switching Remix's sky off produced a black frame instead of a dimmer one -- with no sky
+            // there is nothing entering the medium to be smeared.
+            //
+            // Default is the runtime's own 20 metres, which is what the reference renders with. Set the
+            // setting higher to trade night darkness for distant volumetric fog; 0 restores the old
+            // view-distance derivation for anyone who wants it back.
+            static const float froxelSetting
+                = envFloat("OPENMW_REMIX_FROXEL_DISTANCE", Settings::remix().mFroxelDistance);
             constexpr float kFroxelCoverage = 0.95f;
-            const float froxelMetres = std::max(20.0f, viewDistance * kFroxelCoverage / kUnitsPerMetre);
+            const float froxelMetres = froxelSetting > 0.0f
+                ? froxelSetting
+                : std::max(20.0f, viewDistance * kFroxelCoverage / kUnitsPerMetre);
             pushFloat("rtx.volumetrics.froxelMaxDistanceMeters", froxelMetres, mFroxelDistance);
+        }
+
+        // Volumetric fog follows whether the cell has weather at all, because otherwise it follows nothing.
+        //
+        // The block above only writes the medium while sky.mHaveWeather holds. It had no else, so on stepping
+        // into a shop the host simply stopped updating and the runtime kept the last exterior's medium --
+        // density, colour and all -- which is why interiors had outdoor fog standing in them.
+        //
+        // mHaveWeather is the right test rather than an explicit interior flag: a cell that behaves as an
+        // exterior, Mournhold being the case that matters, reports weather and therefore keeps its fog, while
+        // an ordinary interior reports none and loses it. That is the distinction wanted, and it comes from
+        // the game's own data rather than a list maintained here.
+        //
+        // rtx.volumetrics.enable is the lever because it is one of the few volumetric options the runtime's
+        // weather blender never writes -- it interpolates density, colour, anisotropy and the rest every
+        // frame, so anything this host set among those would be overwritten within the frame. The enable is
+        // ours to own.
+        //
+        // Caves and other interiors that would genuinely suit fog are not served by this: they report no
+        // weather, so they get none. Giving them their own medium means driving it from cell data rather than
+        // from weather, which is a separate change and wants its own setting.
+        {
+            const int wantVolumetrics = (sky.mHaveWeather && fogEnabled()) ? 1 : 0;
+            if (wantVolumetrics != mVolumetricsEnabled)
+            {
+                mVolumetricsEnabled = wantVolumetrics;
+                mRuntime.setConfigVariable("rtx.volumetrics.enable", wantVolumetrics ? "True" : "False");
+                Log(Debug::Info) << "Remix sky: volumetric fog "
+                                 << (wantVolumetrics ? "ON (cell has weather)"
+                                                     : "OFF (cell has no weather, so no outdoor medium indoors)");
+            }
         }
 
         // The weather preset drives the runtime's own blender, which interpolates between presets on its

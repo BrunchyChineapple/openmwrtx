@@ -5,6 +5,7 @@
 #include <string>
 
 #include <QCompleter>
+#include <QDoubleSpinBox>
 #include <QDesktopServices>
 #include <QFileDialog>
 #include <QMenu>
@@ -56,6 +57,26 @@ namespace
     void saveSettingInt(const QSpinBox& spinBox, Settings::SettingValue<int>& value)
     {
         value.set(spinBox.value());
+    }
+
+    void loadSettingFloat(const Settings::SettingValue<float>& value, QDoubleSpinBox& spinBox)
+    {
+        spinBox.setValue(value);
+    }
+
+    void saveSettingFloat(const QDoubleSpinBox& spinBox, Settings::SettingValue<float>& value)
+    {
+        value.set(static_cast<float>(spinBox.value()));
+    }
+
+    void loadSettingString(const Settings::SettingValue<std::string>& value, QLineEdit& lineEdit)
+    {
+        lineEdit.setText(QString::fromStdString(value.get()));
+    }
+
+    void saveSettingString(const QLineEdit& lineEdit, Settings::SettingValue<std::string>& value)
+    {
+        value.set(lineEdit.text().toStdString());
     }
 
     int toIndex(Settings::HrtfMode value)
@@ -412,6 +433,23 @@ bool Launcher::SettingsPage::loadSettings()
 
         startDefaultCharacterAtField->setText(mGameSettings.value("start").value);
         runScriptAfterStartupField->setText(mGameSettings.value("script-run").value);
+
+        // RTX Remix diagnostics. See the [Remix] block in settings-default.cfg for what each one does; the
+        // tooltips in the .ui carry the short version.
+        loadSettingInt(Settings::remix().mMaterialLogLimit, *remixMaterialLogLimit);
+        loadSettingInt(Settings::remix().mTextureLogLimit, *remixTextureLogLimit);
+        loadSettingInt(Settings::remix().mSceneLogFrames, *remixSceneLogFrames);
+        loadSettingBool(Settings::remix().mProbeQuad, *remixProbeQuadCheckBox);
+        loadSettingBool(Settings::remix().mUntexturedEmissive, *remixUntexturedEmissiveCheckBox);
+        loadSettingBool(Settings::remix().mTerrainLayers, *remixTerrainLayersCheckBox);
+        loadSettingBool(Settings::remix().mTerrainComposite, *remixTerrainCompositeCheckBox);
+        loadSettingBool(Settings::remix().mCompositeCompress, *remixCompositeCompressCheckBox);
+        loadSettingBool(Settings::remix().mPackMatching, *remixPackMatchingCheckBox);
+        loadSettingBool(Settings::remix().mBudgetNearestFirst, *remixBudgetNearestFirstCheckBox);
+        loadSettingFloat(Settings::remix().mCompositeBudgetMs, *remixCompositeBudgetMs);
+        loadSettingFloat(Settings::remix().mCullMargin, *remixCullMargin);
+        loadSettingFloat(Settings::remix().mMinAngularRadius, *remixMinAngularRadius);
+        loadSettingString(Settings::remix().mSkipTextures, *remixSkipTexturesField);
     }
     return true;
 }
@@ -687,6 +725,21 @@ void Launcher::SettingsPage::saveSettings()
         QString scriptRun = runScriptAfterStartupField->text();
         if (scriptRun != mGameSettings.value("script-run").value)
             mGameSettings.setValue("script-run", { scriptRun });
+
+        saveSettingInt(*remixMaterialLogLimit, Settings::remix().mMaterialLogLimit);
+        saveSettingInt(*remixTextureLogLimit, Settings::remix().mTextureLogLimit);
+        saveSettingInt(*remixSceneLogFrames, Settings::remix().mSceneLogFrames);
+        saveSettingBool(*remixProbeQuadCheckBox, Settings::remix().mProbeQuad);
+        saveSettingBool(*remixUntexturedEmissiveCheckBox, Settings::remix().mUntexturedEmissive);
+        saveSettingBool(*remixTerrainLayersCheckBox, Settings::remix().mTerrainLayers);
+        saveSettingBool(*remixTerrainCompositeCheckBox, Settings::remix().mTerrainComposite);
+        saveSettingBool(*remixCompositeCompressCheckBox, Settings::remix().mCompositeCompress);
+        saveSettingBool(*remixPackMatchingCheckBox, Settings::remix().mPackMatching);
+        saveSettingBool(*remixBudgetNearestFirstCheckBox, Settings::remix().mBudgetNearestFirst);
+        saveSettingFloat(*remixCompositeBudgetMs, Settings::remix().mCompositeBudgetMs);
+        saveSettingFloat(*remixCullMargin, Settings::remix().mCullMargin);
+        saveSettingFloat(*remixMinAngularRadius, Settings::remix().mMinAngularRadius);
+        saveSettingString(*remixSkipTexturesField, Settings::remix().mSkipTextures);
     }
 }
 

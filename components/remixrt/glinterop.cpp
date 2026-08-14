@@ -1355,6 +1355,45 @@ namespace
     constexpr GLenum kFramebufferBinding = 0x8CA6;
     constexpr GLenum kColorAttachment0 = 0x8CE0;
     constexpr GLenum kFramebufferComplete = 0x8CD5;
+    constexpr GLenum kReadFramebuffer = 0x8CA8;
+    constexpr GLenum kDrawFramebuffer = 0x8CA9;
+    constexpr GLenum kRgba8 = 0x8058;
+
+    /// Whether the interface is assembled in a texture of our own and blitted into the shared image, or
+    /// drawn straight into it.
+    ///
+    /// On by default because drawing straight in is a data race with no ordering available. The shared
+    /// overlay image is imported with an empty ExternalSync on purpose -- the GL/Vulkan semaphore
+    /// handshake does not work on this driver in either direction (see engine.cpp where the import is
+    /// created) -- so nothing sequences OpenMW's writes against Remix's read of the same memory.
+    ///
+    /// The comment at that decision put the cost at "a single frame of a half-drawn menu". It is worse
+    /// than that, because the target is cleared to transparent black before the interface is drawn: a
+    /// read landing between the clear and the draws sees an image with nothing in it. Composited over a
+    /// path-traced frame that is nearly black anyway -- a main menu submits one instance and no lights --
+    /// that is the whole screen going dark for a frame, which is the reported whole-screen flicker on the
+    /// startup splash and in menus rather than a subtle artifact.
+    ///
+    /// Rejected: a GL fence or glFinish after the draws. Both establish that the writes have landed at
+    /// one instant, and neither stops the next frame's clear reopening the same window, because Remix
+    /// composites on its own schedule and the image's timeline stays [clear][draw][clear][draw].
+    /// Ordering a single point in that sequence does not make the other points safe.
+    ///
+    /// Rejected: a second shared image, alternating. It removes the race just as well, but selecting
+    /// which one to composite needs a runtime-side API that does not exist, and it costs a second
+    /// full-resolution image where this costs one that never leaves OpenMW's own memory.
+    ///
+    /// What remains is a torn blit: a read during the copy gets part of the previous interface frame and
+    /// part of this one. Both are complete frames of a mostly static interface, so the difference is
+    /// nothing like an empty image.
+    bool overlayScratchEnabled()
+    {
+        static const bool value = []() -> bool {
+            const char* env = std::getenv("OPENMW_REMIX_OVERLAY_SCRATCH");
+            return env == nullptr || *env == '\0' || *env != '0';
+        }();
+        return value;
+    }
 }
 
 namespace RemixRT
@@ -1428,7 +1467,11 @@ namespace RemixRT
         glGetIntegerv(kFramebufferBinding, &mSavedFramebuffer);
         glGetIntegerv(GL_VIEWPORT, mSavedViewport);
 
-        ext->glBindFramebuffer(kFramebuffer, mFramebuffer);
+        // Assemble the interface somewhere Remix cannot see, when that is available. The clear below is
+        // what makes drawing straight into the shared image unsafe rather than merely unsynchronised, so
+        // the clear has to land on memory no other API reads.
+        mScratchBound = overlayScratchEnabled() && ensureScratch(ext);
+        ext->glBindFramebuffer(kFramebuffer, mScratchBound ? mScratchFramebuffer : mFramebuffer);
         glViewport(0, 0, static_cast<GLsizei>(mWidth), static_cast<GLsizei>(mHeight));
 
         // Transparent black, every frame. The whole image is replaced rather than accumulated: the GUI is
@@ -1442,8 +1485,87 @@ namespace RemixRT
         {
             mLoggedReady = true;
             Log(Debug::Info) << "Remix: OpenMW's interface is being drawn into Remix's overlay image ("
-                             << mWidth << "x" << mHeight << ", GL texture " << texture << ")";
+                             << mWidth << "x" << mHeight << ", GL texture " << texture << ")"
+                             << (mScratchBound ? ", assembled in a private target and blitted in once"
+                                                 " complete so the shared image is never seen mid-clear"
+                                               : ", drawn straight in -- unsynchronised, and the clear is"
+                                                 " visible to Remix as an empty overlay");
         }
+    }
+
+    bool GuiOverlayTarget::ensureScratch(osg::GLExtensions* ext) const
+    {
+        if (mScratchFailed)
+            return false;
+        if (mScratchFramebuffer != 0)
+            return true;
+
+        // glBlitFramebuffer is what moves the finished interface across, so without it there is no point
+        // building the rest. Falls back rather than failing: drawing straight into the shared image races,
+        // but it does put an interface on screen, and that is better than none.
+        if (ext->glBlitFramebuffer == nullptr || ext->glGenFramebuffers == nullptr
+            || ext->glBindFramebuffer == nullptr || ext->glFramebufferTexture2D == nullptr
+            || ext->glCheckFramebufferStatus == nullptr)
+        {
+            Log(Debug::Warning) << "Remix: the driver does not expose framebuffer blitting, so OpenMW's "
+                                   "interface has to be drawn straight into the shared overlay image; "
+                                   "expect the interface to drop out for single frames";
+            mScratchFailed = true;
+            return false;
+        }
+
+        glGenTextures(1, &mScratchTexture);
+        if (mScratchTexture == 0)
+        {
+            mScratchFailed = true;
+            return false;
+        }
+
+        glBindTexture(GL_TEXTURE_2D, mScratchTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, kRgba8, static_cast<GLsizei>(mWidth), static_cast<GLsizei>(mHeight),
+            0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        // No mips and no filtering: this is only ever a blit source at 1:1, so anything else is memory
+        // and driver work for a sample that never happens.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        ext->glGenFramebuffers(1, &mScratchFramebuffer);
+        if (mScratchFramebuffer == 0)
+        {
+            glDeleteTextures(1, &mScratchTexture);
+            mScratchTexture = 0;
+            mScratchFailed = true;
+            return false;
+        }
+
+        // Bound to kFramebuffer rather than the read/draw split, because completeness is a property of the
+        // object and checking it here keeps the two bindings in end() to their one job.
+        ext->glBindFramebuffer(kFramebuffer, mScratchFramebuffer);
+        ext->glFramebufferTexture2D(kFramebuffer, kColorAttachment0, GL_TEXTURE_2D, mScratchTexture, 0);
+        const GLenum status = ext->glCheckFramebufferStatus(kFramebuffer);
+        ext->glBindFramebuffer(kFramebuffer, 0);
+
+        if (status != kFramebufferComplete)
+        {
+            Log(Debug::Warning) << "Remix: the interface scratch framebuffer is incomplete (status 0x"
+                                << std::hex << status << std::dec
+                                << "); falling back to drawing straight into the shared overlay image";
+            ext->glDeleteFramebuffers(1, &mScratchFramebuffer);
+            mScratchFramebuffer = 0;
+            glDeleteTextures(1, &mScratchTexture);
+            mScratchTexture = 0;
+            mScratchFailed = true;
+            return false;
+        }
+
+        if (!mLoggedScratch)
+        {
+            mLoggedScratch = true;
+            Log(Debug::Info) << "Remix: interface scratch target ready (" << mWidth << "x" << mHeight
+                             << " RGBA8, GL texture " << mScratchTexture << ")";
+        }
+        return true;
     }
 
     void GuiOverlayTarget::end(osg::RenderInfo& renderInfo) const
@@ -1458,6 +1580,31 @@ namespace RemixRT
         osg::GLExtensions* ext = state->get<osg::GLExtensions>();
         if (ext == nullptr || ext->glBindFramebuffer == nullptr)
             return;
+
+        // Hand the finished interface over in one copy.
+        //
+        // This is the whole point of the scratch target: the shared image goes straight from one complete
+        // interface frame to the next, with no clear and no partial draw in between for Remix to catch.
+        // Blitting the full extent rather than a dirty rectangle because the source was just cleared to
+        // transparent black everywhere, so every texel is meaningful -- a partial copy would leave last
+        // frame's interface outside the rectangle.
+        //
+        // GL_NEAREST and matching extents: this is a 1:1 copy of the same format and size, so there is no
+        // filtering decision to make and a linear filter would only invite the driver to resample.
+        if (mScratchBound && mScratchFramebuffer != 0 && ext->glBlitFramebuffer != nullptr)
+        {
+            ext->glBindFramebuffer(kReadFramebuffer, mScratchFramebuffer);
+            ext->glBindFramebuffer(kDrawFramebuffer, mFramebuffer);
+            ext->glBlitFramebuffer(0, 0, static_cast<GLint>(mWidth), static_cast<GLint>(mHeight), 0, 0,
+                static_cast<GLint>(mWidth), static_cast<GLint>(mHeight), GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            // Both bindings, because binding kFramebuffer below sets read and draw together on a driver
+            // that treats them as one target and leaves them split on one that does not. Restoring
+            // explicitly means the saved value takes effect either way.
+            ext->glBindFramebuffer(kReadFramebuffer, static_cast<GLuint>(mSavedFramebuffer));
+            ext->glBindFramebuffer(kDrawFramebuffer, static_cast<GLuint>(mSavedFramebuffer));
+        }
+
+        mScratchBound = false;
 
         ext->glBindFramebuffer(kFramebuffer, static_cast<GLuint>(mSavedFramebuffer));
         glViewport(mSavedViewport[0], mSavedViewport[1], mSavedViewport[2], mSavedViewport[3]);

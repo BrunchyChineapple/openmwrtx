@@ -2100,6 +2100,33 @@ void OMW::Engine::prepareEngine()
             // for Morrowind it is 143000, a 43% error in every atmospheric distance.
             mRemix->setConfigVariable("rtx.sceneScale", "1.43");
             mRemix->setConfigVariable("rtx.skyMode", "1");
+
+            // V-Sync has to be stated, because nothing else will state it for us.
+            //
+            // rtx.enableVsync defaults to EnableVsync::WaitingForImplicitSwapchain, and exactly one place in
+            // the runtime resolves that: d3d9_swapchain.cpp latches On or Off from the D3D9 present
+            // parameters when the game creates its implicit swapchain. An API host never creates one, so the
+            // option would sit in the waiting state for the whole session.
+            //
+            // Nothing downstream handles that value. d3d9_swapchain.cpp switches on enableVsyncState with
+            // cases for On and Off only, and dxvk_imgui.cpp asserts the waiting value never reaches it -- an
+            // assert compiled out of the release build, so the failure is silent rather than loud. Stating a
+            // real value here resolves it through EnableVsyncOnChange.
+            //
+            // What this does NOT fix: tearing while frame generation is running. RtxContext::dispatchDLFG
+            // rewrites this option to Off on every frame it is enabled, commented "force vsync off if DLFG is
+            // enabled, as we don't properly support FG + vsync", and rtx_fork_fsr_framegen.cpp does the same.
+            // So with DLFG or FSR frame generation active this line is overridden immediately and presents
+            // are paced only by frame generation itself -- rtx.dlfg.enablePresentMetering selects hardware
+            // metering or CPU pacing for that. Whole-screen tearing under frame generation is therefore a
+            // known limitation of the runtime rather than something this push addresses, and it is why the
+            // non-frame-generation launchers do not exhibit it: they keep V-Sync.
+            //
+            // It still matters for every path that is not generating frames, which is where an unresolved
+            // present mode would otherwise leave presentation unsynchronised. On rather than Off because the
+            // host does not present the path-traced image itself and so cannot pace it. The option carries
+            // UserSetting, so the Remix menu's V-Sync checkbox still overrides this.
+            mRemix->setConfigVariable("rtx.enableVsync", "1");
             mRemix->setGameValue("__weather.target", "clear");
             mRemix->setGameValue("__weather.blend_seconds", "0");
         }
@@ -2254,8 +2281,22 @@ void OMW::Engine::prepareEngine()
             // operation, it is the operation. Stated as a share of the loop rather than as a frame rate,
             // because a frame rate cannot be chosen without knowing what a frame costs, and that is exactly
             // what varies. Overridable so the numbers can be measured rather than argued about.
+            // The delay was 200 ms, and that number was derived from the measurement above: at ~1,483 ms
+            // a present, waiting 200 ms before spending one was generous. A present now costs 9.5 ms on
+            // average and 0.07 ms at best -- 155 times less -- so the same 200 ms no longer buys anything
+            // and instead suppresses the screen entirely for every load shorter than that. Which is most
+            // of them: the measured cell load was 160 ms of real work, so it never reached the gate and
+            // showed no art and no progress bar at all. Only the first save load from the main menu is
+            // long enough to clear it, which is exactly the reported behaviour -- one loading screen per
+            // session and none afterwards.
+            //
+            // 32 ms is about two frames at 60 Hz. It keeps the thing the delay was really for, which is
+            // not paying for a screen nobody could perceive, while letting anything a human would call a
+            // pause put something up. The share below is what bounds the cost from then on, and being a
+            // share it rescales itself as the present cost changes -- unlike this, which had to be
+            // recalibrated by hand and was not.
             const double nestedShare = envDouble("OPENMW_REMIX_NESTED_PRESENT_SHARE", 0.25);
-            const double nestedFirstDelayMs = envDouble("OPENMW_REMIX_NESTED_PRESENT_DELAY_MS", 200.0);
+            const double nestedFirstDelayMs = envDouble("OPENMW_REMIX_NESTED_PRESENT_DELAY_MS", 32.0);
 
             RemixRT::setNestedFramePresenter([this, nestedShare, nestedFirstDelayMs]() {
                 if (mRemix == nullptr || !mRemix->isReady())
@@ -2271,14 +2312,49 @@ void OMW::Engine::prepareEngine()
                 // per burst. A gap longer than any single presented frame means the previous burst ended, so
                 // the next starts with a full allowance rather than inheriting a spent one.
                 constexpr double burstGapMs = 500.0;
+
+                // Per-burst accounting, because the session totals cannot answer the question the ration
+                // actually poses. "Presented 315, rationed 190" is consistent with every burst getting a
+                // fair share and with half the bursts getting nothing at all, and those are different
+                // states: the second one is a loading screen that never appeared. Statics rather than
+                // members because this lambda is constructed and installed exactly once.
+                //
+                // Reported when the burst ends, which is detected lazily on the next call, so a line can
+                // arrive well after the load it describes. Capped, because a long session has many.
+                static unsigned int s_burstStartFrames = 0;
+                static unsigned int s_burstStartSkipped = 0;
+                static unsigned int s_burstReports = 0;
+                constexpr unsigned int kMaxBurstReports = 24;
+
                 if (mRemixNestedSequenceActive && since(mRemixNestedLastCall) > burstGapMs)
+                {
                     mRemixNestedSequenceActive = false;
+
+                    if (s_burstReports < kMaxBurstReports
+                        && RemixRT::diagEnabled(RemixRT::Diag::NestedBursts))
+                    {
+                        ++s_burstReports;
+                        const unsigned int shown = stats.mFrames - s_burstStartFrames;
+                        const unsigned int dropped = stats.mSkipped - s_burstStartSkipped;
+                        Log(Debug::Info)
+                            << "Remix nested burst ended: " << shown << " frames presented, " << dropped
+                            << " rationed over "
+                            << std::chrono::duration<double, std::milli>(mRemixNestedLastCall
+                                   - mRemixNestedSequenceStart)
+                                   .count()
+                            << " ms of loop time, " << mRemixNestedSequenceSpentMs << " ms of it presenting"
+                            << (shown == 0 ? " -- nothing reached the screen for this one" : "") << " ("
+                            << s_burstReports << " of " << kMaxBurstReports << ")";
+                    }
+                }
 
                 if (!mRemixNestedSequenceActive)
                 {
                     mRemixNestedSequenceActive = true;
                     mRemixNestedSequenceStart = now;
                     mRemixNestedSequenceSpentMs = 0.0;
+                    s_burstStartFrames = stats.mFrames;
+                    s_burstStartSkipped = stats.mSkipped;
                 }
                 mRemixNestedLastCall = now;
 
@@ -2323,6 +2399,11 @@ void OMW::Engine::prepareEngine()
                 mRemixTiming.mNestedPresents += 1;
                 mRemixTiming.mNestedPresentMs += presentMs;
             });
+
+            // Printed here rather than earlier because this is the point where the host-side streams the
+            // manifest describes become reachable, and a manifest that lists an instrument nothing can
+            // reach yet would be misleading about what a run actually recorded.
+            RemixRT::logDiagManifest();
 
             if (mRemix != nullptr && mRemix->setOverlayEnabled(true, 1.0f))
             {

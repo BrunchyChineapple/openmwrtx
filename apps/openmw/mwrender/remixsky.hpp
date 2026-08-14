@@ -61,7 +61,6 @@ namespace MWRender
         float mMoonPhase[2] = { std::numeric_limits<float>::quiet_NaN(),
             std::numeric_limits<float>::quiet_NaN() };
         float mStarBrightness = std::numeric_limits<float>::quiet_NaN();
-        float mNightSkyBrightness = std::numeric_limits<float>::quiet_NaN();
         float mFogDistance = std::numeric_limits<float>::quiet_NaN();
         float mFroxelDistance = std::numeric_limits<float>::quiet_NaN();
         float mWaterPlane = std::numeric_limits<float>::quiet_NaN();
@@ -78,6 +77,14 @@ namespace MWRender
         int mMoonEnabled[2] = { -1, -1 };
         int mCloudEnabled = -1;
         int mExterior = -1;
+        /// Day/night state at the last changeover log. -1 so the first update always reports.
+        int mLoggedNight = -1;
+
+        /// Whether rtx.volumetrics.enable was last pushed on (1), off (0), or never (-1).
+        ///
+        /// Tri-state so the first frame always writes, whichever way it goes. The runtime's weather blender
+        /// does not touch this option, so a value pushed here stays put until the cell type changes.
+        int mVolumetricsEnabled = -1;
         /// Weather preset last handed to the blender. -1 rather than 0, because 0 is Clear.
         int mWeatherTarget = -1;
         bool mLoggedOnce = false;

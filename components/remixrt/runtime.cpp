@@ -13,6 +13,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1103,7 +1104,10 @@ namespace RemixRT
         unsigned long long textureHash, float roughness, float metallic,
         unsigned char alphaTestReference, unsigned long long normalTextureHash, float emissive,
         int blendType, unsigned long long maskTextureHash, const float* maskTransform,
-        unsigned long long roughnessTextureHash, unsigned long long emissiveTextureHash)
+        unsigned long long roughnessTextureHash, unsigned long long emissiveTextureHash,
+        const float* albedoConstant, float opacityConstant, const float* emissiveColour,
+        unsigned char wrapModeU, unsigned char wrapModeV, unsigned long long heightTextureHash,
+        float displaceIn, float displaceOut, unsigned char spriteSheetCols, unsigned char spriteSheetFps)
     {
         if (!mImpl->mStarted || mImpl->mApi.CreateMaterial == nullptr || hash == 0 || textureHash == 0)
             return 0;
@@ -1130,10 +1134,14 @@ namespace RemixRT
 
         remixapi_MaterialInfoOpaqueEXT opaque = {};
         opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-        // Left at white so the texture is what shows. The runtime multiplies the two, so a tinted
-        // constant here would darken every textured surface for no reason.
-        opaque.albedoConstant = { 1.0f, 1.0f, 1.0f };
-        opaque.opacityConstant = 1.0f;
+        // White unless the caller has a real tint. The runtime multiplies the two, so a tint invented here
+        // would darken every textured surface for no reason -- but NiMaterialProperty's mDiffuse is not
+        // invented, and pinning this to white discarded it for every tinted object in the game.
+        opaque.albedoConstant = albedoConstant != nullptr
+            ? remixapi_Float3D{ albedoConstant[0], albedoConstant[1], albedoConstant[2] }
+            : remixapi_Float3D{ 1.0f, 1.0f, 1.0f };
+        // Multiplies the texture's alpha rather than replacing it, so 1.0 leaves the texture in charge.
+        opaque.opacityConstant = opacityConstant;
         opaque.roughnessConstant = roughness;
         opaque.metallicConstant = metallic;
         // A bound roughness map supersedes the constant per texel; the constant still covers every surface
@@ -1170,8 +1178,23 @@ namespace RemixRT
         // Deliberately not smuggled through a scalar such as anisotropy, which is read elsewhere. The
         // mask's *UV mapping* does not fit anywhere honest, so it travels in a real extension struct
         // below rather than claiming a third slot.
+        //
+        // Parallax shares this slot, so the two are mutually exclusive. The mask wins: a terrain layer has no
+        // normal-height map, and reading a coverage mask as a height field would carve the ground up by its
+        // blend weights. Displacement stays zero for the mask, which is exactly what keeps the runtime from
+        // looking at the slot at all.
+        wchar_t heightPath[32] = {};
         if (maskTextureHash != 0)
+        {
             opaque.heightTexture = maskPath;
+        }
+        else if (heightTextureHash != 0 && (displaceIn > 0.0f || displaceOut > 0.0f))
+        {
+            std::swprintf(heightPath, std::size(heightPath), L"0x%llx", heightTextureHash);
+            opaque.heightTexture = heightPath;
+            opaque.displaceIn = displaceIn;
+            opaque.displaceOut = displaceOut;
+        }
 
         // The mask's own UV mapping, which the height slot cannot carry and the runtime must not guess.
         //
@@ -1211,9 +1234,26 @@ namespace RemixRT
             // Radiance scale rather than colour, for the same reason the light conversion separates the two.
             material.emissiveTexture = emissiveTextureHash != 0 ? emissivePath : pseudoPath;
             material.emissiveIntensity = emissive;
-            material.emissiveColorConstant = { 1.0f, 1.0f, 1.0f };
+            // Radiance scale and colour are stored separately by the runtime, so a caller with a coloured
+            // emission normalises it and sends the magnitude as the intensity. White here meant a green rune
+            // or a blue glow arrived white no matter what the asset said.
+            material.emissiveColorConstant = emissiveColour != nullptr
+                ? remixapi_Float3D{ emissiveColour[0], emissiveColour[1], emissiveColour[2] }
+                : remixapi_Float3D{ 1.0f, 1.0f, 1.0f };
         }
         applyDefaultSamplerState(material);
+        // Addressing from the source texture, overriding the Repeat default only where the caller asks.
+        material.wrapModeU = wrapModeU;
+        material.wrapModeV = wrapModeV;
+        // A sprite sheet albedo, animated by the runtime rather than by swapping the texture per frame. One
+        // row, so the frame count is the column count -- the runtime derives its tile from
+        // `frame % cols, frame / cols`, and a single row keeps the second term zero.
+        if (spriteSheetCols > 0 && spriteSheetFps > 0)
+        {
+            material.spriteSheetRow = 1;
+            material.spriteSheetCol = spriteSheetCols;
+            material.spriteSheetFps = spriteSheetFps;
+        }
 
         remixapi_MaterialHandle handle = nullptr;
         if (mImpl->mApi.CreateMaterial(&material, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -1587,14 +1627,41 @@ namespace RemixRT
         if (!mImpl->mHaveOutput || mImpl->mDevice == nullptr)
             return false;
 
-        const UINT width = mImpl->mOutputImage.mWidth;
-        const UINT height = mImpl->mOutputImage.mHeight;
+        // Asked of the surface rather than assumed, because assuming is precisely what broke this.
+        //
+        // GetRenderTargetData rejects the copy unless source and destination agree on format and size, and
+        // this staging surface was created as D3DFMT_A8R8G8B8 while the shared target is created as
+        // D3DFMT_A16B16G16R16F back in acquireOutputTarget. Every call returned D3DERR_INVALIDCALL, so the
+        // probe never ran once and its error line read like a rendering fault rather than a broken
+        // instrument. Reading the format back also means changing the target's format keeps this working
+        // instead of quietly breaking it again.
+        D3DSURFACE_DESC desc = {};
+        HRESULT hr = mImpl->mOutputSurface->GetDesc(&desc);
+        if (FAILED(hr))
+        {
+            Log(Debug::Error) << "Remix probe: GetDesc failed, hr 0x" << std::hex << hr << std::dec;
+            return false;
+        }
+
+        const UINT width = desc.Width;
+        const UINT height = desc.Height;
+
+        // Only a format this function can decode is worth copying a full frame for. Saying so beats a
+        // successful read interpreted through the wrong decoder, which is what a byte loop over half-float
+        // texels would have produced had the copy ever succeeded.
+        if (desc.Format != D3DFMT_A16B16G16R16F && desc.Format != D3DFMT_A8R8G8B8)
+        {
+            Log(Debug::Warning) << "Remix probe: shared target format "
+                                << static_cast<unsigned int>(desc.Format)
+                                << " is not one this probe can sample; no conclusion drawn.";
+            return false;
+        }
 
         // A render target cannot be locked directly; GetRenderTargetData copies it into a system-memory
         // plain surface that can be.
         IDirect3DSurface9* staging = nullptr;
-        HRESULT hr = mImpl->mDevice->CreateOffscreenPlainSurface(
-            width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        hr = mImpl->mDevice->CreateOffscreenPlainSurface(
+            width, height, desc.Format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
         if (FAILED(hr) || staging == nullptr)
         {
             Log(Debug::Error) << "Remix probe: CreateOffscreenPlainSurface failed, hr 0x" << std::hex << hr
@@ -1622,23 +1689,43 @@ namespace RemixRT
 
         // Sparse sample rather than every pixel: enough to answer "is anything lit" at 4K without
         // walking 33 MB.
-        unsigned int maxChannel = 0;
+        //
+        // Decoded through the file-scope halfToFloat for the half-float target rather than a second copy of
+        // that arithmetic. Only RGB is asked about, because an opaque alpha over a black frame is still a
+        // black frame. Litness is tested on the bit pattern rather than the decoded value so a NaN texel --
+        // which halfToFloat deliberately preserves -- still counts as "something is there" even though it
+        // cannot win the peak comparison.
+        float maxChannel = 0.0f;
         unsigned int nonBlack = 0;
         unsigned int sampled = 0;
         const auto* base = static_cast<const unsigned char*>(locked.pBits);
+        const bool isHalf = desc.Format == D3DFMT_A16B16G16R16F;
         for (UINT y = 0; y < height; y += 8)
         {
-            const auto* row = reinterpret_cast<const unsigned int*>(base + locked.Pitch * y);
+            const auto* rowBytes = base + static_cast<std::size_t>(locked.Pitch) * y;
             for (UINT x = 0; x < width; x += 8)
             {
-                const unsigned int pixel = row[x];
                 ++sampled;
-                for (int shift = 0; shift < 24; shift += 8)
+                bool lit = false;
+                if (isHalf)
                 {
-                    const unsigned int channel = (pixel >> shift) & 0xFFu;
-                    maxChannel = std::max(maxChannel, channel);
+                    const auto* texel = reinterpret_cast<const unsigned short*>(rowBytes) + 4u * x;
+                    for (int channel = 0; channel < 3; ++channel)
+                    {
+                        maxChannel = std::max(maxChannel, halfToFloat(texel[channel]));
+                        if ((texel[channel] & 0x7FFFu) != 0u)
+                            lit = true;
+                    }
                 }
-                if ((pixel & 0x00FFFFFFu) != 0)
+                else
+                {
+                    const unsigned int pixel = reinterpret_cast<const unsigned int*>(rowBytes)[x];
+                    for (int shift = 0; shift < 24; shift += 8)
+                        maxChannel
+                            = std::max(maxChannel, static_cast<float>((pixel >> shift) & 0xFFu) / 255.0f);
+                    lit = (pixel & 0x00FFFFFFu) != 0u;
+                }
+                if (lit)
                     ++nonBlack;
             }
         }
@@ -1647,7 +1734,8 @@ namespace RemixRT
         staging->Release();
 
         Log(Debug::Info) << "Remix probe: sampled " << sampled << " pixels of the shared target, "
-                         << nonBlack << " non-black, brightest channel " << maxChannel << "/255"
+                         << nonBlack << " non-black, brightest channel " << maxChannel
+                         << " (linear, 1.0 nominal white)"
                          << (nonBlack == 0
                                     ? " -- Remix produced a black image, so the problem is upstream of the interop"
                                     : " -- Remix produced an image, so the problem is the GL side (sync or layout)");
@@ -2151,6 +2239,70 @@ namespace RemixRT
     namespace
     {
         std::function<void()> gNestedFramePresenter;
+
+        struct DiagStream
+        {
+            Diag mWhich;
+            const char* mEnv;
+            bool mDefault;
+            const char* mWhat;
+        };
+
+        /// Defaults are on for anything that costs one line per event, which is all of these. The point of
+        /// the switch is that it exists and is named in the log, not that it starts off.
+        constexpr DiagStream kDiagStreams[] = {
+            { Diag::LoadingScreen, "OPENMW_REMIX_DIAG_LOADING", true,
+                "loading screen background choice and layout, one line per screen" },
+            { Diag::NestedBursts, "OPENMW_REMIX_DIAG_NESTED", true,
+                "per-burst nested present accounting, one line per burst" },
+        };
+
+        /// Reads a switch once. Absent or empty means the default; anything other than "0" is on.
+        ///
+        /// The master variable is checked first and short-circuits, so OPENMW_REMIX_DIAG=0 does not need
+        /// every individual one cleared alongside it.
+        bool readDiag(const DiagStream& stream)
+        {
+            if (const char* master = std::getenv("OPENMW_REMIX_DIAG");
+                master != nullptr && *master != '\0' && *master == '0')
+                return false;
+
+            const char* value = std::getenv(stream.mEnv);
+            if (value == nullptr || *value == '\0')
+                return stream.mDefault;
+            return *value != '0';
+        }
+    }
+
+    bool diagEnabled(Diag which)
+    {
+        // Resolved once per stream and cached. These are read from deep inside per-event code paths, and
+        // an environment lookup there would be the only cost any of this has.
+        static const auto resolved = []() {
+            std::array<bool, std::size(kDiagStreams)> values{};
+            for (std::size_t i = 0; i < std::size(kDiagStreams); ++i)
+                values[i] = readDiag(kDiagStreams[i]);
+            return values;
+        }();
+
+        for (std::size_t i = 0; i < std::size(kDiagStreams); ++i)
+            if (kDiagStreams[i].mWhich == which)
+                return resolved[i];
+        return false;
+    }
+
+    void logDiagManifest()
+    {
+        std::string line = "Remix host instrumentation:";
+        for (const DiagStream& stream : kDiagStreams)
+            line += std::string(" ") + stream.mEnv + "=" + (diagEnabled(stream.mWhich) ? "on" : "off");
+        Log(Debug::Info) << line;
+        Log(Debug::Info) << "Remix host instrumentation: set any of the above to 0, or "
+                            "OPENMW_REMIX_DIAG=0 to silence all of them, before measuring frame time. "
+                            "Each is one line per event, not per frame; the per-frame streams are "
+                            "[Remix] scene log frames, material log limit and texture log limit.";
+        for (const DiagStream& stream : kDiagStreams)
+            Log(Debug::Verbose) << "Remix host instrumentation:   " << stream.mEnv << " -- " << stream.mWhat;
     }
 
     void setNestedFramePresenter(std::function<void()> present)
@@ -2162,6 +2314,11 @@ namespace RemixRT
     {
         if (gNestedFramePresenter)
             gNestedFramePresenter();
+    }
+
+    bool nestedFramePresenterInstalled()
+    {
+        return static_cast<bool>(gNestedFramePresenter);
     }
 
     NestedFrameStats& nestedFrameStats()

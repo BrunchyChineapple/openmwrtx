@@ -281,6 +281,10 @@ namespace RemixRT
         bool failed() const { return mFailed; }
 
     private:
+        /// Creates the scratch texture and its framebuffer on first use. -> false if that is not possible,
+        /// in which case the caller draws straight into the shared image as it used to.
+        bool ensureScratch(osg::GLExtensions* ext) const;
+
         ImportOperation* mImport;
         unsigned int mWidth;
         unsigned int mHeight;
@@ -291,6 +295,21 @@ namespace RemixRT
         /// draws next. Only valid between the two calls.
         mutable int mSavedFramebuffer = 0;
         mutable int mSavedViewport[4] = { 0, 0, 0, 0 };
+
+        /// A private target the interface is assembled in, blitted into the shared image once it is
+        /// complete. Ordinary GL memory that no other API can see, which is the point: the shared image
+        /// is never observed mid-clear, only ever holding one finished interface frame or another.
+        /// See overlayScratchEnabled in glinterop.cpp for why a fence cannot do this job.
+        mutable unsigned int mScratchTexture = 0;
+        mutable unsigned int mScratchFramebuffer = 0;
+        /// Set when the scratch path cannot be built. Distinct from mFailed: this one falls back to
+        /// drawing straight into the shared image, which races but still puts an interface on screen.
+        mutable bool mScratchFailed = false;
+        /// True between begin and end when the interface went to the scratch target, so end knows whether
+        /// there is anything to blit. Not derived from mScratchTexture, because begin can return early
+        /// before binding anything.
+        mutable bool mScratchBound = false;
+        mutable bool mLoggedScratch = false;
     };
 
     /// Adapters that drive GuiOverlayTarget from a camera's pre- and post-draw callbacks.

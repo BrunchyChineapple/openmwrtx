@@ -481,11 +481,40 @@ namespace RemixRT
         ///        right for a flame quad -- the whole quad glows -- and wrong for a lantern, where only the
         ///        glass should. \a emissive still scales it, so this slot decides where the light comes from
         ///        and that scalar decides how much.
+        /// @param albedoConstant linear RGB tint multiplying the albedo texture, or null for white. This is
+        ///        NiMaterialProperty's mDiffuse. A value below white darkens the surface, which is the point
+        ///        where the asset asks for it and a hazard where it does not, so callers should pass null
+        ///        rather than a guess.
+        /// @param opacityConstant the material's own opacity, multiplying whatever the texture's alpha gives.
+        ///        NiMaterialProperty's mAlpha. 1.0 leaves the texture in charge.
+        /// @param emissiveColour unit linear RGB the emission is tinted with, or null for white. Paired with
+        ///        \a emissive, which carries the magnitude: the runtime stores emission as an intensity and a
+        ///        colour, so a caller with a colour should normalise it and put the magnitude in \a emissive.
+        /// @param wrapModeU,wrapModeV MDL addressing enumerants, 0 Clamp and 1 Repeat. Repeat unless the
+        ///        source texture actually clamps -- a wrong Clamp smears edge texels along the surface.
+        /// @param heightTextureHash optional height field for parallax occlusion mapping, sampled from red,
+        ///        with 1.0 meaning the outer surface and lower values displacing inward. Ignored unless
+        ///        \a displaceIn or \a displaceOut is non-zero, and mutually exclusive with
+        ///        \a maskTextureHash, which travels through the same slot in the runtime's material.
+        /// @param displaceIn inward displacement depth in world units. Zero disables displacement entirely,
+        ///        which is also what makes the terrain mask safe to route through the height slot. The
+        ///        runtime scales this by its own Displacement In Factor.
+        /// @param displaceOut outward displacement depth. Zero for a height field that only carves inward,
+        ///        which is what a Morrowind height alpha describes.
+        /// @param spriteSheetCols frame count of a sprite sheet albedo, which is also its column count -- the
+        ///        sheet is laid out as a single row. Zero for an ordinary texture.
+        /// @param spriteSheetFps playback rate. Zero means not animated, and the runtime keys its own
+        ///        is-animated decision on this being non-zero.
         unsigned long long createTexturedMaterial(unsigned long long hash, unsigned long long textureHash,
             float roughness, float metallic, unsigned char alphaTestReference,
             unsigned long long normalTextureHash = 0, float emissive = 0.0f, int blendType = -1,
             unsigned long long maskTextureHash = 0, const float* maskTransform = nullptr,
-            unsigned long long roughnessTextureHash = 0, unsigned long long emissiveTextureHash = 0);
+            unsigned long long roughnessTextureHash = 0, unsigned long long emissiveTextureHash = 0,
+            const float* albedoConstant = nullptr, float opacityConstant = 1.0f,
+            const float* emissiveColour = nullptr, unsigned char wrapModeU = 1,
+            unsigned char wrapModeV = 1, unsigned long long heightTextureHash = 0,
+            float displaceIn = 0.0f, float displaceOut = 0.0f, unsigned char spriteSheetCols = 0,
+            unsigned char spriteSheetFps = 0);
 
         /// Creates a translucent, refractive material -- water, glass.
         ///
@@ -619,6 +648,36 @@ namespace RemixRT
         std::unique_ptr<Impl> mImpl;
     };
 
+    /// Host-side diagnostic log streams, each switchable at launch without a rebuild.
+    ///
+    /// Mirrors the runtime's own `rtx.fork.log.*` set and exists for the same two reasons. One is cost: a
+    /// diagnostic that cannot be turned off eventually gets left on, and the next person measuring frame
+    /// time inherits it without knowing. The other is discoverability -- an instrument nobody knows about
+    /// is not an instrument, so logDiagManifest prints the whole inventory and its state once at startup,
+    /// which means a log from any run carries its own index of what else could have been switched on.
+    ///
+    /// Everything here is per *event* -- a loading screen, a burst, a first frame -- not per frame. The
+    /// per-frame streams are older and already bounded by their own settings in `[Remix]`: `scene log
+    /// frames`, `material log limit`, `texture log limit`. So none of these is a frame-time risk on its
+    /// own; they are switchable because that claim should not have to be taken on trust.
+    enum class Diag
+    {
+        /// Which background the loading screen chose and how it was laid out. One line per screen.
+        LoadingScreen,
+        /// Per-burst nested present accounting: frames shown, frames rationed, loop time. One line per
+        /// burst, and the only thing that distinguishes "every load got a fair share" from "half the
+        /// loads showed nothing", which the session totals cannot.
+        NestedBursts,
+    };
+
+    /// Whether a stream is on. Each has its own `OPENMW_REMIX_DIAG_*` variable, and
+    /// `OPENMW_REMIX_DIAG=0` switches off every one of them at once -- which is the single thing to set
+    /// before measuring anything.
+    bool diagEnabled(Diag which);
+
+    /// Prints the inventory and its state. Called once, from the engine, after Remix comes up.
+    void logDiagManifest();
+
     /// Presents Remix's frame from a loop that drives the viewer itself.
     ///
     /// OpenMW has four places that pump their own traversals instead of going through Engine::frame:
@@ -641,6 +700,15 @@ namespace RemixRT
     /// Runs whatever setNestedFramePresenter installed. Safe to call when nothing is installed, and safe
     /// to call when Remix is not in use at all -- both are no-ops.
     void presentNestedFrame();
+
+    /// Whether something other than OpenMW is putting these loops' frames on screen.
+    ///
+    /// The engine installs a presenter only when Remix presents to the screen itself, which is also the
+    /// arrangement in which Remix repeats its retained scene behind the overlay for every nested present.
+    /// So this answers a question these loops genuinely need to ask: is there already a rendered world
+    /// behind the interface I am about to draw. Reading it here rather than re-deriving the environment
+    /// variable keeps one fact in one place.
+    bool nestedFramePresenterInstalled();
 
     /// What the frames drawn by those loops cost, so the engine can both report and ration them.
     ///

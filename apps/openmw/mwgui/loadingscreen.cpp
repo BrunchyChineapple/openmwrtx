@@ -112,6 +112,10 @@ namespace MWGui
             return mTargetFrameRate;
     }
 
+    // GL 3.0 token, and <GL/gl.h> on Windows stops at 1.1. Spelled out for the same reason
+    // components/remixrt/glinterop.cpp spells out its framebuffer tokens.
+    constexpr GLenum kReadFramebufferBinding = 0x8CAA;
+
     class CopyFramebufferToTextureCallback : public osg::Camera::DrawCallback
     {
     public:
@@ -126,6 +130,42 @@ namespace MWGui
             const osg::Viewport* viewPort = renderInfo.getCurrentCamera()->getViewport();
             int w = static_cast<int>(viewPort->width());
             int h = static_cast<int>(viewPort->height());
+
+            // What this copy actually reads, reported once per loading screen.
+            //
+            // This is the background of every in-game loading screen: a snapshot of the frame that was on
+            // screen when the load began. When Remix presents to its own window OpenMW's swap is disabled,
+            // so the buffer being sampled here is one nothing else consumes -- which is a specific reason
+            // it could come back empty, and an empty background is exactly what a black loading screen is.
+            // Sampling it is the only way to tell that apart from the copy working and something later
+            // discarding it.
+            //
+            // Four texels at the centre rather than the whole surface: this is a GPU-to-CPU read inside a
+            // draw callback, so it stalls the pipeline, and mOneshot bounds it to one frame per screen.
+            // The centre because the corners of a Morrowind frame are often legitimately black.
+            if (mOneshot && RemixRT::diagEnabled(RemixRT::Diag::LoadingScreen))
+            {
+                GLint readBinding = 0;
+                glGetIntegerv(kReadFramebufferBinding, &readBinding);
+
+                std::array<unsigned char, 4 * 4 * 4> texels{};
+                if (w >= 2 && h >= 2)
+                    glReadPixels(w / 2 - 2, h / 2 - 2, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, texels.data());
+
+                unsigned int brightest = 0;
+                for (std::size_t i = 0; i < texels.size(); i += 4)
+                    for (std::size_t c = 0; c < 3; ++c)
+                        brightest = std::max(brightest, static_cast<unsigned int>(texels[i + c]));
+
+                Log(Debug::Info) << "Loading screen background: copying " << w << "x" << h
+                                 << " from read framebuffer " << readBinding
+                                 << "; brightest of 16 sampled centre texels " << brightest << " of 255"
+                                 << (brightest == 0
+                                            ? " -- the source is black, so the background is empty before"
+                                              " the copy rather than after it"
+                                            : " -- the source has content");
+            }
+
             mTexture->copyTexImage2D(*renderInfo.getState(), 0, 0, w, h);
 
             mOneshot = false;
@@ -170,6 +210,32 @@ namespace MWGui
         if (mShowWallpaper)
         {
             changeWallpaper();
+        }
+
+        // Which of the two backgrounds this screen will use, and the layout it will use it at.
+        //
+        // The two are entirely different mechanisms and only one of them was ever in question: wallpaper
+        // mode puts a splash image from splash/ into a widget, while scene mode shows a texture copied
+        // from the framebuffer. The selector is the game state, not the kind of load, so a save loaded
+        // from the main menu takes wallpaper mode and every cell load afterwards takes scene mode --
+        // which is why one loading screen per session can look right while the rest do not.
+        //
+        // The canvas size and the box rect are here because a widget laid out against a canvas of one size
+        // and composited into an image of another lands in the wrong place at the wrong scale, and telling
+        // that apart from a missing background needs both numbers rather than a screenshot.
+        if (RemixRT::diagEnabled(RemixRT::Diag::LoadingScreen))
+        {
+            Log(Debug::Info) << "Loading screen on: " << (mShowWallpaper ? "wallpaper" : "scene") << " mode"
+                             << " (state " << static_cast<int>(MWBase::Environment::get()
+                                                                   .getStateManager()
+                                                                   ->getState())
+                             << ", " << mSplashScreens.size() << " splash images known)"
+                             << "; canvas " << mMainWidget->getWidth() << "x" << mMainWidget->getHeight()
+                             << ", loading box " << mLoadingBox->getWidth() << "x"
+                             << mLoadingBox->getHeight() << " at " << mLoadingBox->getLeft() << ","
+                             << mLoadingBox->getTop() << "; splash widget "
+                             << (mSplashImage->getVisible() ? "visible" : "hidden") << ", scene widget "
+                             << (mSceneImage->getVisible() ? "visible" : "hidden");
         }
 
         MWBase::Environment::get().getWindowManager()->pushGuiMode(mShowWallpaper ? GM_LoadingWallpaper : GM_Loading);
@@ -331,7 +397,36 @@ namespace MWGui
 
         if (!mShowWallpaper && mLastRenderTime < mLoadingOnTime)
         {
-            setupCopyFramebufferToTextureCallback();
+            // With Remix presenting, the background this would build is already on screen and better.
+            //
+            // Scene mode exists to keep the world visible behind the progress bar, and it does that by
+            // snapshotting the framebuffer. That is the right mechanism when OpenMW's own frame is what
+            // reaches the screen. It is the wrong one here: Remix presents its retained scene for every
+            // nested present, so the path-traced world is already behind the overlay -- and the buffer
+            // being snapshotted is OpenMW's raster frame, which nothing presents in this mode and which
+            // measured 12 of 255 at its brightest. So the snapshot was not failing to capture the world.
+            // It was capturing an unlit one and painting it over a lit one.
+            //
+            // Hiding both background widgets leaves the overlay transparent everywhere the interface has
+            // not drawn, which is exactly what lets Remix's frame through. The result is the look scene
+            // mode was after in the first place, arrived at by not doing the work.
+            //
+            // Explicitly rather than by omission: setVisible(true) in loadingOn shows the scene widget,
+            // and skipping the setup below would leave it showing whichever stale texture the last copy
+            // left behind. That is how most of a session's loading screens came to show one frozen dark
+            // frame -- the copy only runs on a screen's first draw, so seven of eight cell loads in a
+            // measured run reused a single snapshot taken minutes earlier.
+            if (RemixRT::nestedFramePresenterInstalled())
+            {
+                mSceneImage->setBackgroundImage({});
+                mSceneImage->setVisible(false);
+                mSplashImage->setBackgroundImage({});
+                mSplashImage->setVisible(false);
+            }
+            else
+            {
+                setupCopyFramebufferToTextureCallback();
+            }
         }
 
         MWBase::Environment::get().getInputManager()->update(0, true, true);

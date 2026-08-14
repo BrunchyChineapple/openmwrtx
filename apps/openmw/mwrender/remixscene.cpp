@@ -27,6 +27,7 @@
 #include <osg/BlendFunc>
 #include <osg/Image>
 #include <osg/Light>
+#include <osg/Material>
 #include <osg/FrameStamp>
 #include <osg/StateSet>
 #include <osg/TexMat>
@@ -35,6 +36,7 @@
 #include <components/debug/debuglog.hpp>
 #include <components/sceneutil/lightmanager.hpp>
 #include <components/sceneutil/statesetupdater.hpp>
+#include <components/nifosg/controller.hpp>
 #include <osgParticle/Particle>
 #include <osgParticle/ParticleSystem>
 
@@ -225,7 +227,7 @@ namespace
             if (parsed > 0)
                 return static_cast<std::uint64_t>(parsed);
         }
-        return 600;
+        return static_cast<std::uint64_t>(std::max(1, Settings::remix().mSceneLogFrames.get()));
     }
 
     /// Game-state store keys the runtime publishes live light tuning on.
@@ -294,6 +296,22 @@ namespace
     /// altogether -- it takes no shadow and picks up no bounce colour, so smoke stops behaving like smoke
     /// rather than merely looking too bright.
     constexpr float kParticleEmissive = 6.0f;
+    /// Radiance scale applied to an ALPHA-blended particle's OWN emissive colour.
+    ///
+    /// Different in both value and meaning from kParticleEmissive. That one is a flat radiance handed to a
+    /// surface that emits by construction. This one multiplies the emission the asset actually declares, so a
+    /// mesh carrying none still gets none and only what Morrowind marked as self-lit is affected.
+    ///
+    /// 1.5 because both neighbouring failures are visible on screen: at kParticleEmissive's 6.0 a pale smoke
+    /// texture saturates to solid white, and at 0 -- which is what shipped -- smoke and steam are lit only by
+    /// whatever reaches a thin billboard in a dim interior, which is nearly nothing. A modest term leaves the
+    /// surface in the lighting solution, still taking shadow and bounce, with a floor under it so the effect
+    /// is legible at all.
+    ///
+    /// Tunable through OPENMW_REMIX_PARTICLE_EMISSIVE for the same reason as the glow scale: the defensible
+    /// number depends on the exposure the rest of the scene settles at, and that is a judgement to make
+    /// against the screen rather than in a header.
+    constexpr float kParticleAlphaEmissive = 1.5f;
     /// Radiance scale for a surface carrying a glow map.
     ///
     /// Well below kParticleEmissive, because the two are doing different jobs. That figure has to make a
@@ -447,8 +465,22 @@ namespace
         const char* value = std::getenv(name);
         if (value == nullptr || *value == '\0')
             return fallback;
-        const float parsed = std::strtof(value, nullptr);
-        return parsed > 0.0f ? parsed : fallback;
+        // Zero is a value, not a synonym for unset.
+        //
+        // This used to end `return parsed > 0.0f ? parsed : fallback`, which meant OPENMW_REMIX_*=0 was read,
+        // rejected, and silently replaced by the configured value. Every one of these knobs -- glow intensity,
+        // material emissive, light intensity, the fog terms -- has zero as its meaningful "switch this
+        // contribution off" setting, and several already default to 0.0, so the variable could not even
+        // express its own default. A test that appears to run and changes nothing is worse than one that
+        // fails: it reads as evidence that the thing under test does not matter.
+        //
+        // Rejecting only unparseable input keeps the original intent, which was to ignore junk rather than to
+        // ignore zero. strtof reports that by leaving `end` at the start of the string.
+        char* end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        if (end == value || !std::isfinite(parsed) || parsed < 0.0f)
+            return fallback;
+        return parsed;
     }
 
     /// Reads a non-negative integer environment variable, keeping \a fallback when unset or unparseable.
@@ -1227,6 +1259,82 @@ namespace
         { "_snow", 0.70f, 0.0f },
     };
 
+    /// Texture path fragments whose draws are not surfaces at all.
+    ///
+    /// Separate from kSurfaceRules because that table answers "what is this material like"; this answers
+    /// "is this a material at all". OpenMW's shader framework submits post-process style passes as ordinary
+    /// geometry, and a path tracer has nothing to do with them: SunsDusk's liquid effect binds an animated
+    /// sequence under omw_distortion/ that is meant to warp what is behind it, and handing that to the
+    /// runtime as an albedo draws it as a solid surface in front of the drink.
+    ///
+    /// Matched on path rather than texture hash because the sequence is twenty-four plus frames with a hash
+    /// each, so a hash list would need all of them and would break when the mod's frame count changed.
+    constexpr const char* kNonSurfaceTexturePatterns[] = {
+        "omw_distortion",
+    };
+
+    /// Extra patterns from OPENMW_REMIX_SKIP_TEXTURES, comma or semicolon separated.
+    ///
+    /// Exists so the next mod that does this can be identified and neutralised from a config line instead
+    /// of a rebuild -- the failure is recognisable in the log (an opaque draw with a suspicious texture
+    /// path and no rule matched) long before anyone can patch the source.
+    const std::vector<std::string>& extraNonSurfacePatterns()
+    {
+        static const std::vector<std::string> patterns = [] {
+            std::vector<std::string> out;
+            // Setting first, environment override second, same precedence as every other knob here.
+            const std::string fromSettings = Settings::remix().mSkipTextures.get();
+            const char* fromEnv = std::getenv("OPENMW_REMIX_SKIP_TEXTURES");
+            const std::string source = fromEnv != nullptr ? std::string(fromEnv) : fromSettings;
+            if (source.empty())
+                return out;
+            const char* raw = source.c_str();
+
+            std::string current;
+            for (const char* c = raw;; ++c)
+            {
+                if (*c == '\0' || *c == ',' || *c == ';')
+                {
+                    if (!current.empty())
+                    {
+                        std::transform(current.begin(), current.end(), current.begin(),
+                            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                        out.push_back(current);
+                        current.clear();
+                    }
+                    if (*c == '\0')
+                        break;
+                }
+                else
+                    current.push_back(*c);
+            }
+            return out;
+        }();
+
+        return patterns;
+    }
+
+    /// True when \a path names a texture whose draw should be dropped rather than turned into a surface.
+    bool isNonSurfaceTexture(std::string_view path)
+    {
+        if (path.empty())
+            return false;
+
+        std::string lowered(path);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        for (const char* pattern : kNonSurfaceTexturePatterns)
+            if (lowered.find(pattern) != std::string::npos)
+                return true;
+
+        for (const std::string& pattern : extraNonSurfacePatterns())
+            if (lowered.find(pattern) != std::string::npos)
+                return true;
+
+        return false;
+    }
+
     /// Classifies \a path, or null when no rule matched.
     const SurfaceRule* surfaceRuleFor(std::string_view path)
     {
@@ -1406,7 +1514,7 @@ namespace
             // outside the cull traversal. OPENMW_REMIX_TERRAIN=0 restores the plain-NodeVisitor
             // behaviour -- exteriors without ground or architecture, but running -- and makes the
             // question answerable by bisection rather than by argument.
-            if (envFlag("OPENMW_REMIX_TERRAIN", true))
+            if (envFlag("OPENMW_REMIX_TERRAIN", Settings::remix().mTerrain))
                 setVisitorType(osg::NodeVisitor::INTERSECTION_VISITOR);
 
             // The quadtree picks level of detail from getEyePoint() and keys its cached view data on it.
@@ -1842,7 +1950,7 @@ namespace
         void submitTerrainLayers(const Terrain::TerrainDrawable& terrain, osg::Geometry& geometry,
             unsigned int categories, const float (&baseTransform)[12], float distanceSquared)
         {
-            static const bool enabled = envFlag("OPENMW_REMIX_TERRAIN_LAYERS", true);
+            static const bool enabled = envFlag("OPENMW_REMIX_TERRAIN_LAYERS", Settings::remix().mTerrainLayers);
             if (!enabled)
                 return;
 
@@ -2145,7 +2253,7 @@ namespace
                 }
             }
 
-            static const bool enabled = envFlag("OPENMW_REMIX_GROUNDCOVER", true);
+            static const bool enabled = envFlag("OPENMW_REMIX_GROUNDCOVER", Settings::remix().mGroundcover);
             // Bounded by the per-frame instance ceiling, because that is what this budget counts: one
             // grass copy is one instance, and the loop below is already stopped by kMaxInstancesPerFrame.
             static const unsigned int budget = envUInt(
@@ -2356,6 +2464,10 @@ namespace
                 else if (role == "normalMap" || role == "normalHeightMap")
                 {
                     taggedNormal = texture;
+                    // Only the tag distinguishes the two. The alpha of a plain normalMap means nothing, so
+                    // the height split has to be gated on what OpenMW called it rather than on whether an
+                    // alpha channel happens to be present.
+                    surface.mHasNormalHeight = (role == "normalHeightMap");
                 }
                 else if (role == "specularMap")
                 {
@@ -2369,9 +2481,12 @@ namespace
                 {
                     taggedEmissive = texture;
                 }
+
                 // "glossMap" is deliberately not read, despite the name. OpenMW multiplies it into the
                 // environment-map term (objects.frag: envEffect *= texture2D(glossMap, ...).xyz), so it is
                 // an env-map mask rather than a glossiness map, and feeding it to roughness would be wrong
+                // in a way that looks plausible. darkMap is now read, above, having had that decision
+                // made for it -- it is a colour multiply, and the emissive path is where it earns its keep.
                 // in a way that looks plausible. Nor are darkMap, detailMap, decalMap, bumpMap or envMap
                 // consumed: each needs its own decision about where it belongs, and guessing is what
                 // produced the normal-as-albedo defect above.
@@ -2404,6 +2519,7 @@ namespace
             {
                 surface.mEmissiveMap = taggedEmissive;
             }
+
 
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
                     stateSet.getTextureAttribute(0, osg::StateAttribute::TEXMAT)))
@@ -2449,6 +2565,41 @@ namespace
             {
                 surface.mAdditive = blendFunc->getDestination() == GL_ONE;
             }
+
+            // Material emission, which is where Morrowind keeps the brightness of smoke and steam.
+            //
+            // mAdditive above answers "does this surface accumulate", which correctly identifies flames and
+            // does not identify smoke. Vanilla smoke and steam are SRC_ALPHA/ONE_MINUS_SRC_ALPHA and really
+            // do occlude, yet they read bright in raster because NiMaterialProperty carries an emissive
+            // colour the fixed-function pipeline adds regardless of scene lighting. nifloader forwards it
+            // (setEmission from matprop->mEmissive), and where a NiVertexColorProperty asks for emissive
+            // vertex colours it sets colour mode EMISSION with emission white, leaving the per-particle tint
+            // to the vertex colours already submitted.
+            //
+            // Reading it here is what lets an alpha-blended particle be given the emission its asset asked
+            // for instead of a constant guessed at in this file. Nothing consumed this before, which is why
+            // [Remix PBR] reported emissive on 0% of materials while steam arrived nearly black.
+            if (const auto* material = dynamic_cast<const osg::Material*>(
+                    stateSet.getAttribute(osg::StateAttribute::MATERIAL)))
+            {
+                const osg::Vec4f emission = material->getEmission(osg::Material::FRONT_AND_BACK);
+                surface.mEmissiveColor[0] = emission.r();
+                surface.mEmissiveColor[1] = emission.g();
+                surface.mEmissiveColor[2] = emission.b();
+                // Max component, not luma, to agree with how the runtime splits emission into a scale and a
+                // unit colour. See the field's comment.
+                surface.mMaterialEmissive
+                    = std::max(emission.r(), std::max(emission.g(), emission.b()));
+
+                // Diffuse carries both the tint and the material's own alpha: nifloader writes
+                // setDiffuse(FRONT_AND_BACK, Vec4f(matprop->mDiffuse, matprop->mAlpha)), so the opacity is
+                // in w. Both multiply what the albedo texture supplies.
+                const osg::Vec4f diffuse = material->getDiffuse(osg::Material::FRONT_AND_BACK);
+                surface.mDiffuseColor[0] = diffuse.r();
+                surface.mDiffuseColor[1] = diffuse.g();
+                surface.mDiffuseColor[2] = diffuse.b();
+                surface.mMaterialAlpha = diffuse.a();
+            }
         }
 
         void pushState(osg::Node& node)
@@ -2478,6 +2629,7 @@ namespace
             // Guarded on the frame stamp rather than assuming one: SceneUtil::FrameTimeSource::getValue
             // dereferences it without checking, so evaluating a controller without one is a crash, not a
             // frame of missing animation.
+            NifOsg::FlipController* flip = nullptr;
             for (osg::Callback* callback = getFrameStamp() != nullptr ? node.getCullCallback() : nullptr;
                  callback != nullptr; callback = callback->getNestedCallback())
             {
@@ -2490,6 +2642,46 @@ namespace
                 osg::StateSet& animated = mScene.animatedStateFor(*updater);
                 updater->apply(&animated, this);
                 mergeState(animated, surface);
+
+                // A texture flipbook can be handed to the runtime as a sprite sheet instead, which is one
+                // material and one texture rather than one of each per frame. Found here because this is
+                // where the controllers are already in hand; resolved after the loop so the atlas overrides
+                // the single frame apply() just wrote into the merged state.
+                if (flip == nullptr)
+                {
+                    if (auto* direct = dynamic_cast<NifOsg::FlipController*>(updater))
+                    {
+                        flip = direct;
+                    }
+                    else if (auto* composite = dynamic_cast<SceneUtil::CompositeStateSetUpdater*>(updater))
+                    {
+                        // nifloader wraps a node's controllers in a composite, so a flipbook is usually a
+                        // child of one rather than the callback itself.
+                        for (size_t i = 0; i < composite->getNumControllers() && flip == nullptr; ++i)
+                            flip = dynamic_cast<NifOsg::FlipController*>(composite->getController(i));
+                    }
+                }
+            }
+
+            // A sheet replaces the per-frame albedo, so this has to come after every merge above.
+            //
+            // mDelta of zero means the controller picks frames through an interpolator rather than at a
+            // constant rate, which a sprite sheet cannot express -- those keep the per-frame path rather than
+            // being animated at a rate that is merely plausible.
+            if (flip != nullptr && flip->getDelta() > 0.0f)
+            {
+                const std::vector<osg::ref_ptr<osg::Texture2D>>& frames = flip->getTextures();
+                const long rate = std::lround(1.0f / flip->getDelta());
+                if (frames.size() >= 2 && frames.size() <= 255 && rate >= 1)
+                {
+                    if (const osg::Image* sheet = mScene.spriteSheetFor(frames))
+                    {
+                        surface.mExplicitImage = sheet;
+                        surface.mSpriteSheetCols = static_cast<unsigned char>(frames.size());
+                        surface.mSpriteSheetFps
+                            = static_cast<unsigned char>(std::min<long>(rate, 255));
+                    }
+                }
             }
 
             mSurfaceStack.push_back(surface);
@@ -2556,7 +2748,7 @@ namespace MWRender
         // from a composite render target whose osg::Image is null, so it lands here -- and a field of
         // white patches along the horizon is the result. OPENMW_REMIX_EMISSIVE=1 brings it back for
         // diagnosis.
-        const bool emissive = envFlag("OPENMW_REMIX_EMISSIVE", false);
+        const bool emissive = envFlag("OPENMW_REMIX_EMISSIVE", Settings::remix().mUntexturedEmissive);
         constexpr unsigned long long kDefaultMaterialHash = 0x0B7A5E'0000'0001ull;
         mDefaultMaterial = mRuntime.createFlatMaterial(
             kDefaultMaterialHash, 0.6f, 0.6f, 0.6f, 0.7f, 0.0f, emissive ? kWorldEmissive : 0.0f);
@@ -2596,7 +2788,7 @@ namespace MWRender
         // would take 4096x4096 a chunk. The real answer is Remix's own TerrainBaker, which composites
         // multi-pass terrain at a resolution it manages -- see rtx_terrain_baker.cpp. Until that is wired to
         // the API path this stays opt-in so it can be compared rather than assumed.
-        const bool terrainComposite = envFlag("OPENMW_REMIX_TERRAIN_COMPOSITE", false);
+        const bool terrainComposite = envFlag("OPENMW_REMIX_TERRAIN_COMPOSITE", Settings::remix().mTerrainComposite);
         Terrain::CompositeMap::sReadbackEnabled = terrainComposite;
         Log(Debug::Info) << "Remix scene: terrain composite readback "
                          << (terrainComposite ? "ENABLED -- ground is correctly blended but softer, since a "
@@ -2607,7 +2799,36 @@ namespace MWRender
 
         // Logged rather than silent because it changes what a capture contains and what binds. Two captures
         // of the same cell are only comparable if it is recorded which mode each was taken in.
-        mPackMatching = envFlag("OPENMW_REMIX_PACK_MATCH", true);
+        mPackMatching = envFlag("OPENMW_REMIX_PACK_MATCH", Settings::remix().mPackMatching);
+
+        // Read once here rather than per line. These bound the two log streams that identify which file a
+        // wrong-looking surface came from, and are also most of a large openmw.log, so they are the knobs
+        // most likely to be reached for -- and 0 for either switches that stream off entirely.
+        mMaterialLogLimit = static_cast<unsigned int>(std::max(0, Settings::remix().mMaterialLogLimit.get()));
+        mTextureLogLimit = static_cast<unsigned int>(std::max(0, Settings::remix().mTextureLogLimit.get()));
+
+        // Instrumentation manifest, host side.
+        //
+        // Printed for discoverability rather than diagnosis. Every stream named here can be switched without a
+        // rebuild, but only by someone who knows it exists, and that knowledge otherwise leaves with whoever
+        // wrote it. Putting the inventory in the log means any run, read by anyone, later, indexes its own
+        // tooling. The second line points at the runtime's half deliberately: the two sets live in different
+        // config files behind different UIs, so whichever log gets opened first has to lead to both.
+        {
+            const auto onOff = [](bool value) { return value ? "on" : "off"; };
+            const std::string skip = Settings::remix().mSkipTextures.get();
+            Log(Debug::Info) << "Remix instrumentation: materialLog=" << mMaterialLogLimit
+                             << " textureLog=" << mTextureLogLimit
+                             << " sceneInterval=" << sceneLogInterval() << "f"
+                             << " probeQuad=" << onOff(Settings::remix().mProbeQuad)
+                             << " untexturedEmissive=" << onOff(Settings::remix().mUntexturedEmissive)
+                             << " parallax=" << Settings::remix().mParallaxDepth.get()
+                             << " skipTextures=" << (skip.empty() ? std::string("<none>") : skip);
+            Log(Debug::Info) << "Remix instrumentation: set these in settings.cfg [Remix] or the launcher's "
+                                "Testing tab; either takes effect on the next launch. Runtime-side streams "
+                                "(scatter submit, mesh and material lookups, heavy assets, frame spikes, NEE "
+                                "overflow) are rtx.fork.log.* in rtx.conf and are listed in remix-dxvk.log.";
+        }
         Log(Debug::Info) << "Remix scene: identities use "
                          << (mPackMatching
                                  ? "Remix's D3D9 formulation for both meshes and textures, so a pack "
@@ -2616,9 +2837,9 @@ namespace MWRender
                                    "a Morrowind capture can bind, though Remix and replacement loading are "
                                    "unaffected (OPENMW_REMIX_PACK_MATCH=1 to restore)");
 
-        mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", kLightRadiusDefault);
+        mLightRadius = envFloat("OPENMW_REMIX_LIGHT_RADIUS", Settings::remix().mLightRadius);
         mLightIntensityFactor
-            = envFloat("OPENMW_REMIX_LIGHT_INTENSITY", kLightIntensityFactorDefault);
+            = envFloat("OPENMW_REMIX_LIGHT_INTENSITY", Settings::remix().mLightIntensity);
         Log(Debug::Info) << "Remix scene: light emitter radius " << mLightRadius
                          << " units, intensity factor " << mLightIntensityFactor
                          << " (OPENMW_REMIX_LIGHT_RADIUS and OPENMW_REMIX_LIGHT_INTENSITY override both; "
@@ -3118,7 +3339,7 @@ namespace MWRender
         // transforms -- and the answer was yes, which localised the fault to the material's alpha test.
         // It is a strongly emissive panel a short distance from the eye, so leaving it on floods the
         // whole scene with magenta bounce light.
-        if (envFlag("OPENMW_REMIX_PROBE_QUAD", false))
+        if (envFlag("OPENMW_REMIX_PROBE_QUAD", Settings::remix().mProbeQuad))
         {
             const double eyeD[3] = { eye.x(), eye.y(), eye.z() };
             const double forwardD[3] = { forward.x(), forward.y(), forward.z() };
@@ -3156,7 +3377,7 @@ namespace MWRender
         // Near and far planes are left out deliberately. Far would impose a view distance this traversal has
         // no business choosing, since OpenMW already limits it; near would drop geometry pressed against the
         // camera, which is exactly where the first-person viewmodel sits.
-        static const bool cullEnabled = envFlag("OPENMW_REMIX_CULL", true);
+        static const bool cullEnabled = envFlag("OPENMW_REMIX_CULL", Settings::remix().mCull);
 
         osg::Polytope frustum;
         if (cullEnabled)
@@ -3394,6 +3615,162 @@ namespace MWRender
 
         const osg::Image* stored = mDerivedRoughness.emplace(&specular, derived).first->second.get();
         return textureFor(*stored, false);
+    }
+
+    unsigned long long RemixScene::heightTextureFor(const osg::Image& normalHeight)
+    {
+        if (auto found = mDerivedHeight.find(&normalHeight); found != mDerivedHeight.end())
+            return found->second != nullptr ? textureFor(*found->second, false) : 0;
+
+        // Uncompressed only, for the same reason as the roughness conversion: this is per-texel and does not
+        // decode block formats. A compressed normal-height map keeps its normal and simply gets no
+        // displacement, which is the behaviour that existed before this. Cached as null so the same image is
+        // not examined again every frame.
+        const GLenum pixelFormat = normalHeight.getPixelFormat();
+        const bool convertible = normalHeight.getDataType() == GL_UNSIGNED_BYTE
+            && (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA)
+            && normalHeight.data() != nullptr && normalHeight.s() > 0 && normalHeight.t() > 0;
+        if (!convertible)
+        {
+            mDerivedHeight.emplace(&normalHeight, osg::ref_ptr<osg::Image>());
+            return 0;
+        }
+
+        osg::ref_ptr<osg::Image> derived = new osg::Image;
+        derived->allocateImage(normalHeight.s(), normalHeight.t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        derived->setInternalTextureFormat(GL_RGBA8);
+        // Suffixed so it cannot collide with the source in a surface-rule match, and so a log line naming it
+        // is recognisable as derived rather than as an asset on disk.
+        derived->setFileName(normalHeight.getFileName() + "@height");
+
+        const unsigned char* src = normalHeight.data();
+        unsigned char* dst = derived->data();
+        const int texels = normalHeight.s() * normalHeight.t();
+        // Alpha is the last byte in both RGBA and BGRA, so the two formats need no separate handling.
+        //
+        // Copied straight across with no inversion or rescaling. The runtime treats 1.0 as the outer surface
+        // with lower values displacing inward (rtx_terrain_baker.cpp: "a value of 1.f will have 0
+        // displacement"), and OpenMW's height alpha is high where the surface is raised. Those agree.
+        for (int i = 0; i < texels; ++i)
+        {
+            const unsigned char height = src[i * 4 + 3];
+            dst[i * 4 + 0] = height; // red: the channel the runtime samples
+            dst[i * 4 + 1] = height;
+            dst[i * 4 + 2] = height;
+            dst[i * 4 + 3] = 255;
+        }
+
+        const osg::Image* stored = mDerivedHeight.emplace(&normalHeight, derived).first->second.get();
+        return textureFor(*stored, false);
+    }
+
+    const osg::Image* RemixScene::spriteSheetFor(const std::vector<osg::ref_ptr<osg::Texture2D>>& frames)
+    {
+        if (frames.size() < 2 || frames.size() > 255 || frames.front() == nullptr)
+            return nullptr;
+
+        const osg::Image* first = frames.front()->getImage();
+        if (first == nullptr)
+            return nullptr;
+
+        if (auto found = mSpriteSheets.find(first); found != mSpriteSheets.end())
+            return found->second.get();
+
+        // Every refusal below is cached as a null entry, so a sequence this cannot assemble is examined once
+        // rather than on every draw for the rest of the session.
+        const auto refuse = [&]() -> const osg::Image* {
+            mSpriteSheets.emplace(first, osg::ref_ptr<osg::Image>());
+            return nullptr;
+        };
+
+        const int frameWidth = first->s();
+        const int frameHeight = first->t();
+        const int count = static_cast<int>(frames.size());
+        const unsigned int internalFormat = first->getInternalTextureFormat();
+        const GLenum pixelFormat = first->getPixelFormat();
+
+        // 1 x N, so the sheet is as wide as every frame laid side by side. Refused past 8192 because that is
+        // the width a sheet of many frames runs into first, and a texture the driver refuses to create is a
+        // worse outcome than leaving the flipbook on the per-frame path.
+        if (frameWidth <= 0 || frameHeight <= 0 || frameWidth * count > 8192)
+            return refuse();
+
+        const CompressedFormat* compressed = compressedFormatFor(internalFormat);
+        const bool uncompressed = compressed == nullptr && first->getDataType() == GL_UNSIGNED_BYTE
+            && (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA);
+        if (compressed == nullptr && !uncompressed)
+            return refuse();
+        // Block formats can only be concatenated on block boundaries. Every BC texture is a multiple of four
+        // in practice, but a sequence that is not would be silently sheared by the copy below.
+        if (compressed != nullptr && (frameWidth % 4 != 0 || frameHeight % 4 != 0))
+            return refuse();
+
+        // Every frame has to agree, because the copy derives its offsets from the first frame alone.
+        for (const osg::ref_ptr<osg::Texture2D>& texture : frames)
+        {
+            const osg::Image* image = texture != nullptr ? texture->getImage() : nullptr;
+            if (image == nullptr || image->data() == nullptr || image->s() != frameWidth
+                || image->t() != frameHeight
+                // getInternalTextureFormat returns GLint; the local is unsigned because that is what
+                // compressedFormatFor takes. Cast rather than compare across the signedness.
+                || static_cast<unsigned int>(image->getInternalTextureFormat()) != internalFormat
+                || image->getPixelFormat() != pixelFormat)
+                return refuse();
+        }
+
+        osg::ref_ptr<osg::Image> atlas = new osg::Image;
+        const int atlasWidth = frameWidth * count;
+
+        if (compressed != nullptr)
+        {
+            // Block copy. Each 4x4 block is self-contained in BC1/BC2/BC3, so a frame's block rows land
+            // whole at a column offset and nothing is recompressed.
+            const std::size_t blockBytes = static_cast<std::size_t>(compressed->mBlockBytes);
+            const std::size_t frameBlocksX = static_cast<std::size_t>(frameWidth) / 4u;
+            const std::size_t blockRows = static_cast<std::size_t>(frameHeight) / 4u;
+            const std::size_t atlasBlocksX = frameBlocksX * static_cast<std::size_t>(count);
+
+            auto* data = new unsigned char[atlasBlocksX * blockRows * blockBytes];
+            for (int frame = 0; frame < count; ++frame)
+            {
+                const unsigned char* src = frames[frame]->getImage()->data();
+                for (std::size_t row = 0; row < blockRows; ++row)
+                {
+                    const std::size_t dstBlock
+                        = row * atlasBlocksX + static_cast<std::size_t>(frame) * frameBlocksX;
+                    std::memcpy(data + dstBlock * blockBytes, src + row * frameBlocksX * blockBytes,
+                        frameBlocksX * blockBytes);
+                }
+            }
+            atlas->setImage(atlasWidth, frameHeight, 1, internalFormat, pixelFormat, GL_UNSIGNED_BYTE, data,
+                osg::Image::USE_NEW_DELETE);
+        }
+        else
+        {
+            const std::size_t rowBytes = static_cast<std::size_t>(frameWidth) * 4u;
+            const std::size_t atlasRowBytes = rowBytes * static_cast<std::size_t>(count);
+
+            auto* data = new unsigned char[atlasRowBytes * static_cast<std::size_t>(frameHeight)];
+            for (int frame = 0; frame < count; ++frame)
+            {
+                const unsigned char* src = frames[frame]->getImage()->data();
+                for (int row = 0; row < frameHeight; ++row)
+                {
+                    std::memcpy(data + static_cast<std::size_t>(row) * atlasRowBytes
+                            + static_cast<std::size_t>(frame) * rowBytes,
+                        src + static_cast<std::size_t>(row) * rowBytes, rowBytes);
+                }
+            }
+            atlas->setImage(atlasWidth, frameHeight, 1, internalFormat, pixelFormat, GL_UNSIGNED_BYTE, data,
+                osg::Image::USE_NEW_DELETE);
+        }
+
+        // Keeps the first frame's path with a suffix, so both the surface-rule classifier and the
+        // non-surface classifier -- substring matches, both of them -- reach the same verdict they would for
+        // a single frame. That is what keeps an omw_distortion sequence dropped instead of atlased and drawn.
+        atlas->setFileName(first->getFileName() + "@sprites");
+
+        return mSpriteSheets.emplace(first, atlas).first->second.get();
     }
 
     unsigned long long RemixScene::textureFor(const osg::Image& image, bool colour)
@@ -3645,7 +4022,7 @@ namespace MWRender
             // has no file, cannot be tagged and cannot be replaced, so it is the one case where re-encoding
             // costs nothing downstream.
             static const bool compressComposites
-                = envFlag("OPENMW_REMIX_COMPOSITE_COMPRESS", true);
+                = envFlag("OPENMW_REMIX_COMPOSITE_COMPRESS", Settings::remix().mCompositeCompress);
             if (compressComposites
                 && std::string_view(image.getFileName()) == Terrain::CompositeMap::sReadbackImageName)
             {
@@ -3678,7 +4055,7 @@ namespace MWRender
                 // fallback. Given a way to keep the previous composite for a chunk, or to encode off the
                 // frame thread, deferring becomes invisible and this becomes worth switching on.
                 static const double budgetMs
-                    = envMilliseconds("OPENMW_REMIX_COMPOSITE_BUDGET_MS", 0.0);
+                    = envMilliseconds("OPENMW_REMIX_COMPOSITE_BUDGET_MS", Settings::remix().mCompositeBudgetMs);
 
                 if (budgetMs > 0.0 && mCompositeEncodeMs >= budgetMs)
                 {
@@ -3854,7 +4231,7 @@ namespace MWRender
         const bool generatedComposite
             = std::string_view(image.getFileName()) == Terrain::CompositeMap::sReadbackImageName;
 
-        if (!generatedComposite && mTexturesLogged < kTextureLogLimit)
+        if (!generatedComposite && mTexturesLogged < mTextureLogLimit)
         {
             ++mTexturesLogged;
             Log(Debug::Info) << "Remix texture " << mTexturesLogged << ": " << std::hex << std::uppercase
@@ -3862,7 +4239,7 @@ namespace MWRender
                              << width << "x" << height << " " << cached.mFormat << " "
                              << (colour ? "sRGB" : "linear") << ", " << mipLevels
                              << " mip" << (mipLevels == 1 ? "" : "s")
-                             << (mTexturesLogged == kTextureLogLimit ? " (last of these)" : "");
+                             << (mTexturesLogged == mTextureLogLimit ? " (last of these)" : "");
         }
 
         return hash;
@@ -3904,6 +4281,28 @@ namespace MWRender
         }
         if (image == nullptr)
             return mDefaultMaterial;
+
+        // Draws whose texture is not an albedo at all -- see kNonSurfaceTexturePatterns.
+        //
+        // Returning 0 is the existing "drop this draw" signal: meshFor opens with `if (material == 0)
+        // return 0;` and the particle path checks the same thing. Placed ahead of textureFor so these are
+        // never uploaded either, rather than uploaded and then never sampled.
+        if (isNonSurfaceTexture(image->getFileName()))
+        {
+            // Bounded, because there is one of these per animation frame per material and the point is to
+            // confirm the classification fired, not to narrate every draw.
+            static unsigned int s_nonSurfaceLogged = 0;
+            constexpr unsigned int kNonSurfaceLogLimit = 8;
+            if (s_nonSurfaceLogged < kNonSurfaceLogLimit)
+            {
+                ++s_nonSurfaceLogged;
+                Log(Debug::Info) << "Remix scene: dropped a non-surface draw using " << image->getFileName()
+                                 << " -- a post-process style pass, not an albedo"
+                                 << (s_nonSurfaceLogged == kNonSurfaceLogLimit ? " (last of these)" : "");
+            }
+
+            return 0;
+        }
 
         const unsigned long long textureHash = textureFor(*image, true);
         if (textureHash == 0)
@@ -3976,14 +4375,66 @@ namespace MWRender
         if (surface.mEmissiveMap != nullptr && surface.mEmissiveMap->getImage() != nullptr)
             glowHash = textureFor(*surface.mEmissiveMap->getImage(), true);
 
+        // Recorded before the material-emissive fallback below can put the albedo into that slot, so "does
+        // this asset ship a glow map" stays answerable afterwards. Both the [Remix PBR] tally and the
+        // per-material log line report it, and letting the fallback answer it would make every emitting
+        // surface look like it came with a map it does not have.
+        const bool hasGlowMap = glowHash != 0;
+
         // A glow map does nothing without an intensity beside it: emissiveIntensity is what decides whether
         // the runtime treats the material as emitting at all, and every surface arriving here that is not an
         // additive particle brings zero. A figure the caller supplied still wins, so a flame that also
         // carries a glow map keeps the particle scale rather than being dimmed to this one.
-        static const float glowIntensity = envFloat("OPENMW_REMIX_GLOW_INTENSITY", kGlowEmissive);
+        static const float glowIntensity = envFloat("OPENMW_REMIX_GLOW_INTENSITY", Settings::remix().mGlowIntensity);
         float emissiveIntensity = emissive;
         if (glowHash != 0 && emissiveIntensity <= 0.0f)
             emissiveIntensity = glowIntensity;
+
+        // The same is true of an emissive colour, and for a long time only particles benefited from it.
+        //
+        // NiMaterialProperty is where Morrowind states "this surface emits" when the emission covers a whole
+        // surface rather than a masked part of one, and mMaterialEmissive above already carries its
+        // magnitude for every surface that arrives here. Until now submitParticles was the only caller that
+        // did anything with it, so an opaque mesh asking to glow was read, believed and then dropped -- it
+        // came through as its albedo alone, which for an asset whose albedo IS the glow art means the raw
+        // texture rendered unlit. Glow in the Dahrk's windows are exactly that: the night state's pane and
+        // the interior light shafts carry emissive (1, 1, 1) while the masonry around them carries zero.
+        //
+        // Scaled by its own setting rather than by glowIntensity, because the two are not the same claim. A
+        // glow map is black wherever it must not emit, so a value above one only lifts texels that asked for
+        // it; this covers the entire surface. 1.0 is what the fixed-function pipeline adds and therefore what
+        // OpenMW's raster shows, which makes matching raster the default and brighter a deliberate choice.
+        //
+        // A caller-supplied figure still wins, so additive particles keep kParticleEmissive and alpha-blended
+        // ones keep the particle scale instead of being re-derived here.
+        static const float materialEmissiveScale
+            = envFloat("OPENMW_REMIX_MATERIAL_EMISSIVE", Settings::remix().mMaterialEmissiveScale);
+        if (emissiveIntensity <= 0.0f && surface.mMaterialEmissive > 0.0f)
+        {
+            emissiveIntensity = surface.mMaterialEmissive * materialEmissiveScale;
+
+            // An intensity alone makes the surface emit a flat colour, which is not what the asset asked for.
+            //
+            // The runtime takes its emissive colour from the emissive texture when one is bound and from
+            // emissiveColorConstant when none is, and the two REPLACE rather than multiply -- the albedo plays
+            // no part in the emissive term. Since the constant here is a normalised unit hue, a pane whose NIF
+            // says emissive (1, 1, 1) emits flat white over its whole area.
+            //
+            // The albedo is not the answer to that, for two reasons. The runtime already falls back to it on
+            // its own when no emissive texture is bound, so naming it here changes nothing; and for these
+            // assets the albedo is the wrong texture anyway. Glow in the Dahrk's night pane is a grey
+            // luminance plate with the amber in its DARK map, which OpenMW's raster multiplies in and which
+            // this host used to discard -- so an albedo-sourced emission is exactly the white being seen.
+            //
+            // Nothing more is needed here, because the albedo is now the composited product of the stages
+            // and the runtime falls back to the albedo when no emissive texture is bound. A pane whose albedo
+            // is base * dark therefore emits base * dark: the lattice and the amber together, which is what
+            // the rasteriser draws and what the flattening exists to reproduce.
+            //
+            // This replaced a stopgap that bound the dark map alone into the emissive slot. That recovered the
+            // colour and lost the lattice, because a dark map is half of a product and not a texture in its
+            // own right. Flattening makes the whole question disappear rather than answering it twice.
+        }
 
         // Terrain layer coverage, uploaded as a linear mask for the runtime's terrain baker to composite.
         //
@@ -4028,6 +4479,88 @@ namespace MWRender
             }
         }
 
+        // Material constants from the NIF: tint, opacity, emissive colour, addressing.
+        //
+        // These three slots existed in the API and were pinned to white and 1.0 on the reasoning that the
+        // texture should be what shows. That is the right default and the wrong constant: OpenMW has carried
+        // NiMaterialProperty's mDiffuse, mAlpha and mEmissive all along.
+        //
+        // albedoConstant multiplies the albedo texture, so a tint below white darkens the surface. That is
+        // intended where the asset asks for it, and the two things that keep it from darkening the world at
+        // large are upstream: nifloader forces material diffuse to white when vertex colours are routed into
+        // it, so the tint is not applied twice, and it only attaches a material at all when the values differ
+        // from the defaults. OPENMW_REMIX_MATERIAL_COLOR=0 pins all three back if this reads wrong in game.
+        static const bool materialConstants = envFlag("OPENMW_REMIX_MATERIAL_COLOR", Settings::remix().mMaterialConstants);
+
+        float albedoConstant[3] = { 1.0f, 1.0f, 1.0f };
+        float opacityConstant = 1.0f;
+        // Split emission into a unit colour and a magnitude the same way the runtime does, so a green rune
+        // stays green instead of reducing to a number and coming back white.
+        float emissiveColour[3] = { 1.0f, 1.0f, 1.0f };
+
+        if (materialConstants)
+        {
+            albedoConstant[0] = surface.mDiffuseColor[0];
+            albedoConstant[1] = surface.mDiffuseColor[1];
+            albedoConstant[2] = surface.mDiffuseColor[2];
+            opacityConstant = surface.mMaterialAlpha;
+
+            const float emissiveMagnitude = std::max(
+                surface.mEmissiveColor[0], std::max(surface.mEmissiveColor[1], surface.mEmissiveColor[2]));
+            if (emissiveMagnitude > 0.0f)
+            {
+                emissiveColour[0] = surface.mEmissiveColor[0] / emissiveMagnitude;
+                emissiveColour[1] = surface.mEmissiveColor[1] / emissiveMagnitude;
+                emissiveColour[2] = surface.mEmissiveColor[2] / emissiveMagnitude;
+            }
+        }
+
+        // Addressing, read from the albedo texture where there is one. Terrain composites have no
+        // osg::Texture2D behind them -- their albedo is a readback image -- so those keep the Repeat default,
+        // which is what tiling terrain layers want anyway.
+        unsigned char wrapU = 1;
+        unsigned char wrapV = 1;
+        if (surface.mTexture != nullptr)
+        {
+            // lss::Mdl::WrapMode: 0 Clamp, 1 Repeat. Only CLAMP* becomes Clamp; the mirrored modes have no
+            // safe mapping here and Repeat is both the existing behaviour and the less damaging error.
+            const auto wrapModeFor = [](osg::Texture::WrapMode mode) -> unsigned char {
+                switch (mode)
+                {
+                    case osg::Texture::CLAMP:
+                    case osg::Texture::CLAMP_TO_EDGE:
+                    case osg::Texture::CLAMP_TO_BORDER:
+                        return 0;
+                    default:
+                        return 1;
+                }
+            };
+            wrapU = wrapModeFor(surface.mTexture->getWrap(osg::Texture::WRAP_S));
+            wrapV = wrapModeFor(surface.mTexture->getWrap(osg::Texture::WRAP_T));
+        }
+
+        // Height for parallax occlusion mapping, split out of the normal map's alpha.
+        //
+        // Off by default. The depth is in world units and Morrowind is roughly seventy units to the metre,
+        // so the value that reads as surface relief rather than as a swimming mess is a judgement against
+        // the screen, not something derivable from the asset. OPENMW_REMIX_PARALLAX=1.0 is a reasonable
+        // first try; Remix's own Displacement In Factor then scales it globally.
+        //
+        // Only offered when there is no terrain coverage mask. runtime.cpp routes that mask through the same
+        // heightTexture slot, which is only safe while displacement stays zero -- the runtime gates the slot
+        // on displacement being non-zero -- so setting displacement on a material carrying a mask would make
+        // it read the coverage as a height field.
+        static const float parallaxDepth = envFloat("OPENMW_REMIX_PARALLAX", Settings::remix().mParallaxDepth);
+        unsigned long long heightHash = 0;
+        float displaceIn = 0.0f;
+        if (parallaxDepth > 0.0f && maskHash == 0 && surface.mHasNormalHeight
+            && surface.mNormalMap != nullptr && surface.mNormalMap->getImage() != nullptr)
+        {
+            heightHash = heightTextureFor(*surface.mNormalMap->getImage());
+            if (heightHash != 0)
+                displaceIn = parallaxDepth;
+        }
+
         // Everything baked into the material is part of its identity. The same texture can be a cutout on
         // one mesh and opaque on another, and can be paired with a normal map on one and not the other, so
         // any of these differing means a different material rather than a reused one.
@@ -4044,6 +4577,29 @@ namespace MWRender
         // Folded in for the same reason as the normal: one albedo can appear with a specular map on one
         // mesh and without on another, and those are different materials.
         mix(roughnessHash);
+        // The tint, opacity, emissive colour and addressing are identity too. One texture used tinted on one
+        // mesh and plain on another is two materials; collapsing them means whichever was built first wins
+        // for both, which is the same trap this block already avoids for cutouts and normal maps. Quantised
+        // so that float noise does not manufacture a new material per draw.
+        const auto mixUnit = [&mix](float value) {
+            mix(static_cast<unsigned long long>(value * 255.0f + 0.5f));
+        };
+        mixUnit(albedoConstant[0]);
+        mixUnit(albedoConstant[1]);
+        mixUnit(albedoConstant[2]);
+        mixUnit(opacityConstant);
+        mixUnit(emissiveColour[0]);
+        mixUnit(emissiveColour[1]);
+        mixUnit(emissiveColour[2]);
+        mix(static_cast<unsigned long long>(wrapU) | (static_cast<unsigned long long>(wrapV) << 8));
+        // Height and its depth are identity too: the same albedo with and without displacement are two
+        // materials, and collapsing them would give whichever was built first to both.
+        mix(heightHash);
+        mix(static_cast<unsigned long long>(displaceIn * 256.0f + 0.5f));
+        // The sheet's frame count and rate are identity: the same atlas played at a different rate, or a
+        // sheet against a single frame, are different materials.
+        mix(static_cast<unsigned long long>(surface.mSpriteSheetCols)
+            | (static_cast<unsigned long long>(surface.mSpriteSheetFps) << 8));
         mix(static_cast<unsigned long long>(roughness * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(metallic * 255.0f + 0.5f));
         mix(static_cast<unsigned long long>(emissiveIntensity * 16.0f + 0.5f));
@@ -4078,7 +4634,7 @@ namespace MWRender
         // Composites excluded for the same reason as in textureFor: no file behind them, regenerated
         // constantly, and the flush at the end of every log line is not free.
         if (std::string_view(image->getFileName()) != Terrain::CompositeMap::sReadbackImageName
-            && mMaterialsLogged < kMaterialLogLimit)
+            && mMaterialsLogged < mMaterialLogLimit)
         {
             ++mMaterialsLogged;
             const std::string transparencyDescription = blendType == kBlendTypeAlphaEmissive
@@ -4099,7 +4655,15 @@ namespace MWRender
                              << " roughness "
                              << roughness << " metallic " << metallic << "; normal map "
                              << (normalHash != 0 ? "yes" : "no")
-                             << (mMaterialsLogged == kMaterialLogLimit ? " (last of these)" : "");
+                             // Printed so a surface that lit up unexpectedly can be traced back to its file,
+                             // which is the whole point of these lines. Says where it came from too, because
+                             // a glow map and a material emissive are different assets to go and look at.
+                             << "; emissive " << emissiveIntensity
+                             << (emissiveIntensity <= 0.0f
+                                     ? ""
+                                     : (hasGlowMap ? " (glow map)"
+                                                      : (emissive > 0.0f ? " (caller)" : " (material)")))
+                             << (mMaterialsLogged == mMaterialLogLimit ? " (last of these)" : "");
         }
 
         // `key | 1` is this material's identity, and deliberately not the albedo texture hash.
@@ -4125,7 +4689,9 @@ namespace MWRender
         // was created first.
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
             metallic, alphaTestReference, normalHash, emissiveIntensity, blendType, maskHash,
-            maskHash != 0 ? maskTransform : nullptr, roughnessHash, glowHash);
+            maskHash != 0 ? maskTransform : nullptr, roughnessHash, glowHash, albedoConstant,
+            opacityConstant, emissiveColour, wrapU, wrapV, heightHash, displaceIn, 0.0f,
+            surface.mSpriteSheetCols, surface.mSpriteSheetFps);
         if (handle == 0)
         {
             // Remembered as the fallback so a material the runtime refused is not retried every frame.
@@ -4142,7 +4708,7 @@ namespace MWRender
 
         // Coverage summary, reported every 64 materials rather than per material.
         //
-        // The per-material lines above stop at kMaterialLogLimit and describe individual surfaces, which
+        // The per-material lines above stop at mMaterialLogLimit and describe individual surfaces, which
         // cannot answer the question that actually matters: how much of this scene's art is supplying PBR
         // maps at all. A count with no denominator cannot either -- "214 normals" means nothing without
         // knowing whether that is out of 300 materials or 3000 -- so both are reported together.
@@ -4157,7 +4723,7 @@ namespace MWRender
             ++mMaterialsWithRoughness;
         if (emissiveIntensity > 0.0f)
             ++mMaterialsWithEmissive;
-        if (glowHash != 0)
+        if (hasGlowMap)
             ++mMaterialsWithGlow;
 
         if (mMaterialsBuilt - mMaterialSummaryAt >= 64)
@@ -4181,6 +4747,34 @@ namespace MWRender
         unsigned int categoryFlags, bool doubleSided, const SceneUtil::RigGeometry* rig,
         unsigned int pickingValue, float distanceSquared)
     {
+        // OpenMW's own sky, dropped by default, because this host asks Remix to draw a sky of its own.
+        //
+        // Two skies were being lit at once. RemixSky drives rtx.atmosphere.* -- a physical sky model,
+        // procedural clouds, stars, and real distant lights for the sun and each moon -- while this path
+        // also submitted OpenMW's sky dome, its sun and sun-flash billboards, both moon billboards and its
+        // cloud layer, tagged Category_Sky. Remix turns Category_Sky geometry into the environment, and the
+        // note by mExempt below says what that means: it becomes the dominant area light in every cell.
+        // So the scene was lit by a procedural atmosphere and by a textured dome carrying a starfield and two
+        // moon quads, added together.
+        //
+        // That is what an unexplained pale light at midnight is. It also explains why none of Remix's
+        // night-sky controls could touch it: nightSkyBrightness, starBrightness and the moon gains all tune
+        // the procedural sky, and none of them is what the submitted dome contributes.
+        //
+        // Weather particles are unaffected. Rain and snow carry Category_Sky from Mask_WeatherParticles but
+        // reach the runtime through submitParticles, not this queue, so they are still submitted.
+        //
+        // On by default only if someone wants the old behaviour back: with Remix's own sky off, or skyMode
+        // set to something that does not draw one, the dome is the only sky there is and dropping it would
+        // leave the world unlit.
+        static const bool submitSkyGeometry
+            = envFlag("OPENMW_REMIX_SKY_GEOMETRY", Settings::remix().mSkyGeometry);
+        if (!submitSkyGeometry && (categoryFlags & RemixRT::Runtime::Category_Sky) != 0)
+        {
+            ++mSkyInstancesDropped;
+            return;
+        }
+
         PendingInstance pending;
         pending.mMesh = mesh;
         std::memcpy(pending.mTransform, transform, sizeof(pending.mTransform));
@@ -4210,7 +4804,7 @@ namespace MWRender
 
     void RemixScene::flushSubmissions()
     {
-        static const bool nearestFirst = envFlag("OPENMW_REMIX_BUDGET_NEAREST_FIRST", true);
+        static const bool nearestFirst = envFlag("OPENMW_REMIX_BUDGET_NEAREST_FIRST", Settings::remix().mBudgetNearestFirst);
 
         // Sort keys, not instances. A PendingInstance is ~88 bytes, and at the 20,000-instance ceiling
         // sorting them directly would move well over a megabyte through a merge sort every frame -- a
@@ -4358,7 +4952,10 @@ namespace MWRender
         // scene like anything else, which is what a path tracer is good at. Handing them an emissive term
         // does not merely brighten them, it removes them from the lighting solution entirely -- an emitter
         // takes no shadow and picks up no colour from its surroundings, so smoke stops being smoke.
-        const float particleEmissive = surface.mAdditive ? kParticleEmissive : 0.0f;
+        static const float alphaEmissiveScale
+            = envFloat("OPENMW_REMIX_PARTICLE_EMISSIVE", Settings::remix().mParticleEmissive);
+        const float particleEmissive
+            = surface.mAdditive ? kParticleEmissive : surface.mMaterialEmissive * alphaEmissiveScale;
         const unsigned long long material = materialFor(surface, particleEmissive);
         if (material == 0)
             return;

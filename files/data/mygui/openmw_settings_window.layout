@@ -878,6 +878,127 @@
                     </Widget>
                 </Widget>
             </Widget>
+            <Widget type="TabItem">
+                <Property key="Caption" value=" #{OMWEngine:Remix} "/>
+
+                <Widget type="HBox" position="4 4 352 24">
+                    <Widget type="AutoSizedButton" skin="MW_Button">
+                        <UserString key="SettingCategory" value="Remix"/>
+                        <UserString key="SettingName" value="terrain"/>
+                        <UserString key="SettingType" value="CheckButton"/>
+                    </Widget>
+                    <Widget type="AutoSizedTextBox" skin="SandText">
+                        <Property key="Caption" value="#{OMWEngine:RemixTerrain} "/>
+                    </Widget>
+                    <Widget type="AutoSizedButton" skin="MW_Button">
+                        <UserString key="SettingCategory" value="Remix"/>
+                        <UserString key="SettingName" value="groundcover"/>
+                        <UserString key="SettingType" value="CheckButton"/>
+                    </Widget>
+                    <Widget type="AutoSizedTextBox" skin="SandText">
+                        <Property key="Caption" value="#{OMWEngine:RemixGroundcover} "/>
+                    </Widget>
+                </Widget>
+                <Widget type="HBox" position="4 32 352 24">
+                    <Widget type="AutoSizedButton" skin="MW_Button">
+                        <UserString key="SettingCategory" value="Remix"/>
+                        <UserString key="SettingName" value="cull"/>
+                        <UserString key="SettingType" value="CheckButton"/>
+                    </Widget>
+                    <Widget type="AutoSizedTextBox" skin="SandText">
+                        <Property key="Caption" value="#{OMWEngine:RemixCull} "/>
+                    </Widget>
+                    <Widget type="AutoSizedButton" skin="MW_Button">
+                        <UserString key="SettingCategory" value="Remix"/>
+                        <UserString key="SettingName" value="material constants"/>
+                        <UserString key="SettingType" value="CheckButton"/>
+                    </Widget>
+                    <Widget type="AutoSizedTextBox" skin="SandText">
+                        <Property key="Caption" value="#{OMWEngine:RemixMaterialConstants} "/>
+                    </Widget>
+                </Widget>
+                <Widget type="HBox" position="4 60 352 24">
+                    <Widget type="AutoSizedButton" skin="MW_Button">
+                        <UserString key="SettingCategory" value="Remix"/>
+                        <UserString key="SettingName" value="fog"/>
+                        <UserString key="SettingType" value="CheckButton"/>
+                    </Widget>
+                    <Widget type="AutoSizedTextBox" skin="SandText">
+                        <Property key="Caption" value="#{OMWEngine:RemixFog} "/>
+                    </Widget>
+                </Widget>
+
+                <Widget type="TextBox" skin="NormalText" position="4 92 352 18" align="Left Top" name="RemixParallaxText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 112 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="parallax depth"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0"/>
+                    <UserString key="SettingMax" value="4"/>
+                    <UserString key="SettingLabelWidget" value="RemixParallaxText"/>
+                    <UserString key="SettingLabelCaption" value="RemixParallaxValue"/>
+                </Widget>
+                <Widget type="TextBox" skin="NormalText" position="4 136 352 18" align="Left Top" name="RemixParticleEmissiveText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 156 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="particle emissive"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0"/>
+                    <UserString key="SettingMax" value="6"/>
+                    <UserString key="SettingLabelWidget" value="RemixParticleEmissiveText"/>
+                    <UserString key="SettingLabelCaption" value="RemixParticleEmissiveValue"/>
+                </Widget>
+                <Widget type="TextBox" skin="NormalText" position="4 180 352 18" align="Left Top" name="RemixGlowIntensityText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 200 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="glow intensity"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0"/>
+                    <UserString key="SettingMax" value="6"/>
+                    <UserString key="SettingLabelWidget" value="RemixGlowIntensityText"/>
+                    <UserString key="SettingLabelCaption" value="RemixGlowIntensityValue"/>
+                </Widget>
+                <Widget type="TextBox" skin="NormalText" position="4 224 352 18" align="Left Top" name="RemixLightIntensityText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 244 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="light intensity"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0"/>
+                    <UserString key="SettingMax" value="6"/>
+                    <UserString key="SettingLabelWidget" value="RemixLightIntensityText"/>
+                    <UserString key="SettingLabelCaption" value="RemixLightIntensityValue"/>
+                </Widget>
+                <Widget type="TextBox" skin="NormalText" position="4 268 352 18" align="Left Top" name="RemixFogTransmittanceText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 288 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="fog transmittance"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0.01"/>
+                    <UserString key="SettingMax" value="0.99"/>
+                    <UserString key="SettingLabelWidget" value="RemixFogTransmittanceText"/>
+                    <UserString key="SettingLabelCaption" value="RemixFogTransmittanceValue"/>
+                </Widget>
+            </Widget>
         </Widget>
         <Widget type="AutoSizedButton" skin="MW_Button" position="320 420 56 24" align="Right Bottom" name="OkButton">
             <Property key="ExpandDirection" value="Left"/>

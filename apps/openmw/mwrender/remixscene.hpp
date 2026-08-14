@@ -107,6 +107,16 @@ namespace MWRender
         /// straight out of the state set and calls setMatrix on it. An unseeded state set is a null
         /// dereference, not a missing animation.
         osg::StateSet& animatedStateFor(SceneUtil::StateSetUpdater& updater);
+        /// Assembles a NIF texture flipbook's frames into one 1 x N sprite sheet, or null if it cannot.
+        ///
+        /// Block-copies compressed frames rather than decoding them: BC1, BC2 and BC3 store each 4x4 texel
+        /// block independently, so frames placed on 4-texel boundaries can be concatenated losslessly.
+        /// Uncompressed RGBA is row-copied. Cached on the first frame's image, so a sheet shared by many
+        /// meshes is built once, and a refusal is cached too so the same frames are not retried every frame.
+        ///
+        /// Refuses rather than guesses: frames must agree on size and format, compressed frames must be a
+        /// multiple of four in both axes, and the atlas must stay within 8192 texels across.
+        const osg::Image* spriteSheetFor(const std::vector<osg::ref_ptr<osg::Texture2D>>& frames);
 
         /// Instances submitted on the last call to submit().
         unsigned int lastInstanceCount() const { return mLastInstanceCount; }
@@ -159,6 +169,60 @@ namespace MWRender
             /// mAlphaBlend -- both are blended, and Morrowind uses the same particle machinery for both. An
             /// additive surface is emissive by construction; an alpha-blended one occludes and must be lit.
             bool mAdditive = false;
+            /// Luminance of the material's emissive colour; 0 when the mesh declares none.
+            ///
+            /// Morrowind's NiMaterialProperty carries an emissive colour that the fixed-function pipeline
+            /// adds regardless of scene lighting, which is why smoke and steam look bright in raster despite
+            /// being ordinary alpha-blended quads that occlude. mAdditive cannot stand in for it: both kinds
+            /// are blended, and that test catches only the accumulating ones.
+            ///
+            /// A single scalar because that is all the runtime's emissiveIntensity accepts. Where a
+            /// NiVertexColorProperty asks for emissive vertex colours, nifloader sets emission to white and
+            /// the per-particle tint arrives in the vertex colours instead.
+            /// Magnitude of the material's emissive colour: max(r, g, b), 0 when none is declared.
+            ///
+            /// Max component rather than luminance, to match how the runtime itself splits emission into a
+            /// scale and a unit colour (see gbuffer_memory_polymorphic_surface_material_interaction.slangh:
+            /// emissiveIntensity = max(r,g,b), emissiveColor = emissiveRadiance / emissiveIntensity). Using
+            /// luma here and that split there would disagree, and the colour would come out wrong for
+            /// anything not grey.
+            ///
+            /// Morrowind's NiMaterialProperty carries an emissive colour that the fixed-function pipeline
+            /// adds regardless of scene lighting, which is why smoke and steam look bright in raster despite
+            /// being ordinary alpha-blended quads that occlude. mAdditive cannot stand in for it: both kinds
+            /// are blended, and that test catches only the accumulating ones.
+            ///
+            /// Where a NiVertexColorProperty asks for emissive vertex colours, nifloader sets emission to
+            /// white and the per-particle tint arrives in the vertex colours instead.
+            float mMaterialEmissive = 0.0f;
+            /// The material's emissive colour, linear RGB, unnormalised. Zero when none is declared.
+            ///
+            /// Kept beside the magnitude rather than folded into it because a scalar cannot express hue: a
+            /// green rune and a blue glow both reduce to one number, and both then render white. Split into
+            /// intensity and unit colour at submission, matching the runtime's own convention.
+            float mEmissiveColor[3] = { 0.0f, 0.0f, 0.0f };
+            /// The material's diffuse colour, linear RGB. White when the mesh declares none.
+            ///
+            /// NiMaterialProperty's mDiffuse, a per-material tint that multiplies the albedo texture. Every
+            /// tinted object rendered untinted before this was read.
+            ///
+            /// White is the correct default and is also what nifloader writes when a NiVertexColorProperty
+            /// routes vertex colours into diffuse (colour mode AMBIENT_AND_DIFFUSE), so the two paths do not
+            /// double-apply: in that case the tint travels in the vertex colours instead.
+            float mDiffuseColor[3] = { 1.0f, 1.0f, 1.0f };
+            /// The material's own opacity, 0..1, independent of any texture alpha.
+            ///
+            /// NiMaterialProperty's mAlpha, which nifloader stores in the w of the diffuse vector. Multiplies
+            /// whatever the texture's alpha channel supplies.
+            float mMaterialAlpha = 1.0f;
+            /// Texture addressing for the albedo, as MDL enumerants: 0 Clamp, 1 Repeat.
+            ///
+            /// Repeat unless OpenMW explicitly clamps. The runtime defaults these to Repeat already and the
+            /// comment on applyDefaultSamplerState explains why a wrong Clamp is worth avoiding -- it smears
+            /// the last row and column of texels across everything past the edge, which reads as streaks
+            /// locked to the surface. So Clamp is only ever emitted when the asset asks for it.
+            unsigned char mWrapU = 1;
+            unsigned char mWrapV = 1;
             /// An albedo supplied directly as an image, bypassing mTexture.
             ///
             /// Exists for composited terrain, whose real albedo is a render target with no image behind it
@@ -218,6 +282,23 @@ namespace MWRender
             /// SceneUtil::TextureType tag rather than by assuming a unit index, because the ShaderVisitor
             /// picks the unit dynamically from however many the state set already had.
             const osg::Texture2D* mNormalMap = nullptr;
+            /// Whether mNormalMap carries height in its alpha channel.
+            ///
+            /// True when OpenMW tagged the texture "normalHeightMap" rather than "normalMap". The two are
+            /// the same image as far as the normal is concerned; only the tag says whether the alpha means
+            /// anything. Recorded because the tag is gone by the time the material is built, and guessing
+            /// from the presence of an alpha channel would treat every RGBA normal map as a height field.
+            bool mHasNormalHeight = false;
+            /// Frame count of the sprite sheet in mExplicitImage, or 0 when this surface has none.
+            ///
+            /// Doubles as the atlas column count: the sheet is laid out 1 x N, so the frame count and the
+            /// column count are the same number. See spriteSheetFor for why a single row.
+            unsigned char mSpriteSheetCols = 0;
+            /// Sprite sheet playback rate in frames per second, 0 when this surface has no sheet.
+            ///
+            /// Non-zero is what tells the runtime the material is animated at all
+            /// (rtx_instance_manager.cpp: m_isAnimated = surface.spriteSheetFPS != 0).
+            unsigned char mSpriteSheetFps = 0;
         };
 
         /// Converts and caches one drawable, returning its Remix mesh handle, or 0 if unusable.
@@ -582,6 +663,16 @@ namespace MWRender
         /// Derived images are cached and owned here, because textureFor keys its upload cache on the image
         /// address and a temporary would both churn uploads and alias freed memory.
         unsigned long long roughnessTextureFor(const osg::Image& specular);
+        /// Extracts the height channel from a normal-height map, for Remix's POM slot.
+        ///
+        /// OpenMW packs height into the alpha of a "normalHeightMap"; Remix wants it as its own texture.
+        /// Same conversion discipline as roughnessTextureFor: uncompressed sources only, one derived image
+        /// per source, cached by source pointer so a map shared by many meshes converts once.
+        ///
+        /// White is the outer surface and lower values displace inward, which is the runtime's convention
+        /// (rtx_terrain_baker.cpp: "a value of 1.f will have 0 displacement") and also OpenMW's, so the
+        /// alpha is copied without inversion.
+        unsigned long long heightTextureFor(const osg::Image& normalHeight);
 
         /// Releases meshes not submitted for a while.
         void evictStaleMeshes();
@@ -683,6 +774,10 @@ namespace MWRender
         /// Owns them: textureFor keys its cache on the image address, so a derived image has to outlive
         /// every upload that refers to it. A specular map shared by many meshes is converted once.
         std::unordered_map<const osg::Image*, osg::ref_ptr<osg::Image>> mDerivedRoughness;
+        /// Height channel split out of a normal-height map. Same lifetime and sharing as mDerivedRoughness.
+        std::unordered_map<const osg::Image*, osg::ref_ptr<osg::Image>> mDerivedHeight;
+        /// Assembled sprite sheets, keyed on the first frame's image. A null entry records a refusal.
+        std::unordered_map<const osg::Image*, osg::ref_ptr<osg::Image>> mSpriteSheets;
 
         /// Running tally of what the materials actually ended up carrying.
         ///
@@ -742,6 +837,8 @@ namespace MWRender
         std::unordered_map<unsigned long long, std::size_t> mTextureBytes;
         /// Triangles per mesh identity, for the submission budget below.
         std::unordered_map<unsigned long long, unsigned int> mMeshPrimitives;
+        /// Sky instances dropped because Remix draws its own sky. Reported in the scene summary.
+        unsigned int mSkyInstancesDropped = 0;
         /// Triangles admitted so far this frame, and how many instances the budget turned away.
         unsigned int mPrimitivesSubmitted = 0;
         unsigned int mInstancesOverBudget = 0;
@@ -913,13 +1010,15 @@ namespace MWRender
         // surface state? That decides whether a material can be identified by its albedo texture hash, the
         // way Remix identifies a D3D9 material, without losing a distinction OpenMW currently makes. At 48
         // the answer was "never in 45 samples", which is not an answer.
-        static constexpr unsigned int kMaterialLogLimit = 4096;
+        /// Read from the [Remix] "material log limit" setting at construction. 0 switches these lines off.
+        unsigned int mMaterialLogLimit = 4096;
 
         /// Capped like the material log, but higher: the point of it is to be able to look up an arbitrary
         /// hash seen in Remix's texture list, so covering only the first few textures of a session would
         /// miss most of what anyone would want to ask about.
         unsigned int mTexturesLogged = 0;
-        static constexpr unsigned int kTextureLogLimit = 4096;
+        /// Read from the [Remix] "texture log limit" setting at construction. 0 switches these lines off.
+        unsigned int mTextureLogLimit = 4096;
 
 
         /// Same idea for lights, and a smaller sample: the interesting question is whether the derivation

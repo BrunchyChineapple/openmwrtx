@@ -380,6 +380,11 @@ namespace NifOsg
         META_Object(NifOsg, FlipController)
 
         std::vector<osg::ref_ptr<osg::Texture2D>>& getTextures() { return mTextures; }
+        /// Seconds per frame, or 0 when the frame is chosen by an interpolator instead of a constant rate.
+        ///
+        /// Exposed so a consumer can express the same animation another way -- a Remix sprite sheet wants a
+        /// frame rate, and apply() derives the frame as getInputValue(nv) / mDelta, so the rate is 1/mDelta.
+        float getDelta() const { return mDelta; }
 
         void apply(osg::StateSet* stateset, osg::NodeVisitor* nv) override;
     };

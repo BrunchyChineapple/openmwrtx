@@ -1624,6 +1624,303 @@
         </layout>
        </item>
        <item>
+        <widget class="Line" name="remixTestingLine">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="remixTestingLabel">
+         <property name="text">
+          <string>RTX Remix diagnostics and instrumentation. The log limits bound how much is written to openmw.log; the submission toggles switch off a whole class of geometry so a suspected culprit can be isolated without rebuilding.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixMaterialLogLimitLayout">
+         <item>
+          <widget class="QLabel" name="remixMaterialLogLimitLabel">
+           <property name="toolTip">
+            <string>Maximum per-material log lines. These identify which file a wrong-looking surface came from, and are also most of a large openmw.log. 0 switches them off.</string>
+           </property>
+           <property name="text">
+            <string>Material Log Limit</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="remixMaterialLogLimit">
+           <property name="toolTip">
+            <string>Maximum per-material log lines. These identify which file a wrong-looking surface came from, and are also most of a large openmw.log. 0 switches them off.</string>
+           </property>
+         <property name="minimum">
+            <number>0</number>
+           </property>
+           <property name="maximum">
+            <number>65535</number>
+           </property>
+           <property name="singleStep">
+            <number>256</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixTextureLogLimitLayout">
+         <item>
+          <widget class="QLabel" name="remixTextureLogLimitLabel">
+           <property name="toolTip">
+            <string>Maximum per-texture log lines. The hash in each can be pasted into Remix's texture list to get from a thumbnail that looks wrong back to the file. 0 switches them off.</string>
+           </property>
+           <property name="text">
+            <string>Texture Log Limit</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="remixTextureLogLimit">
+           <property name="toolTip">
+            <string>Maximum per-texture log lines. The hash in each can be pasted into Remix's texture list to get from a thumbnail that looks wrong back to the file. 0 switches them off.</string>
+           </property>
+         <property name="minimum">
+            <number>0</number>
+           </property>
+           <property name="maximum">
+            <number>65535</number>
+           </property>
+           <property name="singleStep">
+            <number>256</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixSceneLogFramesLayout">
+         <item>
+          <widget class="QLabel" name="remixSceneLogFramesLabel">
+           <property name="toolTip">
+            <string>Frames between scene summary lines. 600 is 20-40 seconds at path-traced frame times, which is too coarse to catch a transient state.</string>
+           </property>
+           <property name="text">
+            <string>Scene Log Interval (frames)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="remixSceneLogFrames">
+           <property name="toolTip">
+            <string>Frames between scene summary lines. 600 is 20-40 seconds at path-traced frame times, which is too coarse to catch a transient state.</string>
+           </property>
+         <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>100000</number>
+           </property>
+           <property name="singleStep">
+            <number>60</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixProbeQuadCheckBox">
+         <property name="toolTip">
+          <string>Draws a bright quad in front of the camera. Separates a broken submission path from wrong world transforms.</string>
+         </property>
+         <property name="text">
+          <string>Draw Probe Quad</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixUntexturedEmissiveCheckBox">
+         <property name="toolTip">
+          <string>Makes surfaces that fell back to the untextured material self-lit, which is how they get found.</string>
+         </property>
+         <property name="text">
+          <string>Untextured Geometry Glows</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixTerrainLayersCheckBox">
+         <property name="toolTip">
+          <string>Submit terrain as its per-layer textures. Off falls back to a single baked composite per chunk.</string>
+         </property>
+         <property name="text">
+          <string>Terrain Layer Textures</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixTerrainCompositeCheckBox">
+         <property name="toolTip">
+          <string>Bake terrain layers into one composite texture per chunk. Superseded by the layer path above.</string>
+         </property>
+         <property name="text">
+          <string>Bake Terrain Composites</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixCompositeCompressCheckBox">
+         <property name="toolTip">
+          <string>Block-compress composites before upload. Costs encode time, saves a large amount of video memory.</string>
+         </property>
+         <property name="text">
+          <string>Compress Terrain Composites</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixPackMatchingCheckBox">
+         <property name="toolTip">
+          <string>Compute mesh identities the way Remix's own D3D9 path would, so a pack authored against a Morrowind capture can bind. Off submits geometry no pack can replace.</string>
+         </property>
+         <property name="text">
+          <string>Replacement Pack Mesh Matching</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="remixBudgetNearestFirstCheckBox">
+         <property name="toolTip">
+          <string>Spend the per-frame geometry budget on the nearest drawables. Off submits in traversal order.</string>
+         </property>
+         <property name="text">
+          <string>Fill Geometry Budget Nearest First</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixCompositeBudgetMsLayout">
+         <item>
+          <widget class="QLabel" name="remixCompositeBudgetMsLabel">
+           <property name="toolTip">
+            <string>Per-frame millisecond budget for composite encoding, 0 for none. Deferring leaves a chunk untextured for a frame, trading a visible pop for a shorter frame.</string>
+           </property>
+           <property name="text">
+            <string>Composite Encode Budget (ms)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QDoubleSpinBox" name="remixCompositeBudgetMs">
+           <property name="toolTip">
+            <string>Per-frame millisecond budget for composite encoding, 0 for none. Deferring leaves a chunk untextured for a frame, trading a visible pop for a shorter frame.</string>
+           </property>
+         <property name="decimals">
+          <number>1</number>
+         </property>
+         <property name="minimum">
+            <double>0.0</double>
+           </property>
+           <property name="maximum">
+            <double>100.0</double>
+           </property>
+           <property name="singleStep">
+            <double>0.5</double>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixCullMarginLayout">
+         <item>
+          <widget class="QLabel" name="remixCullMarginLabel">
+           <property name="toolTip">
+            <string>Distance by which the cull frustum is expanded. A path tracer needs off-screen geometry for shadows and reflections. A cell is 8192 units across.</string>
+           </property>
+           <property name="text">
+            <string>Cull Margin (units)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QDoubleSpinBox" name="remixCullMargin">
+           <property name="toolTip">
+            <string>Distance by which the cull frustum is expanded. A path tracer needs off-screen geometry for shadows and reflections. A cell is 8192 units across.</string>
+           </property>
+         <property name="decimals">
+          <number>0</number>
+         </property>
+         <property name="minimum">
+            <double>0.0</double>
+           </property>
+           <property name="maximum">
+            <double>65536.0</double>
+           </property>
+           <property name="singleStep">
+            <double>256.0</double>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixMinAngularRadiusLayout">
+         <item>
+          <widget class="QLabel" name="remixMinAngularRadiusLabel">
+           <property name="toolTip">
+            <string>Smallest angular radius a drawable may subtend before it is culled as too small to resolve. Roughly one pixel at 1440p. 0 switches the test off.</string>
+           </property>
+           <property name="text">
+            <string>Minimum Angular Radius</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QDoubleSpinBox" name="remixMinAngularRadius">
+           <property name="toolTip">
+            <string>Smallest angular radius a drawable may subtend before it is culled as too small to resolve. Roughly one pixel at 1440p. 0 switches the test off.</string>
+           </property>
+         <property name="decimals">
+          <number>4</number>
+         </property>
+         <property name="minimum">
+            <double>0.0</double>
+           </property>
+           <property name="maximum">
+            <double>1.0</double>
+           </property>
+           <property name="singleStep">
+            <double>0.0005</double>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="remixSkipTexturesLayout">
+         <item>
+          <widget class="QLabel" name="remixSkipTexturesLabel">
+           <property name="text">
+            <string>Skip Textures</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="remixSkipTexturesField">
+           <property name="toolTip">
+            <string>Texture path fragments to treat as non-surface passes rather than albedo, comma or semicolon separated. OpenMW submits post-process style passes as ordinary geometry, and handing one to a path tracer as an albedo draws it as a solid surface.</string>
+           </property>
+           <property name="placeholderText">
+            <string>e.g. omw_distortion</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <spacer>
          <property name="orientation">
           <enum>Qt::Vertical</enum>

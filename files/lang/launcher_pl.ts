@@ -1517,5 +1517,125 @@ Logi i ustawienia zmienione za pomocą programu uruchamiającego i w grze zostan
         <source>Active Config Directories</source>
         <translation>Aktywne katalogi konfiguracyjne</translation>
     </message>
+    <message>
+        <source>RTX Remix diagnostics and instrumentation. The log limits bound how much is written to openmw.log; the submission toggles switch off a whole class of geometry so a suspected culprit can be isolated without rebuilding.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Maximum per-material log lines. These identify which file a wrong-looking surface came from, and are also most of a large openmw.log. 0 switches them off.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Material Log Limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Maximum per-texture log lines. The hash in each can be pasted into Remix&apos;s texture list to get from a thumbnail that looks wrong back to the file. 0 switches them off.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Texture Log Limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames between scene summary lines. 600 is 20-40 seconds at path-traced frame times, which is too coarse to catch a transient state.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scene Log Interval (frames)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Draws a bright quad in front of the camera. Separates a broken submission path from wrong world transforms.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Draw Probe Quad</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Makes surfaces that fell back to the untextured material self-lit, which is how they get found.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untextured Geometry Glows</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Submit terrain as its per-layer textures. Off falls back to a single baked composite per chunk.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Terrain Layer Textures</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bake terrain layers into one composite texture per chunk. Superseded by the layer path above.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bake Terrain Composites</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Block-compress composites before upload. Costs encode time, saves a large amount of video memory.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compress Terrain Composites</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compute mesh identities the way Remix&apos;s own D3D9 path would, so a pack authored against a Morrowind capture can bind. Off submits geometry no pack can replace.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Replacement Pack Mesh Matching</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Spend the per-frame geometry budget on the nearest drawables. Off submits in traversal order.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fill Geometry Budget Nearest First</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Per-frame millisecond budget for composite encoding, 0 for none. Deferring leaves a chunk untextured for a frame, trading a visible pop for a shorter frame.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Composite Encode Budget (ms)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Distance by which the cull frustum is expanded. A path tracer needs off-screen geometry for shadows and reflections. A cell is 8192 units across.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cull Margin (units)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smallest angular radius a drawable may subtend before it is culled as too small to resolve. Roughly one pixel at 1440p. 0 switches the test off.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Minimum Angular Radius</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Skip Textures</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Texture path fragments to treat as non-surface passes rather than albedo, comma or semicolon separated. OpenMW submits post-process style passes as ordinary geometry, and handing one to a path tracer as an albedo draws it as a solid surface.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>e.g. omw_distortion</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 </TS>
