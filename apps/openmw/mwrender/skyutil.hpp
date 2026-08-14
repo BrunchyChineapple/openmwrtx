@@ -64,6 +64,17 @@ namespace MWRender
 
         bool mIsStorm;
 
+        // Whether this cell should be treated as having an outdoor atmosphere: a real exterior, or an
+        // interior flagged to behave as one. Carried from World's own exterior-or-quasi-exterior test,
+        // because the sky's enabled flag cannot answer it -- this fork enables the sky unconditionally so
+        // that sealed rooms still receive sky lighting. The Remix host gates its volumetric medium on this,
+        // so an ordinary interior gets no outdoor fog while Mournhold and the Vivec cantons keep theirs.
+        //
+        // Defaults true so that any construction path which does not set it behaves as an exterior, the
+        // conservative direction: fog where it may not belong is a visual nuisance, fog missing outdoors
+        // would be a regression.
+        bool mOutdoorAtmosphere = true;
+
         ESM::RefId mAmbientLoopSoundID;
         ESM::RefId mRainLoopSoundID;
         float mAmbientSoundVolume;

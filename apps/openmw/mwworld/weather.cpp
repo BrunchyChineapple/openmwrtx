@@ -861,6 +861,13 @@ namespace MWWorld
         // Deliberately narrower than the early return this replaces: sun, moons, clouds, fog, ambient and sun
         // colour all still apply, which is the whole point. Interiors with a sightline out get a real sky and
         // the light that comes with it; sealed ones get the lighting without rain indoors.
+        // Set after calculateWeatherResult so nothing downstream recomputes over it, and from the caller's
+        // own test rather than anything sky-side: worldimp passes isExterior as
+        // isCellExterior() || isCellQuasiExterior(), which is exactly the distinction wanted. A real
+        // exterior and a quasi-exterior interior both report an outdoor atmosphere; an ordinary interior
+        // does not. Read by the Remix host to decide whether its volumetric medium belongs in this cell.
+        mResult.mOutdoorAtmosphere = isExterior;
+
         if (!isExterior)
         {
             mResult.mParticleEffect.clear();

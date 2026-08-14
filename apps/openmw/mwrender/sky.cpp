@@ -591,6 +591,13 @@ namespace MWRender
         }
 
         mEnabled = enabled;
+        // One-way only. Switching the sky off must take its weather with it, which is what the console's
+        // toggle expects, but switching it on says nothing about whether this cell has an outdoor
+        // atmosphere -- that is setWeather's answer, from the cell's own classification. Assigning `enabled`
+        // in both directions is what defeated the gate before: this fork enables the sky in every cell, so
+        // the assignment rewrote the correct interior answer to true on the very next frame.
+        if (!enabled)
+            mState.mHaveWeather = false;
     }
 
     void SkyManager::setMoonColour(bool red)
@@ -643,7 +650,20 @@ namespace MWRender
         mState.mNight = weather.mNight;
         mState.mIsStorm = weather.mIsStorm;
         mState.mStormDirection = weather.mStormDirection;
-        mState.mHaveWeather = true;
+        // Whether this cell's weather should be *shown*, not whether weather has ever been computed. The
+        // Remix host gates its volumetric medium on this, so a wrong answer here puts outdoor fog in a
+        // windowless room.
+        //
+        // Two earlier sources were both wrong. Latching true on the first frame weather was computed never
+        // cleared, so every interior after the player's first trip outside kept the outdoor medium. Reading
+        // mEnabled instead looked right -- it comes from World's sky flag -- but this fork answers that flag
+        // unconditionally so that sealed interiors still receive sky lighting, which pins it true everywhere
+        // and gates nothing at all.
+        //
+        // The cell's own classification is the only source that answers the question, so it is carried here
+        // from WeatherManager rather than re-derived: exterior or quasi-exterior means an outdoor
+        // atmosphere, and Mournhold and the Vivec cantons keep their fog through the quasi-exterior half.
+        mState.mHaveWeather = weather.mOutdoorAtmosphere;
 
         if (!mCreated)
             return;

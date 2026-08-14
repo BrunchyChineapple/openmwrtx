@@ -576,8 +576,9 @@ namespace MWRender
                 mVolumetricsEnabled = wantVolumetrics;
                 mRuntime.setConfigVariable("rtx.volumetrics.enable", wantVolumetrics ? "True" : "False");
                 Log(Debug::Info) << "Remix sky: volumetric fog "
-                                 << (wantVolumetrics ? "ON (cell has weather)"
-                                                     : "OFF (cell has no weather, so no outdoor medium indoors)");
+                                 << (wantVolumetrics
+                                            ? "ON (cell is exterior or quasi-exterior)"
+                                            : "OFF (ordinary interior, so no outdoor medium stands in it)");
             }
         }
 
