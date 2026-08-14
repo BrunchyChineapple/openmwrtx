@@ -75,6 +75,28 @@ namespace NifOsg
         return mStopTime;
     }
 
+    float ControllerFunction::getPeriod() const
+    {
+        // In input seconds, not in controller values. calculate() maps seconds to a value by
+        // time = mFrequency * seconds + mPhase, so one traversal of [mStartTime, mStopTime] takes
+        // (mStopTime - mStartTime) / mFrequency seconds of input.
+        //
+        // Zero when the animation does not repeat, which is the honest answer rather than a small number: a
+        // Constant extrapolation clamps at both ends instead of cycling, so it has no period to sample, and a
+        // caller that wants a loop should decline rather than invent one. A non-positive frequency or an empty
+        // range says the same thing.
+        if (mExtrapolationMode != Nif::NiTimeController::ExtrapolationMode::Cycle
+            && mExtrapolationMode != Nif::NiTimeController::ExtrapolationMode::Reverse)
+            return 0.f;
+        if (mFrequency <= 0.f || mStopTime <= mStartTime)
+            return 0.f;
+
+        // A Reverse controller runs the range forwards and then backwards, so its loop is twice as long.
+        const float forward = (mStopTime - mStartTime) / mFrequency;
+        return mExtrapolationMode == Nif::NiTimeController::ExtrapolationMode::Reverse ? forward * 2.f
+                                                                                      : forward;
+    }
+
     KeyframeController::KeyframeController() {}
 
     KeyframeController::KeyframeController(const KeyframeController& copy, const osg::CopyOp& copyop)
@@ -314,22 +336,26 @@ namespace NifOsg
             stateset->setTextureAttribute(unit, texMat, osg::StateAttribute::ON);
     }
 
+    osg::Matrixf UVController::matrixAt(float value) const
+    {
+        // First scale the UV relative to its center, then apply the offset.
+        // U offset is flipped regardless of the graphics library
+        osg::Vec3f uvOrigin(0.5f, 0.5f, 0.f);
+        osg::Vec3f uvScale(mUScale.interpKey(value), mVScale.interpKey(value), 1.f);
+        osg::Vec3f uvTrans(-mUTrans.interpKey(value), mVTrans.interpKey(value), 0.f);
+
+        osg::Matrixf mat = osg::Matrixf::translate(uvOrigin);
+        mat.preMultScale(uvScale);
+        mat.preMultTranslate(-uvOrigin);
+        mat.setTrans(mat.getTrans() + uvTrans);
+        return mat;
+    }
+
     void UVController::apply(osg::StateSet* stateset, osg::NodeVisitor* nv)
     {
         if (hasInput())
         {
-            float value = getInputValue(nv);
-
-            // First scale the UV relative to its center, then apply the offset.
-            // U offset is flipped regardless of the graphics library
-            osg::Vec3f uvOrigin(0.5f, 0.5f, 0.f);
-            osg::Vec3f uvScale(mUScale.interpKey(value), mVScale.interpKey(value), 1.f);
-            osg::Vec3f uvTrans(-mUTrans.interpKey(value), mVTrans.interpKey(value), 0.f);
-
-            osg::Matrixf mat = osg::Matrixf::translate(uvOrigin);
-            mat.preMultScale(uvScale);
-            mat.preMultTranslate(-uvOrigin);
-            mat.setTrans(mat.getTrans() + uvTrans);
+            const osg::Matrixf mat = matrixAt(getInputValue(nv));
 
             // setting once is enough because all other texture units share the same TexMat (see setDefaults).
             if (!mTextureUnits.empty())

@@ -24,6 +24,7 @@ add_openmw_dir (mwrender
     renderbin actoranimation landmanager navmesh actorspaths recastmesh fogmanager objectpaging groundcover
     postprocessor pingpongcull luminancecalculator pingpongcanvas transparentpass precipitationocclusion ripples
     actorutil distortion animationpriority bonegroup blendmask animblendcontroller remixscene remixsky
+    remixstagebake
     )
 
 add_openmw_dir (mwinput

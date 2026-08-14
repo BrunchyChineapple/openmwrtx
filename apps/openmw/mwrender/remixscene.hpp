@@ -36,6 +36,11 @@ namespace osgParticle
     class ParticleSystem;
 }
 
+namespace NifOsg
+{
+    class UVController;
+}
+
 namespace MWRender
 {
     /// Feeds OpenMW's scene graph to the Remix runtime, one frame at a time.
@@ -154,6 +159,53 @@ namespace MWRender
             /// lanterns, runes, glowing plants and enchanted items. Uploaded as colour rather than data,
             /// because it names an emitted colour and not a scalar.
             const osg::Texture2D* mEmissiveMap = nullptr;
+
+            /// Dark and detail stages, and the units they are bound to.
+            ///
+            /// Neither has a slot in a Remix material, and until now both were dropped. That is not a
+            /// rounding error on Morrowind's assets: OpenMW's rasteriser multiplies a dark map into the
+            /// base (objects.frag L156) and a detail map into it at twice strength (L176), and the Glow in
+            /// the Dahrk night windows put the entire window lattice on the detail stage. Dropping it is
+            /// why those panes render as a bare gradient.
+            ///
+            /// Kept here so RemixStageBake::combine can fold them into one albedo. The *unit* is recorded
+            /// alongside each because that is what identifies the stage's texcoords: OSG gives every
+            /// texture unit its own texcoord array, and nifloader binds the array for whichever uvSet the
+            /// stage named. The affine relating a stage's coords to the base's is solved from those arrays
+            /// rather than assumed, because assuming it is exactly how an earlier attempt produced a
+            /// lattice that was flipped and magnified -- these scales are routinely negative and in the
+            /// tens.
+            const osg::Texture2D* mDarkMap = nullptr;
+            const osg::Texture2D* mDetailMap = nullptr;
+            /// ~0u when the corresponding stage is absent, or when the unit could not be determined.
+            unsigned int mDiffuseUnit = ~0u;
+            unsigned int mDarkUnit = ~0u;
+            unsigned int mDetailUnit = ~0u;
+
+            /// Which texture units mTexMat actually drives, as a bitmask indexed by unit.
+            ///
+            /// This is what decides whether an animated base transform can be left live instead of being
+            /// frozen into the bake. NifOsg's UVController allocates one osg::TexMat and assigns that same
+            /// object to every unit reading the uv set it animates -- controller.cpp says so where it only
+            /// bothers to set the matrix once, "because all other texture units share the same TexMat". So
+            /// membership is a pointer comparison against unit 0's matrix, and it is exact.
+            ///
+            /// When every stage's unit is in this set, the matrix is a common factor of the whole product:
+            /// base(Mt) * detail(Mt) is f(Mt), so f is baked once and the matrix left on the surface, and an
+            /// animated one keeps animating. When some stage's unit is not, no such factorisation exists and
+            /// the matrix has to go inside the bake, which freezes it.
+            ///
+            /// A bitmask rather than a flag per stage because of *when* it can be known. The animated matrix
+            /// does not live on the drawable's own state set at all -- a StateSetUpdater on an AnimFlag_AutoPlay
+            /// node is a cull callback, so the traversal evaluates it into a separate state set and merges that
+            /// at node push time, before the drawable's textures have been seen. A verdict computed per stage
+            /// while merging the drawable's state set is therefore computed from the one state set that carries
+            /// no matrices, where every unit compares equal to every other. That is exactly what made the
+            /// logs-on-fire dark map scroll: it read uv set 1 while the controller animated uv set 0, and the
+            /// host concluded it moved with the base. Units are just indices, so they can be recorded whenever
+            /// the matrix is seen and resolved against the stage units later.
+            unsigned int mTexMatUnits = 0;
+
             /// Alpha-test threshold, 0..255. Zero means no cutout, i.e. fully opaque.
             unsigned char mAlphaTestReference = 0;
             /// Whether the surface is alpha blended.
@@ -299,6 +351,19 @@ namespace MWRender
             /// Non-zero is what tells the runtime the material is animated at all
             /// (rtx_instance_manager.cpp: m_isAnimated = surface.spriteSheetFPS != 0).
             unsigned char mSpriteSheetFps = 0;
+
+            /// The UV animation driving this surface, or null when it has none.
+            ///
+            /// Held as well as its current matrix because a matrix is one frame and the stage bake needs the
+            /// whole loop. Where a mesh's stages do not all move together the bake cannot leave the matrix
+            /// live, so it evaluates this controller at evenly spaced phases, bakes one image per phase and
+            /// hands the runtime a sprite sheet -- which is the difference between a frozen animation and a
+            /// correct one on the 333 shapes in the installed set that need it.
+            ///
+            /// Not owned. The controller belongs to the node's callback, which outlives the traversal, and it
+            /// is deliberately not part of the material key: two surfaces differing only by which controller
+            /// animates them still bake to the same phases.
+            const NifOsg::UVController* mUvController = nullptr;
         };
 
         /// Converts and caches one drawable, returning its Remix mesh handle, or 0 if unusable.
@@ -751,6 +816,13 @@ namespace MWRender
         };
         /// Material handle to the textures it references.
         std::unordered_map<unsigned long long, MaterialTextures> mMaterialAlbedoHashes;
+
+        /// Texture-and-outcome pairs the particle diagnostic has already reported, so it says each once.
+        ///
+        /// Particles are rebuilt and resubmitted every frame, so an unguarded line here would be thousands a
+        /// second. Keyed on the outcome as well as the texture so a system that submits nothing at first and
+        /// works later reports both states rather than being silenced by whichever came first.
+        std::set<std::string> mParticleDiagSeen;
 
         /// One texture's classified surface response, memoised so the classification runs once per texture
         /// rather than once per drawable per frame.

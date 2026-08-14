@@ -2255,6 +2255,8 @@ namespace RemixRT
                 "loading screen background choice and layout, one line per screen" },
             { Diag::NestedBursts, "OPENMW_REMIX_DIAG_NESTED", true,
                 "per-burst nested present accounting, one line per burst" },
+            { Diag::Particles, "OPENMW_REMIX_DIAG_PARTICLES", true,
+                "why a particle system produced no geometry, one line per distinct texture" },
         };
 
         /// Reads a switch once. Absent or empty means the default; anything other than "0" is on.

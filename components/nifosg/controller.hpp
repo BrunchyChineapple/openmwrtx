@@ -206,6 +206,13 @@ namespace NifOsg
         float calculate(float value) const override;
 
         float getMaximum() const override;
+
+        /// How many input seconds one full loop of this controller takes, or 0 when it does not loop.
+        ///
+        /// Needed to sample an animation at evenly spaced phases without reimplementing calculate(). Zero for
+        /// a Constant extrapolation, which clamps rather than cycling and therefore has no period; a caller
+        /// wanting a loop should decline rather than invent one.
+        float getPeriod() const;
     };
 
     class GeomMorpherController : public SceneUtil::Controller,
@@ -279,6 +286,19 @@ namespace NifOsg
 
         void setDefaults(osg::StateSet* stateset) override;
         void apply(osg::StateSet* stateset, osg::NodeVisitor* nv) override;
+
+        /// The texture matrix this controller produces at a given controller value.
+        ///
+        /// Split out of apply() so a caller can evaluate a phase without a node visitor and without a frame
+        /// stamp. The Remix host needs this to precompute several phases of one animation at once: it has to
+        /// flatten a mesh's texture stages into a single image, and where the stages do not all move together
+        /// it bakes one image per phase and hands the runtime a sprite sheet. Reimplementing the matrix in the
+        /// host instead would duplicate the centre-relative scale and the flipped U offset below, which are
+        /// exactly the details that are wrong when guessed.
+        ///
+        /// \a value is a controller value, not a time. Pass it through the controller function first --
+        /// getFunction()->calculate(seconds) -- so the frequency, phase and extrapolation mode apply.
+        osg::Matrixf matrixAt(float value) const;
 
     private:
         FloatInterpolator mUTrans;

@@ -477,10 +477,17 @@ namespace RemixRT
         /// @param roughnessTextureHash per-texel roughness, red channel, linear. Overrides \a roughness
         ///        wherever it is bound; the scalar remains the fallback for surfaces without a map.
         /// @param emissiveTextureHash optional glow map, uploaded as *colour*, naming which texels emit and
-        ///        in what colour. Zero falls back to the albedo standing in as the emissive colour, which is
-        ///        right for a flame quad -- the whole quad glows -- and wrong for a lantern, where only the
-        ///        glass should. \a emissive still scales it, so this slot decides where the light comes from
-        ///        and that scalar decides how much.
+        ///        in what colour. \a emissive still scales it, so this slot decides where the light comes
+        ///        from and that scalar decides how much.
+        ///
+        ///        Zero does **not** mean "the albedo stands in". It means the emission is the flat
+        ///        \a emissiveColour over the whole surface, because the shader starts from
+        ///        emissiveColorConstant and only replaces it when a texture is bound -- see
+        ///        opaque_surface_material_interaction.slangh. The runtime does have an albedo substitution,
+        ///        but it lives in rtx_instance_manager.cpp behind useLegacyAlphaState, which is a D3D9
+        ///        draw-call notion that an API material never sets. So a caller wanting a surface to emit
+        ///        what it looks like has to pass its albedo hash here explicitly. This documented the
+        ///        opposite for months, and every emitting surface emitted flat white as a result.
         /// @param albedoConstant linear RGB tint multiplying the albedo texture, or null for white. This is
         ///        NiMaterialProperty's mDiffuse. A value below white darkens the surface, which is the point
         ///        where the asset asks for it and a hazard where it does not, so callers should pass null
@@ -668,6 +675,13 @@ namespace RemixRT
         /// burst, and the only thing that distinguishes "every load got a fair share" from "half the
         /// loads showed nothing", which the session totals cannot.
         NestedBursts,
+        /// Why a particle system produced no geometry. One line per distinct texture, not per system.
+        ///
+        /// The session totals say how many particles arrived and cannot say what happened to any of them.
+        /// A system whose particles are all dead, or all sized zero, submits nothing while still creating
+        /// its material -- so the material log shows it and the scene shows nothing, which is exactly the
+        /// state the soul gem spray is in.
+        Particles,
     };
 
     /// Whether a stream is on. Each has its own `OPENMW_REMIX_DIAG_*` variable, and

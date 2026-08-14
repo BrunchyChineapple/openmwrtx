@@ -1,8 +1,13 @@
 #include "remixscene.hpp"
 
+#include "remixstagebake.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <functional>
+#include <set>
+#include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -343,6 +348,23 @@ namespace
     using TexAffine = std::array<float, 6>;
 
     constexpr TexAffine kIdentityAffine = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+
+    /// The affine that applies \a first and then \a second, as one matrix.
+    ///
+    /// Order is the whole content of this function, so it is named rather than spelled inline at the one
+    /// call site. Texcoords here are row vectors, so composing "first then second" is the product
+    /// first * second, which is the reverse of the column-vector convention most matrix code uses.
+    TexAffine composeTexAffine(const TexAffine& first, const TexAffine& second)
+    {
+        return {
+            first[0] * second[0] + first[1] * second[2],
+            first[0] * second[1] + first[1] * second[3],
+            first[2] * second[0] + first[3] * second[2],
+            first[2] * second[1] + first[3] * second[3],
+            first[4] * second[0] + first[5] * second[2] + second[4],
+            first[4] * second[1] + first[5] * second[3] + second[5],
+        };
+    }
 
     /// Solves for the affine taking \a from's output space to \a to's, i.e. inverse(from) composed with
     /// \a to, and writes it as two rows of { a, b, c } evaluated as a*u + b*v + c.
@@ -1414,6 +1436,24 @@ namespace
         }
     };
 
+    /// Finds a controller of one type on a state set updater, whether the updater *is* one or holds one.
+    ///
+    /// nifloader wraps a node's controllers in a SceneUtil::CompositeStateSetUpdater, so a controller is
+    /// usually a child of the callback rather than the callback itself. Two callers now want this lookup for
+    /// different types, and writing the composite walk twice is how the second one ends up subtly different
+    /// from the first.
+    template <typename T>
+    T* findController(SceneUtil::StateSetUpdater& updater)
+    {
+        if (auto* direct = dynamic_cast<T*>(&updater))
+            return direct;
+        if (auto* composite = dynamic_cast<SceneUtil::CompositeStateSetUpdater*>(&updater))
+            for (unsigned int i = 0; i < composite->getNumControllers(); ++i)
+                if (auto* found = dynamic_cast<T*>(composite->getController(i)))
+                    return found;
+        return nullptr;
+    }
+
     /// Maps an OSG node mask to the Remix instance categories that describe it.
     ///
     /// This is the whole reason no texture-hash tagging is needed: OpenMW already knows what every
@@ -1815,17 +1855,31 @@ namespace
             if (const osg::StateSet* stateSet = drawable.getStateSet())
                 mergeState(*stateSet, surface);
 
+            // Fold any dark and detail stages into one albedo, now that the geometry is in hand.
+            //
+            // This is the first point where both halves exist: mergeState sees the state sets and so the
+            // stage textures, and the drawable carries the texcoord arrays the stages are mapped through.
+            // Neither alone is enough, because the relationship between a stage's coords and the base's is
+            // the thing that has to be solved.
+            bakeExtraStages(*geometry, surface);
+
             // Terrain keeps its texture where a scene-graph walk cannot see it.
             //
             // Terrain::TerrainDrawable holds one state set per texture layer as a member and does the
             // multi-pass draw itself, so nothing about its appearance is reachable through the graph --
             // which is why terrain came out as flat grey while everything else was textured.
             //
-            // Only the first pass is used. The remaining layers are alpha-blended over it through
-            // per-layer blend maps, and a path-traced surface has one material: reproducing the blend
-            // would mean compositing the layers into a per-chunk texture on the CPU. The base layer is
-            // the dominant one, so this is the right approximation to start from rather than the final
-            // answer.
+            // The first pass decides *this* surface's material. It is not the only pass that reaches Remix
+            // any more: submitTerrainLayers below sends each remaining layer as its own instance carrying
+            // its own coverage mask, and the `[Remix terrain]` line counts them under "overlay layers".
+            //
+            // This comment used to end "the base layer is the dominant one, so this is the right
+            // approximation to start from rather than the final answer", which was true when written and
+            // stopped being true when the coverage-mask path landed. The base-layer approximation survives
+            // in exactly two narrower places, both marked where they happen: the composite-map fallback for
+            // distant chunks, which takes the first of the quads a CompositeMap composites from, and the
+            // blend itself, which the runtime's terrain baker performs from the masks rather than this host
+            // flattening the layers on the CPU.
             const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable);
             if (terrain != nullptr)
             {
@@ -2401,6 +2455,306 @@ namespace
                 pass.getTextureAttribute(2, osg::StateAttribute::TEXTURE));
         }
 
+        /// Combines the stages Remix has no slot for into the albedo, or leaves the surface alone.
+        ///
+        /// Cached on the stages involved and the geometry's texcoord arrays, because the result depends on
+        /// exactly those: the same three textures mapped through different coordinates are a different
+        /// image. A window type therefore bakes once for the session however many instances of it exist,
+        /// which matters -- there are 577 meshes carrying a NightDaySwitch.
+        ///
+        /// Failure is normal and is not an error. The census across 51,633 installed NIFs found 3.8% of
+        /// texturing properties genuinely multi-stage, and of the multiply ones 749 have a stage on a
+        /// different uvSet. Some of those will be affine and bakeable and some will be mapped per vertex
+        /// and refused. The log says which, once per reason, because "the lattice is still missing" and
+        /// "the lattice was declined for cause" look identical on screen.
+        static void bakeExtraStages(osg::Geometry& geometry, MWRender::RemixScene::SurfaceState& surface)
+        {
+            if (surface.mDarkMap == nullptr && surface.mDetailMap == nullptr)
+                return;
+            // An explicit image already decided this surface's albedo -- a terrain composite or a sprite
+            // sheet -- and those are generated for reasons that have nothing to do with texture stages.
+            if (surface.mExplicitImage != nullptr || surface.mTexture == nullptr)
+                return;
+
+            const osg::Image* baseImage = surface.mTexture->getImage();
+            const auto* baseCoords = dynamic_cast<const osg::Vec2Array*>(
+                geometry.getTexCoordArray(surface.mDiffuseUnit == ~0u ? 0u : surface.mDiffuseUnit));
+            if (baseImage == nullptr || baseCoords == nullptr)
+                return;
+
+            // Whether two texcoord arrays describe the same mapping. Compared element-wise, and it has to be:
+            // nifloader allocates a fresh osg::Vec2Array for every texture stage even when several name the
+            // same uvSet, so two stages on one uv set hold equal contents in two different objects and a
+            // pointer test would miss every one of them.
+            const auto sameMapping = [](const osg::Vec2Array& a, const osg::Vec2Array& b) {
+                return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+            };
+
+            const unsigned int baseUnit = surface.mDiffuseUnit == ~0u ? 0u : surface.mDiffuseUnit;
+
+            std::vector<MWRender::RemixStageBake::Stage> stages;
+            const auto addStage = [&](const osg::Texture2D* texture, unsigned int unit, float multiplier,
+                                      const char* name) {
+                if (texture == nullptr || unit == ~0u)
+                    return;
+                const auto* coords = dynamic_cast<const osg::Vec2Array*>(geometry.getTexCoordArray(unit));
+                if (coords == nullptr)
+                    coords = baseCoords; // A stage sharing the base's unit shares its coords.
+
+                // Two independent conditions, and both are needed before the base's transform can be said to
+                // move this stage along with it.
+                //
+                // The mapping has to be the identity, or the factored path -- which multiplies stage against
+                // base texel for texel with no affine at all -- would sample the wrong place.
+                //
+                // And the matrix has to actually drive this stage's unit. That is the condition an earlier
+                // version of this got wrong by testing coordinate equality alone, on the reasoning that equal
+                // coordinates mean the same uv set. They do not: 34 shapes in the installed set carry two uv
+                // sets holding *identical* coordinates, and only the set index decides which units a
+                // NiUVController drives. MwG_Burnt_Log_01_g reads uv set 1 on its dark stage while the
+                // controller animates uv set 0, so the stage stood still in the rasteriser and scrolled here.
+                const bool sameMap = sameMapping(*coords, *baseCoords);
+                const bool driven = !surface.mHasTexMat
+                    || ((surface.mTexMatUnits & (1u << unit)) != 0
+                        && (surface.mTexMatUnits & (1u << baseUnit)) != 0);
+                stages.push_back({ texture->getImage(), coords, multiplier, name, sameMap && driven });
+            };
+            // Order matters only for the log; multiplication commutes. Strengths are the rasteriser's:
+            // objects.frag multiplies a dark map at one and a detail map at two.
+            addStage(surface.mDarkMap, surface.mDarkUnit, 1.0f, "darkMap");
+            addStage(surface.mDetailMap, surface.mDetailUnit, 2.0f, "detailMap");
+            if (stages.empty())
+                return;
+
+            // Keyed on the images and the coordinate arrays rather than on the drawable, so instances of one
+            // window share a bake and two windows that differ only in mapping do not.
+            //
+            // The controller is part of the key as well, and unlike its current matrix it is safe to key on:
+            // the phases below sample its whole loop rather than the moment this frame happens to be at, so
+            // the result is stable across frames. Two surfaces sharing every texture but animated by
+            // different controllers are genuinely different bakes.
+            std::size_t key = std::hash<const void*>{}(baseImage) ^ std::hash<const void*>{}(baseCoords);
+            for (const auto& stage : stages)
+                key = key * 1099511628211ull ^ std::hash<const void*>{}(stage.mImage)
+                    ^ std::hash<const void*>{}(stage.mCoords);
+            key = key * 1099511628211ull ^ std::hash<const void*>{}(surface.mUvController);
+
+            // Triangles, because the stage mapping is solved per triangle rather than per surface. Collected
+            // through the same functor the mesh path uses, which decomposes strips, fans and quads -- doing
+            // that by hand over the primitive sets gets the less common modes wrong, and OpenMW's meshes are
+            // not all triangle lists.
+            std::vector<unsigned int> triangles;
+            osg::TriangleIndexFunctor<TriangleCollector> collector;
+            collector.mIndices = &triangles;
+            collector.mVertexCount = static_cast<unsigned int>(baseCoords->size());
+            geometry.accept(collector);
+            if (triangles.empty())
+                return;
+
+            // Unsynchronised, like the other per-submit statics in this traversal: the Remix submit runs on
+            // the frame thread after osgViewer's update traversal, single-threaded by construction.
+            static std::unordered_map<std::size_t, MWRender::RemixStageBake::Result> sCache;
+            auto found = sCache.find(key);
+            // This frame's matrix, which is all a static surface needs and one frame of what an animated one
+            // needs. Deliberately not part of the cache key: an animated value changes every frame, and
+            // keying on it would bake a fresh image per frame.
+            const TexAffine baseTransform = surface.mHasTexMat
+                ? TexAffine{ surface.mTexMat[0], surface.mTexMat[1], surface.mTexMat[2], surface.mTexMat[3],
+                      surface.mTexMat[4], surface.mTexMat[5] }
+                : kIdentityAffine;
+
+            // The whole loop, sampled at evenly spaced phases, when there is a loop to sample.
+            //
+            // This is what turns a frozen fold into a moving one. A folded bake cannot leave the matrix live,
+            // because a single image cannot animate only the part of itself that the asset animates -- so
+            // instead of one image at whatever phase the surface was first seen at, the bake produces one per
+            // phase and the runtime plays them as a sprite sheet. 333 shapes in the installed set need this.
+            //
+            // Sampled in input seconds and pushed through the controller's own function, so the frequency,
+            // phase offset and extrapolation mode are the controller's business rather than reimplemented
+            // here. A controller that does not loop -- Constant extrapolation clamps at both ends -- reports
+            // no period, and then there is nothing to cycle and the single frozen frame is the honest answer.
+            static const unsigned int kPhases = std::max(1u,
+                envUInt("OPENMW_REMIX_STAGE_PHASES",
+                    static_cast<unsigned int>(std::max(1, Settings::remix().mStagePhases.get())), 255u));
+            std::vector<TexAffine> phases{ baseTransform };
+            float period = 0.0f;
+            unsigned char sheetFps = 0;
+            const char* sheetRefusal = nullptr;
+            if (surface.mUvController != nullptr && kPhases > 1)
+            {
+                const auto* function
+                    = dynamic_cast<const NifOsg::ControllerFunction*>(surface.mUvController->getFunction().get());
+                if (function != nullptr)
+                    period = function->getPeriod();
+
+                // The frame rate is chosen first and the frame count derived from it, not the other way
+                // round, because the rate is the quantised quantity: the runtime takes it as an integer, so
+                // only a whole number of frames per second can be expressed.
+                //
+                // Deriving the rate from a frame count instead is wrong in a way that is easy to miss and was
+                // shipped once. Eight frames over this asset's twelve second loop wanted 0.67 fps, which
+                // rounds to 1 -- so the sheet played its eight frames in eight seconds and the animation ran
+                // half again too fast, on top of being visibly stepped. Frames = fps * period is exact by
+                // construction and cannot drift.
+                //
+                // The consequence is a floor on what a sheet can represent: at the slowest expressible rate
+                // of 1 fps a loop needs as many frames as it lasts seconds, so a loop longer than the frame
+                // cap cannot become a sheet at all. Refused outright in that case rather than approximated,
+                // because a smooth slow drift frozen still reads better than the same drift in eight jumps.
+                if (period > 0.0f)
+                {
+                    const unsigned int fps = static_cast<unsigned int>(
+                        std::max(1.0, std::floor(static_cast<double>(kPhases) / period)));
+                    const long frames = std::lround(static_cast<double>(fps) * period);
+                    if (frames < 2)
+                        sheetRefusal = "its loop is shorter than two frames";
+                    else if (frames > static_cast<long>(kPhases))
+                        sheetRefusal = "its loop is longer in seconds than the phase cap allows frames, so no"
+                                       " whole frame rate fits it";
+                    else
+                    {
+                        sheetFps = static_cast<unsigned char>(std::min<unsigned int>(fps, 255));
+                        phases.clear();
+                        for (long i = 0; i < frames; ++i)
+                        {
+                            const float seconds
+                                = static_cast<float>(static_cast<double>(i) * period / frames);
+                            const osg::Matrixf m
+                                = surface.mUvController->matrixAt(function->calculate(seconds));
+                            phases.push_back(
+                                TexAffine{ static_cast<float>(m(0, 0)), static_cast<float>(m(0, 1)),
+                                    static_cast<float>(m(1, 0)), static_cast<float>(m(1, 1)),
+                                    static_cast<float>(m(3, 0)), static_cast<float>(m(3, 1)) });
+                        }
+                    }
+                }
+            }
+
+            if (found == sCache.end())
+            {
+                MWRender::RemixStageBake::Result baked = MWRender::RemixStageBake::combine(
+                    *baseImage, *baseCoords, triangles, stages, phases);
+
+                // Only when every phase asked for actually fit. The rate and the frame count are a matched
+                // pair -- frames = fps * period -- so a sheet holding fewer frames than were sampled would
+                // play the loop at the wrong length, which is the defect this arrangement exists to avoid.
+                if (sheetFps > 0 && baked.mSpriteFrames == phases.size())
+                    baked.mSpriteFps = sheetFps;
+
+                // One line per outcome per texture, not per drawable: a merged town instantiates the same
+                // window hundreds of times and would otherwise bury the log.
+                const bool transformed = baseTransform != kIdentityAffine;
+                // Whether any source was compressed, because that decides whether the sampling is even
+                // meaningful and it is not obvious from the result. osg::Image::getColor computes a
+                // per-pixel offset; a block-compressed image does not have one, so reading it that way
+                // should return nonsense. These sources are BC1 and the bake nonetheless comes out correct,
+                // which means one of those two statements is wrong -- so the fact is printed rather than
+                // assumed either way. A plausible-looking lattice is not proof the texels were decoded.
+                std::string compressed;
+                if (baseImage->isCompressed())
+                    compressed += " base";
+                for (const auto& stage : stages)
+                    if (stage.mImage != nullptr && stage.mImage->isCompressed())
+                        compressed += std::string(" ") + stage.mName;
+
+                // Which of the two paths ran is the first thing to want when a surface looks wrong, because
+                // it says whether the asset's animation survived. The triangle counts belong only to the
+                // folded path; the factored one maps no triangles by construction, so printing zeroes there
+                // would read as a failure.
+                const std::string geometryOrDomain = baked.mBaseTransformFactoredOut
+                    ? std::string(", the full UV square; every stage is on the base's uv set, so its texture"
+                                  " matrix stays live and any animation is preserved")
+                    : ", " + std::to_string(baked.mTrianglesMapped) + " triangles mapped, "
+                        + std::to_string(baked.mTrianglesDegenerate) + " degenerate";
+
+                // Three outcomes for an animated fold, and they look nothing like each other on screen, so
+                // the line has to say which one happened rather than leaving it to be inferred.
+                std::string animation;
+                if (baked.mBaseTransformFactoredOut)
+                    animation = "";
+                else if (baked.mSpriteFrames > 1 && baked.mSpriteFps > 0)
+                    animation = "; a stage does not move with the base, so the matrix was folded in and the"
+                                " animation resolved into a "
+                        + std::to_string(baked.mSpriteFrames) + "-frame sprite sheet at "
+                        + std::to_string(static_cast<unsigned int>(baked.mSpriteFps)) + " fps over a "
+                        + std::to_string(period) + "s loop";
+                else if (sheetRefusal != nullptr)
+                    animation = "; a stage does not move with the base, so the matrix was folded in, and the"
+                                " animation is FROZEN because "
+                        + std::string(sheetRefusal) + " (loop " + std::to_string(period)
+                        + "s against a cap of " + std::to_string(kPhases)
+                        + " frames -- raise [Remix] stage phases past the loop length in seconds to animate"
+                          " it, at the cost of frame resolution)";
+                else if (transformed)
+                    animation = "; the base's texture matrix was folded in and there is no loop to sample,"
+                                " so an animation is frozen at this phase";
+
+                if (baked.mImage != nullptr)
+                    Log(Debug::Info) << "Remix stage bake: " << baseImage->getFileName() << " + "
+                                     << stages.size() << " stage(s) -> " << baked.mImage->s() << "x"
+                                     << baked.mImage->t() << geometryOrDomain
+                                     << (compressed.empty() ? "; all sources uncompressed"
+                                                            : "; COMPRESSED sources:" + compressed)
+                                     << animation;
+                else
+                    Log(Debug::Info) << "Remix stage bake declined for " << baseImage->getFileName() << ": "
+                                     << baked.mReason;
+
+                found = sCache.emplace(key, std::move(baked)).first;
+            }
+
+            if (found->second.mImage == nullptr)
+                return;
+
+            surface.mExplicitImage = found->second.mImage;
+
+            // A multi-phase bake is a sprite sheet, and the runtime has to be told so or it samples the whole
+            // strip as one image -- every phase at once, squeezed across the surface.
+            //
+            // The texcoords are deliberately left alone. calcSpriteSheetAdjustment does the cell mapping
+            // itself, `uvBias + frac(textureCoordinates) * uvSize`, so the surface keeps the plain footprint
+            // remap into one frame's [0,1] and dividing it here as well would scale it twice.
+            if (found->second.mSpriteFrames > 1 && found->second.mSpriteFps > 0)
+            {
+                surface.mSpriteSheetCols = static_cast<unsigned char>(
+                    std::min<unsigned int>(found->second.mSpriteFrames, 255u));
+                surface.mSpriteSheetFps = found->second.mSpriteFps;
+            }
+
+            const TexAffine remap = found->second.mTexMat;
+            if (found->second.mBaseTransformFactoredOut)
+            {
+                // Composed, because the base's matrix was deliberately left out of the image: every stage
+                // moves with it, so it factored out of the product and the surface still needs it. Replacing
+                // it here instead is exactly what froze the soul gems mid-swirl -- their glow puts base and
+                // detail on one texture and one animated uvSet, and discarding that matrix discards the
+                // animation.
+                //
+                // Order is the surface's own matrix first and the footprint remap second, since the remap
+                // describes the finished image and has to see a coordinate that already lies in it.
+                const TexAffine live = surface.mHasTexMat
+                    ? TexAffine{ surface.mTexMat[0], surface.mTexMat[1], surface.mTexMat[2],
+                          surface.mTexMat[3], surface.mTexMat[4], surface.mTexMat[5] }
+                    : kIdentityAffine;
+                const TexAffine composed = composeTexAffine(live, remap);
+                std::copy(composed.begin(), composed.end(), std::begin(surface.mTexMat));
+            }
+            else
+            {
+                // Replaced, not composed. The base's matrix went into the bake, so the only transform the
+                // finished image still needs is the footprint remap.
+                //
+                // Composing unconditionally was the first attempt and it produced a visible defect: on these
+                // windows the base carries a NiUVController and the lattice does not, so leaving the animated
+                // matrix on a surface whose albedo now contains both made the lattice scroll and reverse with
+                // the gradient. The asset animates one stage; a single baked texture cannot animate part of
+                // itself, which is why the two cases are separated rather than reconciled.
+                std::copy(remap.begin(), remap.end(), std::begin(surface.mTexMat));
+            }
+            surface.mHasTexMat = true;
+        }
+
         /// Folds one state set into \a surface. Later calls override earlier ones, which matches OSG's
         /// precedence for attributes that carry no override flag.
         static void mergeState(const osg::StateSet& stateSet, MWRender::RemixScene::SurfaceState& surface)
@@ -2456,7 +2810,23 @@ namespace
                 {
                     // First tagged diffuse wins, so a later unit cannot displace it.
                     if (taggedDiffuse == nullptr)
+                    {
                         taggedDiffuse = texture;
+                        surface.mDiffuseUnit = unit;
+                    }
+                }
+                // Captured rather than consumed. Neither has a Remix material slot, and both are real
+                // contributors in the rasteriser -- see the fields' comment in remixscene.hpp. The unit is
+                // what locates the stage's texcoord array later.
+                else if (role == "darkMap")
+                {
+                    surface.mDarkMap = texture;
+                    surface.mDarkUnit = unit;
+                }
+                else if (role == "detailMap")
+                {
+                    surface.mDetailMap = texture;
+                    surface.mDetailUnit = unit;
                 }
                 // "normalHeightMap" is a normal map with height in alpha. The normal half is what Remix is
                 // being given; the height half would need Remix's separate heightTexture slot and a
@@ -2537,6 +2907,20 @@ namespace
                 surface.mHasTexMat = surface.mTexMat[0] != 1.0f || surface.mTexMat[1] != 0.0f
                     || surface.mTexMat[2] != 0.0f || surface.mTexMat[3] != 1.0f
                     || surface.mTexMat[4] != 0.0f || surface.mTexMat[5] != 0.0f;
+
+                // Which units this same matrix drives. Recorded here rather than beside the stages, because
+                // this is the only point where the matrix is in hand, and on an animated node it arrives on a
+                // state set of its own that carries no textures at all -- see mTexMatUnits in the header.
+                //
+                // Pointer equality against unit 0's attribute, which is exact: UVController assigns one
+                // osg::TexMat object to every unit it drives. Replaced rather than merged, matching mTexMat
+                // just above -- the state set that supplies the matrix supplies the unit set with it.
+                surface.mTexMatUnits = 0;
+                const unsigned int texMatUnits
+                    = static_cast<unsigned int>(stateSet.getTextureAttributeList().size());
+                for (unsigned int unit = 0; unit < texMatUnits && unit < 32u; ++unit)
+                    if (stateSet.getTextureAttribute(unit, osg::StateAttribute::TEXMAT) == texMat)
+                        surface.mTexMatUnits |= 1u << unit;
             }
 
             // Recomputed rather than inherited when the state set says anything about alpha testing, so
@@ -2600,6 +2984,134 @@ namespace
                 surface.mDiffuseColor[2] = diffuse.b();
                 surface.mMaterialAlpha = diffuse.a();
             }
+
+            // Every texture unit on a state set that mentions a named texture, and what became of it.
+            //
+            // Four roles are consumed and the rest are deliberately ignored, so a texture can be bound,
+            // present in the asset, visible in the rasteriser, and invisible here -- with nothing in the
+            // log to say so, because a texture that reaches no consumed role is never even uploaded. That
+            // is not hypothetical: the Dahrk window lattice appears nowhere in a 1,175-texture run while
+            // the amber pane beside it uploads with its normal map. Knowing which stage it sits on is the
+            // difference between a fix and another guess, and no other line prints an unconsumed unit.
+            //
+            // Keyed on a texture name rather than switched on wholesale, because this walks the units a
+            // second time and prints a line per state set: with no pattern set it costs one empty-vector
+            // check. Self-gating for that reason -- no OPENMW_REMIX_DIAG_TEXTURE, no work, no switch to
+            // remember to turn off.
+            if (!diagTexturePatterns().empty())
+                logStateSetTextures(stateSet, surface);
+        }
+
+        /// Comma or semicolon separated substrings from OPENMW_REMIX_DIAG_TEXTURE, lowercased.
+        static const std::vector<std::string>& diagTexturePatterns()
+        {
+            static const std::vector<std::string> patterns = [] {
+                std::vector<std::string> out;
+                const char* raw = std::getenv("OPENMW_REMIX_DIAG_TEXTURE");
+                if (raw == nullptr || *raw == '\0')
+                    return out;
+                std::string current;
+                for (const char* c = raw;; ++c)
+                {
+                    if (*c == '\0' || *c == ',' || *c == ';')
+                    {
+                        if (!current.empty())
+                        {
+                            std::transform(current.begin(), current.end(), current.begin(),
+                                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                            out.push_back(current);
+                            current.clear();
+                        }
+                        if (*c == '\0')
+                            break;
+                    }
+                    else
+                        current.push_back(*c);
+                }
+                return out;
+            }();
+            return patterns;
+        }
+
+        static std::string textureFileName(const osg::StateSet& stateSet, unsigned int unit)
+        {
+            const auto* texture = dynamic_cast<const osg::Texture2D*>(
+                stateSet.getTextureAttribute(unit, osg::StateAttribute::TEXTURE));
+            if (texture == nullptr)
+                return {};
+            const osg::Image* image = texture->getImage();
+            return image != nullptr ? image->getFileName() : std::string("(no image)");
+        }
+
+        /// Prints the unit inventory when any unit names a pattern texture, plus what got resolved.
+        static void logStateSetTextures(
+            const osg::StateSet& stateSet, const MWRender::RemixScene::SurfaceState& surface)
+        {
+            const unsigned int units = static_cast<unsigned int>(stateSet.getTextureAttributeList().size());
+
+            bool matched = false;
+            for (unsigned int unit = 0; unit < units && !matched; ++unit)
+            {
+                std::string lowered = textureFileName(stateSet, unit);
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                for (const std::string& pattern : diagTexturePatterns())
+                    if (lowered.find(pattern) != std::string::npos)
+                    {
+                        matched = true;
+                        break;
+                    }
+            }
+            if (!matched)
+                return;
+
+            std::string line = "Remix stateset (" + std::to_string(units) + " units):";
+            for (unsigned int unit = 0; unit < units; ++unit)
+            {
+                const std::string file = textureFileName(stateSet, unit);
+                if (file.empty())
+                    continue;
+                const auto* type = dynamic_cast<const SceneUtil::TextureType*>(
+                    stateSet.getTextureAttribute(unit, SceneUtil::TextureType::AttributeType));
+                line += "\n    unit " + std::to_string(unit) + " role "
+                    + (type != nullptr ? type->getName() : std::string("(untagged)")) + " -> " + file;
+            }
+
+            // What the four consumed roles ended up holding, so an ignored stage is visible as an absence
+            // rather than inferred from one.
+            const auto resolved = [](const osg::Texture2D* texture) -> std::string {
+                if (texture == nullptr)
+                    return "none";
+                const osg::Image* image = texture->getImage();
+                return image != nullptr ? image->getFileName() : "(no image)";
+            };
+            line += "\n    resolved: albedo " + resolved(surface.mTexture) + "; normal "
+                + resolved(surface.mNormalMap) + "; specular " + resolved(surface.mSpecularMap)
+                + "; emissive " + resolved(surface.mEmissiveMap);
+            line += "\n    texMat " + std::string(surface.mHasTexMat ? "yes" : "no");
+            if (surface.mHasTexMat)
+                line += " [" + std::to_string(surface.mTexMat[0]) + " " + std::to_string(surface.mTexMat[1])
+                    + " / " + std::to_string(surface.mTexMat[2]) + " " + std::to_string(surface.mTexMat[3])
+                    + " + " + std::to_string(surface.mTexMat[4]) + " " + std::to_string(surface.mTexMat[5])
+                    + "]";
+            line += "; alphaTest " + std::to_string(static_cast<unsigned int>(surface.mAlphaTestReference))
+                + "; blend " + (surface.mAlphaBlend ? "yes" : "no") + "; materialEmissive "
+                + std::to_string(surface.mMaterialEmissive);
+
+            // Bounded per distinct configuration, not per occurrence.
+            //
+            // A flat count was the first attempt and it was useless: a merged town folds the same state set
+            // thousands of times, so all sixteen slots went to one day-variant window and the emissive night
+            // variant beside it -- the one actually in question -- never printed. Deduplicating on the line
+            // itself means the budget is spent on sixteen *different* configurations, which is what the
+            // reader wants. Same failure as a one-shot log that fires on the first frame and describes a
+            // state nothing else shares.
+            static std::set<std::string> sSeen;
+            constexpr std::size_t kDistinctLimit = 24;
+            if (sSeen.size() >= kDistinctLimit || !sSeen.insert(line).second)
+                return;
+
+            Log(Debug::Info) << line << " (" << sSeen.size() << " of " << kDistinctLimit << " distinct)";
         }
 
         void pushState(osg::Node& node)
@@ -2630,6 +3142,7 @@ namespace
             // dereferences it without checking, so evaluating a controller without one is a crash, not a
             // frame of missing animation.
             NifOsg::FlipController* flip = nullptr;
+            const NifOsg::UVController* uv = nullptr;
             for (osg::Callback* callback = getFrameStamp() != nullptr ? node.getCullCallback() : nullptr;
                  callback != nullptr; callback = callback->getNestedCallback())
             {
@@ -2648,19 +3161,13 @@ namespace
                 // where the controllers are already in hand; resolved after the loop so the atlas overrides
                 // the single frame apply() just wrote into the merged state.
                 if (flip == nullptr)
-                {
-                    if (auto* direct = dynamic_cast<NifOsg::FlipController*>(updater))
-                    {
-                        flip = direct;
-                    }
-                    else if (auto* composite = dynamic_cast<SceneUtil::CompositeStateSetUpdater*>(updater))
-                    {
-                        // nifloader wraps a node's controllers in a composite, so a flipbook is usually a
-                        // child of one rather than the callback itself.
-                        for (size_t i = 0; i < composite->getNumControllers() && flip == nullptr; ++i)
-                            flip = dynamic_cast<NifOsg::FlipController*>(composite->getController(i));
-                    }
-                }
+                    flip = findController<NifOsg::FlipController>(*updater);
+
+                // The UV animation is kept for the stage bake, which needs to evaluate it at several phases
+                // rather than only at now. Only the *matrix* reaches the merged state set above, and one
+                // matrix is one frame of an animation -- see bakeExtraStages.
+                if (uv == nullptr)
+                    uv = findController<NifOsg::UVController>(*updater);
             }
 
             // A sheet replaces the per-frame albedo, so this has to come after every merge above.
@@ -2683,6 +3190,11 @@ namespace
                     }
                 }
             }
+
+            // Inherited by everything below this node, which is where it is needed: nifloader attaches the
+            // controller to the node and the geometry it animates hangs beneath it.
+            if (uv != nullptr)
+                surface.mUvController = uv;
 
             mSurfaceStack.push_back(surface);
         }
@@ -4326,14 +4838,28 @@ namespace MWRender
         // InstanceInfoBlendEXT, because that extension is only consulted when the material sets
         // useDrawCallAlphaState, and turning that on would route alpha testing through the legacy
         // draw-call path too -- where an API host has no legacy draw call to supply it.
+        // Additive is never a cutout, whoever the caller is. That is not a preference the way mPreferBlend is;
+        // it is what the blend factors mean. A destination factor of ONE says "add light to what is behind
+        // me", so the surface contributes radiance and occludes nothing. A cutout makes it occlude, which
+        // inverts the asset's instruction rather than approximating it.
+        //
+        // This was reachable only through mPreferBlend, which the traversal sets for particles alone, so
+        // additive *geometry* fell through to the cutout below and turned solid. A soul gem is the clearest
+        // case: its soul is a spray of particles inside an additive geosphere shell, and as a cutout the shell
+        // became an opaque ball that hid the spray completely. The particles were correct the whole time --
+        // alive, sized, submitted every frame -- and could be seen by clipping the camera inside the gem.
+        // 2,661 shapes in the installed set blend additively, so this was never one asset's problem.
         unsigned char alphaTestReference = surface.mAlphaTestReference;
         int blendType = kBlendTypeNone;
-        if (surface.mPreferBlend && surface.mAlphaBlend)
+        if (surface.mAlphaBlend && (surface.mPreferBlend || surface.mAdditive))
         {
             // Additive gets the emissive blend type, which is the same translation the runtime applies to a
             // legacy SRC_ALPHA/ONE draw call. Note this stacks with the emissive term materialFor is handed
             // for additive particles: if flames come out blown, that term is the one to drop, since the
             // blend type now carries the "this glows" half of it.
+            //
+            // An explicit alpha test is left in place alongside it. The rasteriser applies both -- test, then
+            // blend -- so dropping one here would be less faithful, not simpler.
             blendType = surface.mAdditive ? kBlendTypeAlphaEmissive : kBlendTypeAlpha;
         }
         else if (alphaTestReference == 0 && surface.mAlphaBlend)
@@ -4420,20 +4946,17 @@ namespace MWRender
             // no part in the emissive term. Since the constant here is a normalised unit hue, a pane whose NIF
             // says emissive (1, 1, 1) emits flat white over its whole area.
             //
-            // The albedo is not the answer to that, for two reasons. The runtime already falls back to it on
-            // its own when no emissive texture is bound, so naming it here changes nothing; and for these
-            // assets the albedo is the wrong texture anyway. Glow in the Dahrk's night pane is a grey
-            // luminance plate with the amber in its DARK map, which OpenMW's raster multiplies in and which
-            // this host used to discard -- so an albedo-sourced emission is exactly the white being seen.
+            // The albedo is the answer, and it is bound as the emissive texture further down. Two earlier
+            // claims here said otherwise and both were wrong. That the albedo was the wrong texture was true
+            // only before the stages were flattened -- the night pane's albedo was a grey luminance plate with
+            // its amber stranded in a discarded dark map, and is now the product of the two. That the runtime
+            // falls back to the albedo unprompted was never true of this host: that patch lives in
+            // rtx_instance_manager.cpp behind useLegacyAlphaState, which an API material does not set. So a
+            // pane emitted flat white for as long as the fallback was assumed to be happening.
             //
-            // Nothing more is needed here, because the albedo is now the composited product of the stages
-            // and the runtime falls back to the albedo when no emissive texture is bound. A pane whose albedo
-            // is base * dark therefore emits base * dark: the lattice and the amber together, which is what
-            // the rasteriser draws and what the flattening exists to reproduce.
-            //
-            // This replaced a stopgap that bound the dark map alone into the emissive slot. That recovered the
-            // colour and lost the lattice, because a dark map is half of a product and not a texture in its
-            // own right. Flattening makes the whole question disappear rather than answering it twice.
+            // A stopgap before that bound the dark map alone into the emissive slot, which recovered the
+            // colour and lost the lattice, a dark map being half of a product rather than a texture in its own
+            // right. Flattening makes that question disappear instead of answering it twice.
         }
 
         // Terrain layer coverage, uploaded as a linear mask for the runtime's terrain baker to composite.
@@ -4513,6 +5036,36 @@ namespace MWRender
                 emissiveColour[1] = surface.mEmissiveColor[1] / emissiveMagnitude;
                 emissiveColour[2] = surface.mEmissiveColor[2] / emissiveMagnitude;
             }
+        }
+
+        // Emission takes its colour from the albedo texture when the asset names no colour of its own.
+        //
+        // Without this an emitting surface emits a flat unit colour across its whole area, which is not an
+        // approximation of the asset so much as a different image. The runtime's shader is explicit about it:
+        // opaque_surface_material_interaction.slangh starts from emissiveColorConstant and REPLACES it with
+        // the emissive texture's sample only when one is bound. The albedo takes no part in emission there.
+        //
+        // The comment that used to sit further up asserted the opposite -- that the runtime falls back to the
+        // albedo by itself, so naming it here would change nothing. That holds only for legacy draw-call
+        // materials, where rtx_instance_manager.cpp patches EmissiveColorTexture to the albedo for
+        // emissive-blend surfaces, and that patch is gated on useLegacyAlphaState. An API host never sets it:
+        // blending is declared on the material here precisely because InstanceInfoBlendEXT is consulted only
+        // when a material opts into the draw-call path. So the fallback never ran once, and every emitting
+        // surface this host built emitted flat white -- a lit window pane emitting white rather than the
+        // amber lattice its albedo now carries, and a soul gem's spray emitting white rather than the soul.
+        //
+        // Only where the asset's emissive colour is achromatic, which is Morrowind's way of saying "emit what
+        // this surface looks like". A NIF naming a hue means that hue and keeps the constant, since a bound
+        // texture would replace the constant rather than tint it. The test needs no tolerance: these
+        // components were just normalised by their own maximum, so an achromatic emissive lands on exactly
+        // one in all three.
+        //
+        // hasGlowMap is captured above, before this runs, so the diagnostics still report whether the asset
+        // actually ships a glow map rather than counting this fallback as one.
+        if (glowHash == 0 && emissiveIntensity > 0.0f && emissiveColour[0] == 1.0f && emissiveColour[1] == 1.0f
+            && emissiveColour[2] == 1.0f)
+        {
+            glowHash = textureHash;
         }
 
         // Addressing, read from the albedo texture where there is one. Terrain composites have no
@@ -4972,23 +5525,64 @@ namespace MWRender
             mParticleMeshes.erase(found);
         }
 
+        // Particle sizes are in the system's local space, and the quad below is built from the *world* space
+        // camera basis, so the size has to make the same journey the position does.
+        //
+        // Without this a particle system under a scaled node is submitted at its local size in world units,
+        // and the error is the node's scale. That is not subtle where it happens: the soul gem sprays came
+        // through between 0.0013 and 0.059 units across against a working flame's 4.7 to 36.7, which at
+        // roughly seventy units to the metre is under a millimetre. They were being submitted every frame,
+        // one quad per live particle, and were simply too small to see -- which reads exactly like geometry
+        // that never arrived. Trueflame's vfx_fireglow trail is the same case at 3e-05.
+        //
+        // The geometric mean of the three axis lengths, which is the scale exactly when the transform is
+        // uniform and a sensible single number when it is not. A camera-facing quad has one extent, so there
+        // is nowhere to put a non-uniform scale even if it were worth honouring.
+        float localScale = 1.0f;
+        if (!worldSpace)
+        {
+            const osg::Vec3d axisX(localToWorld(0, 0), localToWorld(0, 1), localToWorld(0, 2));
+            const osg::Vec3d axisY(localToWorld(1, 0), localToWorld(1, 1), localToWorld(1, 2));
+            const osg::Vec3d axisZ(localToWorld(2, 0), localToWorld(2, 1), localToWorld(2, 2));
+            const double product = axisX.length() * axisY.length() * axisZ.length();
+            if (product > 0.0)
+                localScale = static_cast<float>(std::cbrt(product));
+        }
+
         mVertexScratch.clear();
         mIndexScratch.clear();
+
+        // Tallies for the diagnostic below. A system that submits nothing has still created its material by
+        // this point, so the material log shows it and the scene does not -- and the only way to tell which
+        // of the two rejections below did it is to count them.
+        unsigned int dead = 0;
+        unsigned int sizeless = 0;
+        float smallestSize = std::numeric_limits<float>::max();
+        float largestSize = 0.0f;
 
         for (int i = 0; i < count; ++i)
         {
             const osgParticle::Particle* particle = particles.getParticle(i);
             if (particle == nullptr || !particle->isAlive())
+            {
+                ++dead;
                 continue;
+            }
 
             osg::Vec3f centre = particle->getPosition();
             if (!worldSpace)
                 centre = osg::Vec3f(osg::Vec3d(centre) * localToWorld);
 
             // Half extent, because the quad spans the size in each direction from the centre.
-            const float half = particle->getCurrentSize() * 0.5f;
+            const float worldSize = particle->getCurrentSize() * localScale;
+            const float half = worldSize * 0.5f;
+            smallestSize = std::min(smallestSize, worldSize);
+            largestSize = std::max(largestSize, worldSize);
             if (!(half > 0.0f))
+            {
+                ++sizeless;
                 continue;
+            }
 
             // Rotated in the billboard plane by the particle's own angle, which osgParticle integrates from
             // the NIF's rotation speed. Without it every puff in a plume shares the camera basis exactly, so
@@ -5048,6 +5642,31 @@ namespace MWRender
 
             mIndexScratch.insert(mIndexScratch.end(),
                 { base, base + 1u, base + 2u, base, base + 2u, base + 3u });
+        }
+
+        // Said once per distinct texture rather than per system or per frame. Particles are re-submitted every
+        // frame, so anything per-frame here would be thousands of lines a second, and the interesting fact is
+        // which *asset* produces nothing rather than how many instances of it do.
+        if (RemixRT::diagEnabled(RemixRT::Diag::Particles))
+        {
+            const std::string name = surface.mTexture != nullptr && surface.mTexture->getImage() != nullptr
+                ? surface.mTexture->getImage()->getFileName()
+                : std::string("(untextured)");
+            const bool produced = !mVertexScratch.empty() && !mIndexScratch.empty();
+            // Keyed on the texture and the outcome, so a system that starts empty and later works reports
+            // both rather than being silenced by its first frame.
+            if (mParticleDiagSeen.emplace(name + (produced ? "|ok" : "|empty")).second)
+            {
+                Log(Debug::Info) << "[Remix particles] " << name << ": " << count << " slots, " << dead
+                                 << " not alive, " << sizeless << " sized zero, "
+                                 << (mVertexScratch.size() / 4) << " quads submitted; world size "
+                                 << (largestSize > 0.0f ? smallestSize : 0.0f) << ".." << largestSize
+                                 << " (node scale " << localScale << "); "
+                                 << (worldSpace ? "world space" : "local space") << "; blend "
+                                 << (surface.mAdditive ? "additive" : (surface.mAlphaBlend ? "alpha" : "none"))
+                                 << "; emissive " << particleEmissive
+                                 << (produced ? "" : "  <-- NOTHING SUBMITTED");
+            }
         }
 
         if (mVertexScratch.empty() || mIndexScratch.empty())
