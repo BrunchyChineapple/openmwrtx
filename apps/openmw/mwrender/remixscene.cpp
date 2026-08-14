@@ -2706,22 +2706,52 @@ namespace
             auto memoised = sContentKeys.find(memoKey);
             if (memoised == sContentKeys.end())
             {
+                // Whether combine will factor the base transform out rather than fold it in, because that
+                // decides what the bake actually reads.
+                //
+                // The factored path samples the images alone. It covers the full UV square and never touches
+                // a texcoord or a triangle, because with every stage on the base's uv set the mapping between
+                // them is the identity everywhere -- remixstagebake.cpp says so and reports zero triangles
+                // mapped for it. So for those bakes the coords and the triangle winding are not inputs, and
+                // hashing them only splits an identical image across several keys.
+                //
+                // Measured before this: one run baked ab_painting_canvas_01 three times at 27.7 ms each,
+                // tx_mh_rusty_grate twice and vfx_myst_glow twice. Seven of eighteen bakes produced an image
+                // that already existed, because three paintings share one canvas texture and differ only in
+                // where they sit in it.
+                //
+                // Decided here rather than after the bake because it has to be: the flag is a property of the
+                // state set the caller has already filled in, so the same all_of the bake uses answers it
+                // before combine is called.
+                const bool willFactor = std::all_of(stages.begin(), stages.end(),
+                    [](const MWRender::RemixStageBake::Stage& stage) { return stage.mSharesBaseTransform; });
+
                 unsigned long long content = imageIdentityHash(baseImage);
-                content = RemixRT::AssetHash::combine(coordContentHash(baseCoords), content);
+                if (!willFactor)
+                    content = RemixRT::AssetHash::combine(coordContentHash(baseCoords), content);
                 for (const auto& stage : stages)
                 {
                     content = RemixRT::AssetHash::combine(imageIdentityHash(stage.mImage), content);
-                    content = RemixRT::AssetHash::combine(coordContentHash(stage.mCoords), content);
+                    if (!willFactor)
+                        content = RemixRT::AssetHash::combine(coordContentHash(stage.mCoords), content);
                     // The multiplier and the factorisation flag both change the texels produced, so two
                     // otherwise identical stage sets that differ in either are different bakes.
                     content = RemixRT::AssetHash::combine(
                         std::bit_cast<std::uint32_t>(stage.mMultiplier), content);
                     content = RemixRT::AssetHash::combine(stage.mSharesBaseTransform ? 1ull : 0ull, content);
                 }
-                // Per triangle, because the stage mapping is solved per triangle: the same texcoords wound
-                // into different triangles bake differently.
-                content = RemixRT::AssetHash::fold(
-                    triangles.data(), triangles.size() * sizeof(unsigned int), content);
+                // Per triangle, because the folded path solves the stage mapping per triangle: the same
+                // texcoords wound into different triangles bake differently. The factored path solves nothing
+                // per triangle and reports zero mapped, so the winding is not one of its inputs.
+                if (!willFactor)
+                    content = RemixRT::AssetHash::fold(
+                        triangles.data(), triangles.size() * sizeof(unsigned int), content);
+
+                // Which of the two paths the key describes, so a factored key can never collide with a folded
+                // one. The per-stage mSharesBaseTransform above already separates them in every case that can
+                // arise today, but that is a consequence of how the flags happen to combine rather than a
+                // statement of intent, and this key now means different things depending on the path.
+                content = RemixRT::AssetHash::combine(willFactor ? 0x5bf03635ull : 0x27d4eb2full, content);
 
                 // The phases, and only when they are loop-derived.
                 //
@@ -2734,7 +2764,12 @@ namespace
                 // safe choice in the first place. A constant goes in instead, so instances share one frozen
                 // bake -- exactly what the frozen path already promises, folding the matrix in at whichever
                 // phase was seen first.
-                if (sheetFps > 0)
+                //
+                // Excluded entirely on the factored path, which cannot produce a sheet: it leaves the matrix
+                // live on the surface and returns one frame, so the phase list has no effect on the image and
+                // the sheet rate is discarded downstream when mSpriteFrames does not match phases.size().
+                // Keying on it there would split a shared image by whatever animation happened to be attached.
+                if (sheetFps > 0 && !willFactor)
                 {
                     for (const TexAffine& phase : phases)
                         for (const float component : phase)
