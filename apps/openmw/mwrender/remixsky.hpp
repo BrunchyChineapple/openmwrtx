@@ -79,6 +79,8 @@ namespace MWRender
         int mExterior = -1;
         /// Day/night state at the last changeover log. -1 so the first update always reports.
         int mLoggedNight = -1;
+        /// Whether the sun was last reported dimmed for an interior (1), at full strength (0), or never (-1).
+        int mLoggedSunDimmed = -1;
 
         /// Whether rtx.volumetrics.enable was last pushed on (1), off (0), or never (-1).
         ///

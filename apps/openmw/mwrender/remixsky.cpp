@@ -268,7 +268,49 @@ namespace MWRender
 
             pushFloat("rtx.atmosphere.sunElevation", elevation, mSunElevation);
             pushFloat("rtx.atmosphere.sunRotation", rotation, mSunRotation);
-            pushFloat("rtx.atmosphere.sunIntensity", 1.0f, mSunIntensity);
+
+            // The sun, and nothing else, is dimmed in cells that are not outdoors.
+            //
+            // Morrowind's interiors are pieces fitted together rather than sealed volumes, so a sun at its
+            // last exterior elevation shines through every crack and seam. The symptom is boiling light
+            // indoors during the day that is absent at night, which is what names the sun rather than the sky
+            // or the ambient: the sky dome and the point lights do not change between the two.
+            //
+            // sunIntensity is the lever for the same reason rtx.volumetrics.enable is the lever below: the
+            // runtime's weather blender interpolates sunIlluminance every frame from its preset table
+            // (rtx_fork_weather.h), so anything this host wrote there would be overwritten within the frame.
+            // It never writes sunIntensity, and rtx_atmosphere.cpp forms the final value as
+            // sunIlluminance * sunIntensity, so scaling here survives whatever the blender does to the
+            // colour. The option is already declared NoSave and game-drivable per frame, which is exactly
+            // this use.
+            //
+            // Only the sun, deliberately. The interior branch this file used to carry also switched off the
+            // sky, stars, clouds, moons and the fog medium, and the reasons it was removed all still hold --
+            // the Interiors Project puts distant land inside interiors, the sky dome is the dominant area
+            // light under path tracing, and this engine occludes better than the MGE-XE build the branch came
+            // from. Leaving the dome lit and taking away the direct beam is the part that was wanted.
+            //
+            // mHaveWeather is the gate, which is WeatherResult::mOutdoorAtmosphere, which is
+            // isCellExterior() || isCellQuasiExterior(). So every cell Morrowind marks as behaving like an
+            // exterior keeps its full sun -- Mournhold and the Vivec cantons among them -- and the decision
+            // comes from the game's own data rather than a list maintained here. The removed branch keyed on
+            // an `exterior` parameter that nothing on this side ever set, which is why it caught every
+            // interior indiscriminately and why Mournhold lost its sky.
+            static const float interiorSun = std::clamp(
+                envFloat("OPENMW_REMIX_INTERIOR_SUN", Settings::remix().mInteriorSunIntensity), 0.0f, 1.0f);
+            const float sunIntensity = sky.mHaveWeather ? 1.0f : interiorSun;
+
+            const int dimmed = sunIntensity < 1.0f ? 1 : 0;
+            if (dimmed != mLoggedSunDimmed)
+            {
+                mLoggedSunDimmed = dimmed;
+                Log(Debug::Info) << "Remix sky: sun intensity " << sunIntensity
+                                 << (dimmed ? " (ordinary interior, so the direct sun is held back while the"
+                                              " sky keeps lighting the cell)"
+                                            : " (cell is exterior or quasi-exterior)");
+            }
+
+            pushFloat("rtx.atmosphere.sunIntensity", sunIntensity, mSunIntensity);
 
             // Logged on every day/night changeover, because the mirror above is the one claim in this file
             // that has never been checked against a running game.

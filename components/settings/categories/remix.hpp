@@ -84,6 +84,28 @@ namespace Settings
         // both on lights the scene from two skies at once. Turn on only if Remix's own sky is disabled.
         SettingValue<bool> mSkyGeometry{ mIndex, "Remix", "sky geometry" };
 
+        // What rtx.atmosphere.sunIntensity is driven to in cells the engine does not flag as outdoors.
+        //
+        // Morrowind's interiors are assembled from pieces rather than sealed volumes, so a sun at its last
+        // exterior elevation shines through every crack and seam. Under path tracing that reads as boiling
+        // light indoors during the day and is absent at night, which is what identifies the sun as the source
+        // rather than the sky or the ambient.
+        //
+        // Deliberately the sun alone. An earlier interior branch in RemixSky switched off the sky, stars,
+        // clouds, moons and fog medium as well, and was removed for three reasons that all still hold: the
+        // Interiors Project places distant land inside interiors and those cells need a real sky behind it;
+        // under path tracing the sky dome is the scene's dominant area light, so removing it leaves interiors
+        // flat and stage-lit; and this engine's occlusion makes the leak less dominant than it was in the
+        // MGE-XE build the branch came from. Scaling the sun keeps the dome lighting the room and takes away
+        // only the direct beam.
+        //
+        // The gate is the engine's own exterior flag, not a cell list, so anything Morrowind marks as
+        // behaving like an exterior -- Mournhold and the Vivec cantons -- keeps its full sun. That is also
+        // what the removed branch got wrong: it keyed on a parameter nothing set, so every interior took it
+        // regardless of size or whether it had a sightline out.
+        SettingValue<float> mInteriorSunIntensity{ mIndex, "Remix", "interior sun intensity",
+            makeClampSanitizerFloat(0, 1) };
+
         // Depth in metres of the froxel grid, which is how far volumetric in-scattering accumulates. The
         // runtime default of 20 is what the Morrowind Remix reference renders with; deriving it from the view
         // distance instead gave ~430 and made the fog a scene-wide glow no sky control could reach. 0 restores
