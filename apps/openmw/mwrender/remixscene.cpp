@@ -2754,8 +2754,21 @@ namespace
             auto found = sCache.find(key);
             if (found == sCache.end())
             {
+                // Timed, because whether these are worth precomputing offline turns on what one costs and
+                // the count alone cannot answer that.
+                //
+                // The question changed when the key became content-addressed. At 187 bakes a session the
+                // problem was obviously the repetition; at four it is not obvious there is a problem at all,
+                // and the measured stalls point elsewhere -- the worst submit of the last run was 1,254 ms of
+                // which traversal was 1,252 ms, and its largest spike landed twenty seconds before the first
+                // bake of the session. So the cost of one bake is the missing number, and guessing it either
+                // way would decide a substantial piece of work on nothing.
+                const auto bakeStart = std::chrono::steady_clock::now();
                 MWRender::RemixStageBake::Result baked = MWRender::RemixStageBake::combine(
                     *baseImage, *baseCoords, triangles, stages, phases);
+                const double bakeMs
+                    = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bakeStart)
+                          .count();
 
                 // Only when every phase asked for actually fit. The rate and the frame count are a matched
                 // pair -- frames = fps * period -- so a sheet holding fewer frames than were sampled would
@@ -2814,13 +2827,13 @@ namespace
                 if (baked.mImage != nullptr)
                     Log(Debug::Info) << "Remix stage bake: " << baseImage->getFileName() << " + "
                                      << stages.size() << " stage(s) -> " << baked.mImage->s() << "x"
-                                     << baked.mImage->t() << geometryOrDomain
+                                     << baked.mImage->t() << " in " << bakeMs << " ms" << geometryOrDomain
                                      << (compressed.empty() ? "; all sources uncompressed"
                                                             : "; COMPRESSED sources:" + compressed)
                                      << animation;
                 else
-                    Log(Debug::Info) << "Remix stage bake declined for " << baseImage->getFileName() << ": "
-                                     << baked.mReason;
+                    Log(Debug::Info) << "Remix stage bake declined for " << baseImage->getFileName()
+                                     << " after " << bakeMs << " ms: " << baked.mReason;
 
                 found = sCache.emplace(key, std::move(baked)).first;
             }
