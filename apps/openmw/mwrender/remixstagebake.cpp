@@ -137,6 +137,23 @@ namespace MWRender::RemixStageBake
             }
         }
 
+        // Block-compression alignment, applied to every image this function produces.
+        //
+        // A BC block is 4x4, so an image whose dimensions are not both multiples of four cannot be
+        // compressed. OSG refuses it -- "image size is not a multiple of four" -- and the texture ships
+        // uncompressed: a measured 4056x1014 sheet costs about 16 MB where its compressed form is nearer 4,
+        // and one session logged 49 of those refusals. Nothing warned at the point of choosing the size,
+        // because ceil() of a UV-derived extent lands on 1014 as readily as on 1016.
+        //
+        // Rounded UP rather than padded. Both paths derive their texel centres from the width and height they
+        // chose, so a larger image samples the same UV rectangle more finely and Result::mTexMat is unaffected.
+        // Padding would leave a dead margin that the mapping then has to be corrected to avoid.
+        //
+        // The cap is floored to a multiple of four before rounding, so alignment can never breach the budget
+        // the cap exists to enforce.
+        const auto alignCapDown = [](int cap) { return std::max(4, cap - (cap % 4)); };
+        const auto alignSizeUp = [](int size, int cap) { return std::min((size + 3) & ~3, cap); };
+
         // Every stage moves with the base, so the base's matrix is a common factor of the product and comes
         // straight back out of it: base(Mt) * stage(Mt) is f(Mt) for a single f, and f is what is baked. The
         // matrix is left for the caller to keep on the surface, so an animated one goes on animating.
@@ -162,8 +179,9 @@ namespace MWRender::RemixStageBake
                 width = std::max(width, stage.mImage->s());
                 height = std::max(height, stage.mImage->t());
             }
-            width = std::clamp(width, 4, static_cast<int>(maxDimension));
-            height = std::clamp(height, 4, static_cast<int>(maxDimension));
+            const int factoredCap = alignCapDown(static_cast<int>(maxDimension));
+            width = alignSizeUp(std::clamp(width, 4, factoredCap), factoredCap);
+            height = alignSizeUp(std::clamp(height, 4, factoredCap), factoredCap);
 
             osg::ref_ptr<osg::Image> factored = new osg::Image;
             factored->allocateImage(width, height, 1, GL_RGBA, GL_UNSIGNED_BYTE);
@@ -291,8 +309,14 @@ namespace MWRender::RemixStageBake
         if (frames > 1)
             widthCap = std::min(widthCap, std::max(4, static_cast<int>(maxSheetWidth) / frames));
 
-        const auto clampTo = [](double needed, int cap) {
-            return static_cast<int>(std::clamp(std::ceil(needed), 4.0, static_cast<double>(cap)));
+        // Aligned as well as clamped, and the per-frame width is aligned rather than only the finished sheet:
+        // a 4x4 block straddling two phases would bleed one phase into the next along every frame boundary.
+        // Aligning the frame width keeps sheetWidth = width * frames aligned for free.
+        const auto clampTo = [&alignCapDown, &alignSizeUp](double needed, int cap) {
+            const int alignedCap = alignCapDown(cap);
+            const int wanted
+                = static_cast<int>(std::clamp(std::ceil(needed), 4.0, static_cast<double>(alignedCap)));
+            return alignSizeUp(wanted, alignedCap);
         };
         const int width = clampTo(neededWidth, widthCap);
         const int height = clampTo(neededHeight, static_cast<int>(maxDimension));
