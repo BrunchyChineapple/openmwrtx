@@ -367,32 +367,41 @@ namespace
     /// backing submitted geometry are immutable for the object's lifetime. So the steady-state cost is a
     /// pointer lookup and only a first sighting hashes anything.
     ///
-    /// Deliberately not RemixScene::textureFor, which also returns a content hash: that uploads the texture
-    /// to the runtime as a side effect. A stage image is consumed by the bake and never submitted on its own,
-    /// so asking for its hash that way would put every dark and detail map in VRAM to no purpose.
+    /// Identity of an image for the bake cache, WITHOUT reading its texels.
+    ///
+    /// Hashing the pixel data looked like the better key and caused an access violation, deterministically, a
+    /// few seconds into every run:
+    ///
+    ///     AssetHash::bytes(image->data(), image->getTotalSizeInBytes())
+    ///
+    /// osg::Image::getTotalSizeInBytes() is derived from s * t * format, not from what was actually
+    /// allocated. A truncated or malformed DDS declares dimensions its data does not cover -- and a 500-mod
+    /// install has plenty, the same session logging a run of "Failed to open image" -- so that read runs off
+    /// the end of the buffer. RemixStageBake::combine never tripped over it because it samples through
+    /// getColor(), which is bounded by s() and t().
+    ///
+    /// So the address it is, for images only. The file name comes along because it is free, stable and
+    /// distinguishes two images at the same recycled address, which the address alone cannot. Texel content is
+    /// simply not worth an unbounded read: the coordinate arrays below are std::vector-backed, so their size
+    /// is exact and they are safe to hash, and they are what actually differed between instances anyway.
+    ///
+    /// When the offline bake arrives this wants replacing with the asset PATH rather than either of these,
+    /// which is both safe and something a tool can agree on.
     ///
     /// Unsynchronised statics, like the other per-submit caches in this file: the Remix submit runs on the
     /// frame thread after osgViewer's update traversal, single-threaded by construction.
-    unsigned long long imageContentHash(const osg::Image* image)
+    unsigned long long imageIdentityHash(const osg::Image* image)
     {
-        if (image == nullptr || image->data() == nullptr)
+        if (image == nullptr)
             return 0;
 
-        static std::unordered_map<const void*, unsigned long long> sHashes;
-        const auto [entry, inserted] = sHashes.try_emplace(image, 0ull);
-        if (inserted)
-        {
-            // Dimensions and format alongside the texels: two images can share a byte pattern while meaning
-            // different pictures, and a compressed source's block data says nothing about its extent.
-            unsigned long long hash = RemixRT::AssetHash::bytes(
-                image->data(), static_cast<std::size_t>(image->getTotalSizeInBytes()));
-            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->s()), hash);
-            hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->t()), hash);
-            hash = RemixRT::AssetHash::combine(
-                static_cast<unsigned long long>(image->getPixelFormat()), hash);
-            entry->second = RemixRT::AssetHash::avoidZero(hash);
-        }
-        return entry->second;
+        unsigned long long hash = std::hash<const void*>{}(image);
+        const std::string& name = image->getFileName();
+        if (!name.empty())
+            hash = RemixRT::AssetHash::fold(name.data(), name.size(), hash);
+        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->s()), hash);
+        hash = RemixRT::AssetHash::combine(static_cast<unsigned long long>(image->t()), hash);
+        return RemixRT::AssetHash::avoidZero(hash);
     }
 
     unsigned long long coordContentHash(const osg::Vec2Array* coords)
@@ -2697,11 +2706,11 @@ namespace
             auto memoised = sContentKeys.find(memoKey);
             if (memoised == sContentKeys.end())
             {
-                unsigned long long content = imageContentHash(baseImage);
+                unsigned long long content = imageIdentityHash(baseImage);
                 content = RemixRT::AssetHash::combine(coordContentHash(baseCoords), content);
                 for (const auto& stage : stages)
                 {
-                    content = RemixRT::AssetHash::combine(imageContentHash(stage.mImage), content);
+                    content = RemixRT::AssetHash::combine(imageIdentityHash(stage.mImage), content);
                     content = RemixRT::AssetHash::combine(coordContentHash(stage.mCoords), content);
                     // The multiplier and the factorisation flag both change the texels produced, so two
                     // otherwise identical stage sets that differ in either are different bakes.
