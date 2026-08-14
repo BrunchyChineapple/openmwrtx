@@ -71,6 +71,11 @@ namespace Settings
 
         // Scale on the emissive a NIF's NiMaterialProperty asks for, on ordinary geometry. 1.0 reproduces
         // what OpenMW's raster adds; 0 restores the previous behaviour of ignoring it outside particles.
+        //
+        // The clamp's ceiling is well above 1.0 on purpose. Reproducing the raster is not the same as looking
+        // right under a path tracer, and measured on a lit Glow in the Dahrk pane, 1.0 reads dim. The slider
+        // in the settings window stops at 10; this accepts 16 so a hand-edited settings.cfg has room above
+        // the slider. Keep the slider's SettingMax at or below this or its top end silently does nothing.
         SettingValue<float> mMaterialEmissiveScale{ mIndex, "Remix", "material emissive",
             makeClampSanitizerFloat(0, 16) };
 
@@ -98,6 +103,15 @@ namespace Settings
         // are how a wrong-looking surface gets traced back to a file, and also the bulk of a multi-megabyte
         // openmw.log. Zero switches each off; the defaults keep the behaviour that shipped.
         SettingValue<bool> mProbeQuad{ mIndex, "Remix", "probe quad" };
+        // How many phases of a UV animation the stage bake resolves into a sprite sheet, when a mesh's
+        // texture stages cannot all be left to move with the animation and so have to be flattened.
+        //
+        // The sheet is laid out in one row, so this multiplies the baked image's width and is bounded by an
+        // 8,192 budget: raising it narrows each frame rather than growing the sheet. Eight at the bake's
+        // default 1,024 cap comes to exactly that budget, which is why the default costs no resolution at all
+        // against a single frozen frame. One disables the sheet and freezes the animation.
+        SettingValue<int> mStagePhases{ mIndex, "Remix", "stage phases", makeClampSanitizerInt(1, 255) };
+
         SettingValue<int> mSceneLogFrames{ mIndex, "Remix", "scene log frames", makeMaxSanitizerInt(1) };
         SettingValue<int> mMaterialLogLimit{ mIndex, "Remix", "material log limit", makeMaxSanitizerInt(0) };
         SettingValue<int> mTextureLogLimit{ mIndex, "Remix", "texture log limit", makeMaxSanitizerInt(0) };

@@ -998,6 +998,24 @@
                     <UserString key="SettingLabelWidget" value="RemixFogTransmittanceText"/>
                     <UserString key="SettingLabelCaption" value="RemixFogTransmittanceValue"/>
                 </Widget>
+                <Widget type="TextBox" skin="NormalText" position="4 312 352 18" align="Left Top" name="RemixMaterialEmissiveText"/>
+                <Widget type="ScrollBar" skin="MW_HScroll" position="4 332 352 18" align="HStretch Top">
+                    <Property key="Range" value="10000"/>
+                    <Property key="Page" value="100"/>
+                    <Property key="WheelPage" value="100"/>
+                    <UserString key="SettingType" value="Slider"/>
+                    <UserString key="SettingCategory" value="Remix"/>
+                    <UserString key="SettingName" value="material emissive"/>
+                    <UserString key="SettingValueType" value="Float"/>
+                    <UserString key="SettingMin" value="0"/>
+                    <!-- Runs to 10, not to the 1.0 that reproduces OpenMW's raster. Measured against a lit
+                         Glow in the Dahrk window pane, 1.0 reads visibly dim under path-traced exposure, so a
+                         slider that stopped there could not reach a usable setting. The clamp behind it
+                         accepts up to 16; keep this at or below that or the top of the slider does nothing. -->
+                    <UserString key="SettingMax" value="10"/>
+                    <UserString key="SettingLabelWidget" value="RemixMaterialEmissiveText"/>
+                    <UserString key="SettingLabelCaption" value="RemixMaterialEmissiveValue"/>
+                </Widget>
             </Widget>
         </Widget>
         <Widget type="AutoSizedButton" skin="MW_Button" position="320 420 56 24" align="Right Bottom" name="OkButton">
