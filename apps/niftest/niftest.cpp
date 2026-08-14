@@ -500,6 +500,12 @@ namespace NifCensus
         std::map<std::string, unsigned int> mTextureExtensions;
         std::set<std::string> mTextures;
 
+        // Triangles per file and the total, for the renderer's scene-wide primitive limits. Kept as a flat
+        // list and sorted at report time rather than maintained as a heap: 60k entries is nothing next to
+        // parsing the files themselves, and the whole list is wanted for the total anyway.
+        std::vector<std::pair<std::size_t, std::string>> mTrianglesByFile;
+        std::size_t mTrianglesTotal = 0;
+
         unsigned int mShapes = 0;
         unsigned int mShapesUntextured = 0;
         unsigned int mShapesNoBaseSlot = 0;
@@ -883,6 +889,20 @@ namespace NifCensus
             ++gStats.mVersions[version.str()];
         }
 
+        // Triangles across every geometry record in the file, summed.
+        //
+        // Per FILE rather than per shape because that is the unit the renderer pays for: the host merges a
+        // file's shapes into one mesh, so one BLAS geometry carries the whole total. NiGeometryData's own
+        // mNumTriangles is a uint16_t and so caps at 65,535, which means a report of a million-triangle
+        // geometry can only ever be an aggregate -- counting shapes individually hides exactly the asset
+        // that matters.
+        //
+        // Worth having because the runtime enforces hard limits on the sum across the scene: a 26-bit
+        // primitive index (67,108,863) and a 24-bit NEE cache prefix sum. Past those, cached light samples
+        // resolve to the wrong surface and the index is out of range. The runtime names the offender only by
+        // geometry hash, which is not traceable to an asset, so the triangle count is the join column.
+        std::size_t trianglesThisFile = 0;
+
         std::set<std::string> seenHere;
         for (const std::unique_ptr<Nif::Record>& record : nif.mRecords)
         {
@@ -890,6 +910,20 @@ namespace NifCensus
                 continue;
             ++gStats.mRecords[record->mRecordName];
             seenHere.insert(record->mRecordName);
+
+            if (record->mRecordType == Nif::RC_NiTriShapeData)
+            {
+                trianglesThisFile += static_cast<const Nif::NiTriShapeData&>(*record).mTriangles.size() / 3;
+            }
+            else if (record->mRecordType == Nif::RC_NiTriStripsData)
+            {
+                // A strip of n indices is n-2 triangles, degenerate ones included: they are still primitives
+                // as far as the acceleration structure and the primitive index are concerned.
+                for (const std::vector<unsigned short>& strip :
+                    static_cast<const Nif::NiTriStripsData&>(*record).mStrips)
+                    if (strip.size() > 2)
+                        trianglesThisFile += strip.size() - 2;
+            }
 
             switch (record->mRecordType)
             {
@@ -953,6 +987,12 @@ namespace NifCensus
         for (const std::string& name : seenHere)
             ++gStats.mRecordFiles[name];
 
+        if (trianglesThisFile > 0)
+        {
+            gStats.mTrianglesByFile.emplace_back(trianglesThisFile, file);
+            gStats.mTrianglesTotal += trianglesThisFile;
+        }
+
         for (const Nif::Record* root : nif.mRoots)
             walk(root, Inherited{}, file, 0);
     }
@@ -975,6 +1015,29 @@ namespace NifCensus
     {
         std::cout << "\n================ NIF CENSUS ================\n";
         std::cout << "files parsed: " << gStats.mFiles << ", failed to parse: " << gStats.mFailed << '\n';
+
+        // Heaviest files by triangle count.
+        //
+        // The renderer caps the whole scene at a 26-bit primitive index, 67,108,863, and the NEE cache at a
+        // 24-bit prefix sum. Past either, cached light samples resolve to the wrong surface and the index runs
+        // out of range. Cost is per INSTANCE, so an asset's danger is its triangle count times how often it is
+        // placed -- a heavy mesh used once is affordable and a heavy mesh used two dozen times is not.
+        //
+        // The runtime reports offenders by geometry hash only, which no asset can be traced back to, so this
+        // list exists to be matched on triangle count instead.
+        {
+            std::vector<std::pair<std::size_t, std::string>> heaviest = gStats.mTrianglesByFile;
+            std::sort(heaviest.begin(), heaviest.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+
+            std::cout << "--- triangles ---\n";
+            std::cout << "  total across all parsed files: " << gStats.mTrianglesTotal << '\n';
+            std::cout << "  scene primitive index ceiling: 67108863 (26-bit), NEE cache: 16777214 (24-bit)\n";
+            std::cout << "  heaviest files (count is per instance; multiply by placements):\n";
+            const std::size_t show = std::min<std::size_t>(heaviest.size(), 30);
+            for (std::size_t i = 0; i < show; ++i)
+                std::cout << "        " << heaviest[i].first << "  " << heaviest[i].second << '\n';
+        }
 
         std::cout << "\n--- NIF versions ---\n";
         for (const auto& [version, count] : gStats.mVersions)
