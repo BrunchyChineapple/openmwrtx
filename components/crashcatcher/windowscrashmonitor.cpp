@@ -5,8 +5,11 @@
 
 #include <DbgHelp.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include <SDL_messagebox.h>
@@ -175,22 +178,54 @@ namespace Crash
             const bool detectFreezes = disableFreezeDetector == nullptr
                 || Misc::StringUtils::toNumeric<int>(disableFreezeDetector, 0) == 0;
 
+            // How long the window must stay unresponsive before this is treated as a freeze worth reporting.
+            //
+            // isAppFrozen is IsHungAppWindow, which is Windows' own judgement: five seconds without pumping
+            // messages, and not tunable. That threshold assumes an unresponsive window means a broken program.
+            // It does not here. A dump taken from this build during a Seyda Neen load put the main thread in
+            // dxvk::D3D9SwapChainEx::SyncFrameLatency, inside Present, waiting on the frame-latency fence --
+            // parked on the GPU by design, with nothing wrong. Present alone measures 38-44 ms of a 60-75 ms
+            // frame in the same session, so a load that lands a few hundred mesh builds and a shader compile
+            // burst in one frame passes five seconds without difficulty and recovers on its own.
+            //
+            // The dialog it raises has one button, and that button calls TerminateProcess. So the detector was
+            // converting a slow load into a killed session -- the exact opposite of its purpose. A grace period
+            // keeps it useful for a real deadlock, which stays hung forever and will still be caught, while a
+            // load that needs twenty seconds is left alone to finish.
+            //
+            // Poll resolution while waiting is CrashCatcherTimeout, 2.5 s, so the effective threshold is the
+            // grace rounded up to that. 0 restores the immediate report.
+            const char* freezeGraceEnv = std::getenv("OPENMW_FREEZE_DETECTOR_GRACE_SECONDS");
+            const int freezeGraceSeconds = std::max(0,
+                freezeGraceEnv != nullptr ? Misc::StringUtils::toNumeric<int>(freezeGraceEnv, 30) : 30);
+
             bool running = true;
             bool frozen = false;
+            std::optional<std::chrono::steady_clock::time_point> hangStartedAt;
             while (isAppAlive() && running && !mFreezeAbort)
             {
                 if (detectFreezes && isAppFrozen())
                 {
-                    if (!frozen)
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!hangStartedAt.has_value())
+                        hangStartedAt = now;
+
+                    if (!frozen && now - *hangStartedAt >= std::chrono::seconds(freezeGraceSeconds))
                     {
+                        Log(Debug::Warning) << "Window unresponsive for " << freezeGraceSeconds
+                                            << "s, reporting a freeze";
                         showFreezeMessageBox();
                         frozen = true;
                     }
                 }
-                else if (frozen)
+                else
                 {
-                    hideFreezeMessageBox();
-                    frozen = false;
+                    hangStartedAt.reset();
+                    if (frozen)
+                    {
+                        hideFreezeMessageBox();
+                        frozen = false;
+                    }
                 }
 
                 if (!mFreezeAbort && waitApp(frozen))
@@ -307,7 +342,14 @@ namespace Crash
             if (env)
                 type = static_cast<MINIDUMP_TYPE>(type | MiniDumpWithFullMemory);
 
-            if (!miniDumpWriteDump(mAppProcessHandle, processId, hCrashLog, type, &infos, 0, 0))
+            // No exception information for a freeze, because there is no exception and none was ever recorded.
+            // mShm->mCrashed is only populated on the crash path, so a freeze dump was passing ThreadId 0 with
+            // a zeroed CONTEXT and EXCEPTION_RECORD. MiniDumpWriteDump writes that through faithfully, and the
+            // result is a dump that claims an exception of interest on thread FFFFFFFF: the debugger cannot set
+            // a current thread, `.reload` fails with a partially initialized target, and `k` refuses. Threads
+            // still enumerate, so the stacks were reachable by hand -- but only after working out why the dump
+            // looked corrupt, which is exactly the cost this avoids next time.
+            if (!miniDumpWriteDump(mAppProcessHandle, processId, hCrashLog, type, isFreeze ? nullptr : &infos, 0, 0))
             {
                 auto err = GetLastError();
                 std::stringstream ss;
