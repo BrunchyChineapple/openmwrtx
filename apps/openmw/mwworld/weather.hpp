@@ -264,8 +264,17 @@ namespace MWWorld
 
         int getWeather();
 
+        // Expire this region's weather so the next getWeather() re-rolls it, remembering what it was.
+        //
+        // Distinct from setWeather(invalidWeatherID), which is what this replaces at the call site in
+        // updateWeatherTime: a roll can only have inertia if it knows what the weather just was, and
+        // invalidating in place destroyed that before chooseNewWeather could see it. The remembered value is
+        // deliberately not saved -- it is one roll's worth of context, not game state.
+        void expire();
+
     private:
         int mWeather;
+        int mLastWeather = -1; // invalidWeatherID, which is file-local to weather.cpp
         std::vector<uint8_t> mChances;
 
         void chooseNewWeather();
@@ -343,6 +352,10 @@ namespace MWWorld
 
         void advanceTime(double hours, bool incremental);
 
+        // Multiplier on the per-weather transition delta that holds a transition's duration constant in game
+        // time rather than in wall clock. 1.0 when the coupling is disabled. See the definition.
+        float transitionRateScale() const;
+
         const std::vector<Weather>& getAllWeather() { return mWeatherSettings; }
 
         const Weather& getWeather() { return mWeatherSettings[mCurrentWeather]; }
@@ -414,6 +427,11 @@ namespace MWWorld
         bool mFastForward;
         float mWeatherUpdateTime;
         float mTransitionFactor;
+        // Weather pacing (fork). Game hours since the last change, against which the minimum-dwell setting is
+        // tested, and the region weather a crossing asked for while the dwell had not yet elapsed. Held rather
+        // than dropped so the crossing still takes effect, just later; invalidWeatherID means nothing pending.
+        float mGameHoursSinceWeatherChange = 0.0f;
+        int mDeferredRegionWeather = -1; // invalidWeatherID
         NightDayMode mNightDayMode;
         int mCurrentWeather;
         int mNextWeather;

@@ -29,6 +29,18 @@ namespace Settings
         // complete (bug #1876)
         SettingValue<int> mActorsProcessingRange{ mIndex, "Game", "actors processing range",
             makeClampSanitizerInt(3584, 7168) };
+        // Weather pacing (fork). Morrowind's weather runs on two clocks that disagree, which is why it reads
+        // as random rather than simulated. The schedule for choosing new weather is in game hours, but a
+        // transition between two weathers advances in REAL seconds, and each new weather is an independent
+        // draw from a static chance table with no memory of what preceded it. These three settings address
+        // one of those each; the value that restores stock behaviour is documented per setting in
+        // settings-default.cfg.
+        SettingValue<float> mWeatherTransitionReferenceTimescale{ mIndex, "Game",
+            "weather transition reference timescale", makeClampSanitizerFloat(0.0f, 1000.0f) };
+        SettingValue<float> mWeatherMinimumHoursBetweenChanges{ mIndex, "Game",
+            "weather minimum hours between changes", makeClampSanitizerFloat(0.0f, 168.0f) };
+        SettingValue<float> mWeatherPersistence{ mIndex, "Game", "weather persistence",
+            makeClampSanitizerFloat(0.0f, 1.0f) };
         SettingValue<bool> mClassicReflectedAbsorbSpellsBehavior{ mIndex, "Game",
             "classic reflected absorb spells behavior" };
         SettingValue<bool> mClassicCalmSpellsBehavior{ mIndex, "Game", "classic calm spells behavior" };

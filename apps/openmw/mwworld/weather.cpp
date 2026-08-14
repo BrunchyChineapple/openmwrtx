@@ -22,6 +22,7 @@
 #include "../mwrender/sky.hpp"
 
 #include "cellstore.hpp"
+#include "datetimemanager.hpp"
 #include "esmstore.hpp"
 #include "player.hpp"
 
@@ -327,6 +328,14 @@ namespace MWWorld
         mWeather = weatherID;
     }
 
+    void RegionWeather::expire()
+    {
+        if (mWeather != invalidWeatherID)
+            mLastWeather = mWeather;
+
+        mWeather = invalidWeatherID;
+    }
+
     int RegionWeather::getWeather()
     {
         // If the region weather was already set (by ChangeWeather, or by a previous call) then just return that value.
@@ -341,10 +350,31 @@ namespace MWWorld
 
     void RegionWeather::chooseNewWeather()
     {
+        auto& prng = MWBase::Environment::get().getWorld()->getPrng();
+
+        // Weather persistence (fork). The stock roll below is memoryless, so a region visits every entry in
+        // its chance table with no regard for what it just had, which is what makes a long session read as a
+        // demo cycling presets rather than a climate. Keeping the previous weather with a fixed probability
+        // turns the draw into a Markov chain with inertia: which weathers a region can produce and their
+        // relative frequencies over a long run are untouched, only the run lengths grow.
+        //
+        // Guarded on the previous weather still being a chance the region actually offers, so this can never
+        // hold a weather the region's table has since stopped allowing.
+        const float persistence = Settings::game().mWeatherPersistence;
+        if (persistence > 0.0f && mLastWeather != invalidWeatherID
+            && static_cast<size_t>(mLastWeather) < mChances.size() && mChances[mLastWeather] > 0)
+        {
+            // rollProbability is [0, 1); keeping on < persistence gives exactly that probability.
+            if (Misc::Rng::rollProbability(prng) < persistence)
+            {
+                mWeather = mLastWeather;
+                return;
+            }
+        }
+
         // All probabilities must add to 100 (responsibility of the user).
         // If chances A and B has values 30 and 70 then by generating 100 numbers 1..100, 30% will be lesser or equal 30
         // and 70% will be greater than 30 (in theory).
-        auto& prng = MWBase::Environment::get().getWorld()->getPrng();
         unsigned int chance = static_cast<unsigned int>(Misc::Rng::rollDice(100, prng) + 1); // 1..100
         unsigned int sum = 0;
         for (size_t i = 0; i < mChances.size(); ++i)
@@ -814,14 +844,41 @@ namespace MWWorld
 
         if (!paused || mFastForward)
         {
-            // Add new transitions when either the player's current external region changes.
-            if (updateWeatherTime() || updateWeatherRegion(player.getCell()->getCell()->getRegion()))
+            // Add new transitions when either the weather timer expires or the player's external region
+            // changes. The two are no longer equivalent: a scheduled change is the climate moving on and
+            // always lands, whereas a region crossing is the player moving and is held to a minimum dwell.
+            //
+            // Morrowind's regions interleave at cell scale -- Bitter Coast and Ascadian Isles cells sit side
+            // by side around Seyda Neen -- so without the dwell a short walk crosses back and forth and drags
+            // the weather with it, which is the most visible reason the system reads as random. Real fronts
+            // are much larger than a region, so a crossing defers instead of discarding: the region's weather
+            // is remembered and applied once the dwell has elapsed, so weather still follows where the player
+            // is, just on a plausible schedule.
+            const bool scheduled = updateWeatherTime();
+            const bool crossedRegion = updateWeatherRegion(player.getCell()->getCell()->getRegion());
+
+            if (crossedRegion)
+            {
+                auto it = mRegions.find(mCurrentRegion);
+                mDeferredRegionWeather = (it != mRegions.end()) ? it->second.getWeather() : invalidWeatherID;
+            }
+
+            if (scheduled)
             {
                 auto it = mRegions.find(mCurrentRegion);
                 if (it != mRegions.end())
                 {
                     addWeatherTransition(it->second.getWeather());
+                    mGameHoursSinceWeatherChange = 0.0f;
+                    mDeferredRegionWeather = invalidWeatherID;
                 }
+            }
+            else if (mDeferredRegionWeather != invalidWeatherID
+                && mGameHoursSinceWeatherChange >= Settings::game().mWeatherMinimumHoursBetweenChanges)
+            {
+                addWeatherTransition(mDeferredRegionWeather);
+                mGameHoursSinceWeatherChange = 0.0f;
+                mDeferredRegionWeather = invalidWeatherID;
             }
 
             updateWeatherTransitions(duration);
@@ -1028,6 +1085,9 @@ namespace MWWorld
         // In Morrowind, when the player sleeps/waits, serves jail time, travels, or trains, all weather transitions are
         // immediately applied, regardless of whatever transition time might have been remaining.
         mTimePassed += static_cast<float>(hours);
+        // Same game-hour clock the change schedule runs on, kept separately because mTimePassed is consumed
+        // and zeroed by updateWeatherTime every frame and so cannot answer "how long has this weather held".
+        mGameHoursSinceWeatherChange += static_cast<float>(hours);
         mFastForward = !incremental ? true : mFastForward;
     }
 
@@ -1173,10 +1233,12 @@ namespace MWWorld
         if (mWeatherUpdateTime <= 0.0f)
         {
             // Expire all regional weather, so that any call to getWeather() will return a new weather ID.
+            // expire() rather than setWeather(invalidWeatherID) so each region remembers what it had and the
+            // re-roll can carry inertia; see RegionWeather::expire.
             auto it = mRegions.begin();
             for (; it != mRegions.end(); ++it)
             {
-                it->second.setWeather(invalidWeatherID);
+                it->second.expire();
             }
 
             mWeatherUpdateTime += mHoursBetweenWeatherChanges;
@@ -1199,13 +1261,35 @@ namespace MWWorld
         return false;
     }
 
+    float WeatherManager::transitionRateScale() const
+    {
+        // Morrowind subtracts transitionDelta once per REAL second, so a transition's duration is fixed in
+        // wall clock and ignores the world clock entirely. At the stock delta of 0.015 that is about 67
+        // seconds, which at the default timescale of 30 lands near half an hour of game time and reads
+        // correctly. Play at a lower timescale for realism and the transition does not slow with it: the same
+        // 67 seconds becomes a few game minutes, and the sky rebuilds itself faster than the world moves.
+        //
+        // Scaling the rate by timescale/reference holds the duration constant in GAME time instead. With the
+        // reference set to the timescale the deltas were authored against, this is an identity at that
+        // timescale and a slowdown below it, so nothing changes for a stock setup.
+        const float reference = Settings::game().mWeatherTransitionReferenceTimescale;
+        if (reference <= 0.0f)
+            return 1.0f;
+
+        const float timescale = MWBase::Environment::get().getWorld()->getTimeManager()->getGameTimeScale();
+        if (timescale <= 0.0f)
+            return 1.0f;
+
+        return timescale / reference;
+    }
+
     inline void WeatherManager::updateWeatherTransitions(const float elapsedRealSeconds)
     {
         // When a player chooses to train, wait, or serves jail time, any transitions will be fast forwarded to the last
         // weather type set, regardless of the remaining transition time.
         if (!mFastForward && inTransition())
         {
-            const float delta = mWeatherSettings[mNextWeather].transitionDelta();
+            const float delta = mWeatherSettings[mNextWeather].transitionDelta() * transitionRateScale();
             mTransitionFactor -= elapsedRealSeconds * delta;
             if (mTransitionFactor <= 0.0f)
             {
