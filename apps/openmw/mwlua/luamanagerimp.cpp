@@ -657,6 +657,15 @@ namespace MWLua
         std::string slowestName;
         std::string slowestTraceback;
 
+        // Callers of the worst kind, so a batch made of hundreds of one action name can be attributed to
+        // the script that queued them rather than only to whichever single one ran slowest. The slowest is
+        // frequently not the culprit: 584 'Create UI' actions across two dozen UI mods reduced to one
+        // traceback says nothing about which mod produced the volume.
+        //
+        // Free in normal play. Tracebacks are only captured when 'lua debug' is set, so this map stays
+        // empty otherwise and the aggregation below is skipped.
+        std::map<std::string, std::map<std::string, std::pair<unsigned int, double>>> byCaller;
+
         {
             BoolScopeGuard applyingGuard(mApplyingDelayedActions);
             for (DelayedAction& action : mActionQueue)
@@ -671,6 +680,14 @@ namespace MWLua
                 auto& entry = byName[std::string(action.name())];
                 entry.first += 1;
                 entry.second += actionMs;
+
+                if (!action.callerTraceback().empty())
+                {
+                    auto& caller
+                        = byCaller[std::string(action.name())][std::string(action.callerTraceback())];
+                    caller.first += 1;
+                    caller.second += actionMs;
+                }
 
                 if (actionMs > slowestMs)
                 {
@@ -704,6 +721,26 @@ namespace MWLua
         {
             Log(Debug::Warning) << "  '" << ranked[i].first << "' x" << ranked[i].second.first << " = "
                                 << ranked[i].second.second << " ms";
+        }
+
+        // Who queued the worst kind. Ranked by count rather than by time, because the question this
+        // answers is which script is responsible for the volume.
+        const auto worstCallers = byCaller.find(ranked[0].first);
+        if (worstCallers != byCaller.end() && !worstCallers->second.empty())
+        {
+            std::vector<std::pair<std::string, std::pair<unsigned int, double>>> callers(
+                worstCallers->second.begin(), worstCallers->second.end());
+            std::sort(callers.begin(), callers.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.second.first > rhs.second.first;
+            });
+            Log(Debug::Warning) << "  '" << ranked[0].first << "' was queued from "
+                                << callers.size() << " distinct site(s); worst by count:";
+            const std::size_t callersShown = std::min<std::size_t>(callers.size(), 3);
+            for (std::size_t i = 0; i < callersShown; ++i)
+            {
+                Log(Debug::Warning) << "    x" << callers[i].second.first << " = "
+                                    << callers[i].second.second << " ms from " << callers[i].first;
+            }
         }
 
         Log(Debug::Warning) << "  slowest single action '" << slowestName << "' " << slowestMs << " ms";
