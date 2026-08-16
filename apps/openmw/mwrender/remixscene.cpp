@@ -290,37 +290,14 @@ namespace
     /// effectively stopped.
     constexpr float kLegacyLightEndValue = 1.0f / 255.0f;
 
-    /// Emissive radiance scale for ADDITIVELY blended particle quads.
-    ///
-    /// Applied only where SurfaceState::mAdditive says the blend function accumulates -- flames, glows,
-    /// sparks, magic. Those are self-lit by construction and come through as grey cardboard without it,
-    /// which is what a path tracer makes of a non-emissive quad.
-    ///
-    /// It used to be applied to every particle unconditionally, on the reasoning that a faintly glowing
-    /// smoke puff was the smaller error. That was wrong twice over: at 6.0 over a pale texture the puff is
-    /// not faintly glowing but saturated solid white, and an emitter is outside the lighting solution
-    /// altogether -- it takes no shadow and picks up no bounce colour, so smoke stops behaving like smoke
-    /// rather than merely looking too bright.
-    constexpr float kParticleEmissive = 6.0f;
-    /// Radiance scale applied to an ALPHA-blended particle's OWN emissive colour.
-    ///
-    /// Different in both value and meaning from kParticleEmissive. That one is a flat radiance handed to a
-    /// surface that emits by construction. This one multiplies the emission the asset actually declares, so a
-    /// mesh carrying none still gets none and only what Morrowind marked as self-lit is affected.
-    ///
-    /// 1.5 because both neighbouring failures are visible on screen: at kParticleEmissive's 6.0 a pale smoke
-    /// texture saturates to solid white, and at 0 -- which is what shipped -- smoke and steam are lit only by
-    /// whatever reaches a thin billboard in a dim interior, which is nearly nothing. A modest term leaves the
-    /// surface in the lighting solution, still taking shadow and bounce, with a floor under it so the effect
-    /// is legible at all.
-    ///
-    /// Tunable through OPENMW_REMIX_PARTICLE_EMISSIVE for the same reason as the glow scale: the defensible
-    /// number depends on the exposure the rest of the scene settles at, and that is a judgement to make
-    /// against the screen rather than in a header.
-    constexpr float kParticleAlphaEmissive = 1.5f;
+    // Both particle emissive figures used to live here as constants. They are settings now -- "particle
+    // emissive" and "particle additive emissive" -- so the defaults live in settings-default.cfg and the
+    // rationale for the two of them sits at the point they are read, in submitParticles. Keeping copies here
+    // would mean two places declaring the same default.
+
     /// Radiance scale for a surface carrying a glow map.
     ///
-    /// Well below kParticleEmissive, because the two are doing different jobs. That figure has to make a
+    /// Well below the additive particle figure, because the two are doing different jobs. That figure has to make a
     /// flat quad read as fire across its whole area; a glow map is already black everywhere that should not
     /// emit, so this only scales the texels that do -- a lantern's glass, a rune, the gills of a glowing
     /// plant. Overstating it does not make those brighter so much as it turns small bright regions into
@@ -3063,6 +3040,13 @@ namespace
             if (const auto* texMat = dynamic_cast<const osg::TexMat*>(
                     stateSet.getTextureAttribute(0, osg::StateAttribute::TEXMAT)))
             {
+                // Recorded from the attribute's presence, before the matrix is even looked at. See
+                // mUvAnimated: the value is animated and therefore useless as material identity, while the
+                // presence is a fixed property of the asset. Only UVController puts one of these here; the
+                // terrain composite and baked-window paths synthesise mTexMat directly and correctly leave
+                // this alone, because a baked footprint remap is not something driving the coordinates.
+                surface.mUvAnimated = true;
+
                 // Row-vector convention, matching the fixed-function texture matrix OSG is emulating:
                 // s' = s*m00 + t*m10 + m30, and likewise for t. The third row and column are dropped
                 // because texcoords here are 2D.
@@ -4247,38 +4231,246 @@ namespace MWRender
         return meshFor(geometry, materialFor(surface), surface, rig);
     }
 
+    /// Decodes a DXT1/DXT3/DXT5 image to RGBA8, or returns null for anything else.
+    ///
+    /// Exists because the specular and normal-height conversions are per-texel and Morrowind's texture packs
+    /// ship these maps compressed. Measured across this install's Textures tree: of 1330 `_spec.dds`, 1237
+    /// are DXT1, 36 are DXT5 and only 57 are uncompressed -- so a conversion that accepts only uncompressed
+    /// input sees four percent of the data that exists, and every other surface falls back to a roughness
+    /// guessed from its file path.
+    ///
+    /// Both channels are worth recovering, for the reason objects.frag gives:
+    ///     float shininess = specTex.a * 255.0;
+    ///     vec3 specularColor = specTex.xyz;
+    /// Alpha is the Blinn-Phong exponent and RGB is a specular mask. A DXT1 map has no alpha -- OpenMW reads
+    /// 1.0 and so shades it at shininess 255 everywhere -- but its RGB still says where the surface is shiny
+    /// at all, which is the difference between varnished wood and cloth on the same sheet.
+    ///
+    /// Only the base mip is decoded. The upload path builds its own mip chain, and a roughness map derived
+    /// from a lower mip would disagree with it.
+    static osg::ref_ptr<osg::Image> decodeS3tcToRgba8(const osg::Image& image)
+    {
+        // 0x83F0 DXT1 (no alpha), 0x83F1 DXT1 with 1-bit alpha, 0x83F2 DXT3, 0x83F3 DXT5.
+        const unsigned int format = static_cast<unsigned int>(image.getPixelFormat());
+        const bool isDxt1 = format == 0x83F0u || format == 0x83F1u;
+        const bool isDxt3 = format == 0x83F2u;
+        const bool isDxt5 = format == 0x83F3u;
+        if (!isDxt1 && !isDxt3 && !isDxt5)
+            return nullptr;
+
+        const int width = image.s();
+        const int height = image.t();
+        if (width <= 0 || height <= 0 || image.data() == nullptr)
+            return nullptr;
+
+        const int blocksX = (width + 3) / 4;
+        const int blocksY = (height + 3) / 4;
+        const int blockBytes = isDxt1 ? 8 : 16;
+        const std::size_t needed = static_cast<std::size_t>(blocksX) * blocksY * blockBytes;
+        if (static_cast<std::size_t>(image.getTotalSizeInBytes()) < needed)
+            return nullptr;
+
+        osg::ref_ptr<osg::Image> out = new osg::Image;
+        out->allocateImage(width, height, 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        out->setInternalTextureFormat(GL_RGBA8);
+        unsigned char* dst = out->data();
+        const unsigned char* src = image.data();
+
+        for (int by = 0; by < blocksY; ++by)
+        {
+            for (int bx = 0; bx < blocksX; ++bx)
+            {
+                const unsigned char* block = src + (static_cast<std::size_t>(by) * blocksX + bx) * blockBytes;
+                const unsigned char* colourBlock = isDxt1 ? block : block + 8;
+
+                // Colour endpoints are RGB565. In DXT1 the ordering selects the mode: c0 > c1 means four
+                // opaque colours, otherwise three colours and a transparent slot.
+                const unsigned int c0 = static_cast<unsigned int>(colourBlock[0]) | (static_cast<unsigned int>(colourBlock[1]) << 8);
+                const unsigned int c1 = static_cast<unsigned int>(colourBlock[2]) | (static_cast<unsigned int>(colourBlock[3]) << 8);
+                const auto expand = [](unsigned int c, int rgb[3]) {
+                    const unsigned int r5 = (c >> 11) & 0x1Fu;
+                    const unsigned int g6 = (c >> 5) & 0x3Fu;
+                    const unsigned int b5 = c & 0x1Fu;
+                    // Bit replication rather than a multiply, which is what the hardware does.
+                    rgb[0] = static_cast<int>((r5 << 3) | (r5 >> 2));
+                    rgb[1] = static_cast<int>((g6 << 2) | (g6 >> 4));
+                    rgb[2] = static_cast<int>((b5 << 3) | (b5 >> 2));
+                };
+                int e0[3];
+                int e1[3];
+                expand(c0, e0);
+                expand(c1, e1);
+
+                int palette[4][3];
+                for (int ch = 0; ch < 3; ++ch)
+                {
+                    palette[0][ch] = e0[ch];
+                    palette[1][ch] = e1[ch];
+                }
+                const bool fourColour = !isDxt1 || c0 > c1;
+                for (int ch = 0; ch < 3; ++ch)
+                {
+                    if (fourColour)
+                    {
+                        palette[2][ch] = (2 * e0[ch] + e1[ch] + 1) / 3;
+                        palette[3][ch] = (e0[ch] + 2 * e1[ch] + 1) / 3;
+                    }
+                    else
+                    {
+                        palette[2][ch] = (e0[ch] + e1[ch]) / 2;
+                        palette[3][ch] = 0;
+                    }
+                }
+
+                const unsigned int indices = static_cast<unsigned int>(colourBlock[4])
+                    | (static_cast<unsigned int>(colourBlock[5]) << 8)
+                    | (static_cast<unsigned int>(colourBlock[6]) << 16)
+                    | (static_cast<unsigned int>(colourBlock[7]) << 24);
+
+                // DXT5 alpha: two endpoints and 3-bit indices, interpolated. DXT3: 4 bits a texel, direct.
+                unsigned char alphaPalette[8] = { 255, 255, 255, 255, 255, 255, 255, 255 };
+                if (isDxt5)
+                {
+                    const int a0 = block[0];
+                    const int a1 = block[1];
+                    alphaPalette[0] = static_cast<unsigned char>(a0);
+                    alphaPalette[1] = static_cast<unsigned char>(a1);
+                    if (a0 > a1)
+                    {
+                        for (int i = 1; i < 7; ++i)
+                            alphaPalette[i + 1] = static_cast<unsigned char>(((7 - i) * a0 + i * a1) / 7);
+                    }
+                    else
+                    {
+                        for (int i = 1; i < 5; ++i)
+                            alphaPalette[i + 1] = static_cast<unsigned char>(((5 - i) * a0 + i * a1) / 5);
+                        alphaPalette[6] = 0;
+                        alphaPalette[7] = 255;
+                    }
+                }
+
+                for (int py = 0; py < 4; ++py)
+                {
+                    for (int px = 0; px < 4; ++px)
+                    {
+                        const int x = bx * 4 + px;
+                        const int y = by * 4 + py;
+                        if (x >= width || y >= height)
+                            continue;
+
+                        const int texel = py * 4 + px;
+                        const unsigned int sel = (indices >> (2 * texel)) & 0x3u;
+
+                        unsigned char alpha = 255;
+                        if (isDxt5)
+                        {
+                            // 3 bits a texel, packed across six bytes after the two endpoints.
+                            const int bitPos = 3 * texel;
+                            const int bytePos = 2 + (bitPos >> 3);
+                            const int shift = bitPos & 7;
+                            unsigned int bits = static_cast<unsigned int>(block[bytePos]) >> shift;
+                            if (shift > 5)
+                                bits |= static_cast<unsigned int>(block[bytePos + 1]) << (8 - shift);
+                            alpha = alphaPalette[bits & 0x7u];
+                        }
+                        else if (isDxt3)
+                        {
+                            const unsigned char packed = block[texel >> 1];
+                            const unsigned int nibble = (texel & 1) ? (packed >> 4) : (packed & 0x0Fu);
+                            alpha = static_cast<unsigned char>(nibble * 17u);
+                        }
+                        else if (!fourColour && sel == 3)
+                        {
+                            alpha = 0;
+                        }
+
+                        unsigned char* out4 = dst + (static_cast<std::size_t>(y) * width + x) * 4;
+                        out4[0] = static_cast<unsigned char>(palette[sel][0]);
+                        out4[1] = static_cast<unsigned char>(palette[sel][1]);
+                        out4[2] = static_cast<unsigned char>(palette[sel][2]);
+                        out4[3] = alpha;
+                    }
+                }
+            }
+        }
+
+        out->setFileName(image.getFileName());
+        return out;
+    }
+
     unsigned long long RemixScene::roughnessTextureFor(const osg::Image& specular)
     {
         if (auto found = mDerivedRoughness.find(&specular); found != mDerivedRoughness.end())
             return found->second != nullptr ? textureFor(*found->second, false) : 0;
 
-        // Only uncompressed sources are converted, because the conversion is per-texel and this code does
-        // not decode block formats. A specular map is small and mods ship them uncompressed far more often
-        // than not; a compressed one simply keeps the constant roughness from the surface rule, which is
-        // the behaviour that existed before any of this. Recorded as a null entry so the same image is not
-        // examined again every frame.
-        const GLenum pixelFormat = specular.getPixelFormat();
-        const bool convertible = specular.getDataType() == GL_UNSIGNED_BYTE
+        // Compressed sources are decoded rather than skipped. The earlier version accepted uncompressed
+        // input only, which on this install meant 57 of 1330 specular maps: every other surface silently
+        // kept a roughness guessed from its file path while real per-texel data sat on disk.
+        const osg::Image* source = &specular;
+        osg::ref_ptr<osg::Image> decoded = decodeS3tcToRgba8(specular);
+        if (decoded != nullptr)
+            source = decoded.get();
+
+        const GLenum pixelFormat = source->getPixelFormat();
+        const bool convertible = source->getDataType() == GL_UNSIGNED_BYTE
             && (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA)
-            && specular.data() != nullptr && specular.s() > 0 && specular.t() > 0;
+            && source->data() != nullptr && source->s() > 0 && source->t() > 0;
         if (!convertible)
         {
             mDerivedRoughness.emplace(&specular, osg::ref_ptr<osg::Image>());
             return 0;
         }
 
+        // Only alpha-bearing maps produce a roughness texture. Without alpha there is no shininess in the
+        // file, and nothing here is entitled to invent one.
+        //
+        // Tried the alternative and reverted it the same night: for a DXT1 map, whose alpha the decoder fills
+        // with 255, the RGB was read as a specular mask and roughness interpolated between matte and smooth
+        // by luminance. That looks reasonable written down and is wrong on screen. OpenMW shades such a map
+        // at shininess 255 everywhere -- objects.frag reads `specTex.a * 255.0`, and absent alpha is 1.0 --
+        // and uses RGB only to scale how much specular *energy* the texel receives. Roughness and specular
+        // energy are different quantities: a dark mask means a weaker highlight, not a rougher surface.
+        // Converting one to the other turned every dark-masked surface matte, which took the gloss off glass
+        // bottles that had looked right a moment earlier.
+        //
+        // Remix has no per-texel specular-intensity slot to put that mask in, so the honest outcome is to
+        // leave these maps alone and let the surface keep the roughness constant its path rule gives it,
+        // which is what happened before any of this and what the bottle looked correct under. The decoder is
+        // still worth having: it recovers the 36 DXT5 specular maps that do carry shininess, and the
+        // compressed normal-height maps for the displacement slot.
+        bool alphaVaries = false;
+        {
+            const unsigned char* probe = source->data();
+            const int texels = source->s() * source->t();
+            const unsigned char first = probe[3];
+            for (int i = 1; i < texels; ++i)
+            {
+                if (probe[i * 4 + 3] != first)
+                {
+                    alphaVaries = true;
+                    break;
+                }
+            }
+        }
+
+        if (!alphaVaries)
+        {
+            mDerivedRoughness.emplace(&specular, osg::ref_ptr<osg::Image>());
+            return 0;
+        }
+
         osg::ref_ptr<osg::Image> derived = new osg::Image;
-        derived->allocateImage(specular.s(), specular.t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        derived->allocateImage(source->s(), source->t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
         derived->setInternalTextureFormat(GL_RGBA8);
         // Named so the surface-rule classifier and any log line have something meaningful to show; the
         // suffix keeps it from colliding with the source in a rule match.
         derived->setFileName(specular.getFileName() + "@roughness");
 
-        const unsigned char* src = specular.data();
+        const unsigned char* src = source->data();
         unsigned char* dst = derived->data();
-        const int texels = specular.s() * specular.t();
-        // Alpha is the last byte in both RGBA and BGRA, which is the only channel read here, so the two
-        // formats need no separate handling.
+        const int texels = source->s() * source->t();
+        // Alpha is the last byte in both RGBA and BGRA, and RGB order does not matter to a luminance, so
+        // the two formats need no separate handling.
         for (int i = 0; i < texels; ++i)
         {
             // objects.frag reads a normalised alpha and multiplies by 255 to recover the exponent, so the
@@ -4303,14 +4495,19 @@ namespace MWRender
         if (auto found = mDerivedHeight.find(&normalHeight); found != mDerivedHeight.end())
             return found->second != nullptr ? textureFor(*found->second, false) : 0;
 
-        // Uncompressed only, for the same reason as the roughness conversion: this is per-texel and does not
-        // decode block formats. A compressed normal-height map keeps its normal and simply gets no
-        // displacement, which is the behaviour that existed before this. Cached as null so the same image is
-        // not examined again every frame.
-        const GLenum pixelFormat = normalHeight.getPixelFormat();
-        const bool convertible = normalHeight.getDataType() == GL_UNSIGNED_BYTE
+        // Decoded when compressed, same as the roughness conversion above. A normal-height map keeps height
+        // in alpha, so DXT5 is the format that matters here and it decodes exactly; a DXT1 one has no alpha
+        // and legitimately yields no displacement. This install ships 411 `_nh` maps, none of which were
+        // reaching the height slot before.
+        const osg::Image* heightSource = &normalHeight;
+        osg::ref_ptr<osg::Image> decodedHeight = decodeS3tcToRgba8(normalHeight);
+        if (decodedHeight != nullptr)
+            heightSource = decodedHeight.get();
+
+        const GLenum pixelFormat = heightSource->getPixelFormat();
+        const bool convertible = heightSource->getDataType() == GL_UNSIGNED_BYTE
             && (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA)
-            && normalHeight.data() != nullptr && normalHeight.s() > 0 && normalHeight.t() > 0;
+            && heightSource->data() != nullptr && heightSource->s() > 0 && heightSource->t() > 0;
         if (!convertible)
         {
             mDerivedHeight.emplace(&normalHeight, osg::ref_ptr<osg::Image>());
@@ -4318,15 +4515,15 @@ namespace MWRender
         }
 
         osg::ref_ptr<osg::Image> derived = new osg::Image;
-        derived->allocateImage(normalHeight.s(), normalHeight.t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        derived->allocateImage(heightSource->s(), heightSource->t(), 1, GL_RGBA, GL_UNSIGNED_BYTE);
         derived->setInternalTextureFormat(GL_RGBA8);
         // Suffixed so it cannot collide with the source in a surface-rule match, and so a log line naming it
         // is recognisable as derived rather than as an asset on disk.
         derived->setFileName(normalHeight.getFileName() + "@height");
 
-        const unsigned char* src = normalHeight.data();
+        const unsigned char* src = heightSource->data();
         unsigned char* dst = derived->data();
-        const int texels = normalHeight.s() * normalHeight.t();
+        const int texels = heightSource->s() * heightSource->t();
         // Alpha is the last byte in both RGBA and BGRA, so the two formats need no separate handling.
         //
         // Copied straight across with no inversion or rescaling. The runtime treats 1.0 as the outer surface
@@ -5018,9 +5215,34 @@ namespace MWRender
         // became an opaque ball that hid the spray completely. The particles were correct the whole time --
         // alive, sized, submitted every frame -- and could be seen by clipping the camera inside the gem.
         // 2,661 shapes in the installed set blend additively, so this was never one asset's problem.
+        // A surface whose texcoords are being driven is an effect plane, not foliage, and gets real
+        // transparency for the same reason particles do.
+        //
+        // Morrowind writes a great deal of its smoke, steam, mist and waterfall as ordinary NiTriShapes with
+        // a NiUVController scrolling the texture, rather than as particle systems -- Dynamic Ambient Visual
+        // Effects' candle smoke is three tri-shapes and three UV controllers with no particle system anywhere
+        // in the file. Nothing on the state set separates that from a leaf: both are blend on, no alpha test.
+        // So both took the cutout, and at 128/255 against a soft gradient only the dense core of the puff
+        // survived -- fully opaque, because that is what a cutout is. Hard-edged white blobs rising in a
+        // chain, each one lit like solid cardboard by the candle 2 cm away, which is exactly what was on
+        // screen. The particle fix could not reach it: it never goes near submitParticles.
+        //
+        // An animated matrix is the discriminator because it is a statement of intent that survives into the
+        // asset. Foliage does not scroll. What does is smoke, steam, mist, waterfalls and magic, and every one
+        // of those wants real transparency -- so this is not a special case for one mod's candles, and
+        // waterfalls should improve with it.
+        //
+        // Presence, not value: see mUvAnimated for why testing the live matrix would flicker the material.
+        //
+        // Reachable because it is a judgement about a whole class of assets made from one signal, and if some
+        // asset is caught wrongly the way back has to not need a rebuild.
+        static const bool blendAnimatedUv
+            = envFlag("OPENMW_REMIX_BLEND_ANIMATED_UV", Settings::remix().mBlendAnimatedUv);
+        const bool blendForAnimatedUv = blendAnimatedUv && surface.mUvAnimated && surface.mAlphaBlend
+            && !surface.mPreferBlend && !surface.mAdditive;
         unsigned char alphaTestReference = surface.mAlphaTestReference;
         int blendType = kBlendTypeNone;
-        if (surface.mAlphaBlend && (surface.mPreferBlend || surface.mAdditive))
+        if (surface.mAlphaBlend && (surface.mPreferBlend || surface.mAdditive || blendForAnimatedUv))
         {
             // Additive gets the emissive blend type, which is the same translation the runtime applies to a
             // legacy SRC_ALPHA/ONE draw call. Note this stacks with the emissive term materialFor is handed
@@ -5100,13 +5322,39 @@ namespace MWRender
         // it; this covers the entire surface. 1.0 is what the fixed-function pipeline adds and therefore what
         // OpenMW's raster shows, which makes matching raster the default and brighter a deliberate choice.
         //
-        // A caller-supplied figure still wins, so additive particles keep kParticleEmissive and alpha-blended
-        // ones keep the particle scale instead of being re-derived here.
+        // A caller-supplied figure still wins, so particles keep whatever submitParticles worked out for them
+        // -- a flat term for additive blending, the asset's own emission scaled for alpha -- rather than
+        // having it re-derived here.
         static const float materialEmissiveScale
             = envFloat("OPENMW_REMIX_MATERIAL_EMISSIVE", Settings::remix().mMaterialEmissiveScale);
+        // An effect plane is scaled as the soft blended thing it is, not as architecture.
+        //
+        // These two scales answer different questions and are calibrated against different surfaces. The
+        // material one is asked "how much should a surface that declares whole-surface emission glow", and it
+        // gets tuned by eye against opaque architecture -- a window pane, a rune, a lantern's glass. Those are
+        // solid, they emit over their whole area exactly once, and a value near or above one is reasonable for
+        // them. The particle one is asked the same question about a soft blended effect, and gets tuned
+        // against smoke, which is the surface class this actually is.
+        //
+        // A UV-scrolled smoke plate is the second thing wearing the first thing's clothes: it reaches here
+        // through the ordinary geometry path only because its author wrote it as a NiTriShape instead of as a
+        // particle system, and nothing about that choice makes it architecture. Handed the architectural
+        // scale it blows out, and does so twice over -- emission is multiplied by alpha per texel, but a plume
+        // is several overlapping planes and, once the surface reaches the unordered TLAS where transparency
+        // accumulates, so does their emission. That is the difference between the two candle screenshots:
+        // the same material, tagged and untagged as a particle, at the same intensity.
+        //
+        // So reuse the figure already tuned for smoke rather than inventing a third one. It is the same
+        // quantity about the same kind of surface, and a value chosen by looking at smoke is worth more here
+        // than any default written into this file.
+        // Both read once. materialFor runs per draw and ahead of its own cache lookup, so a getenv here would
+        // be thousands of calls a frame to answer a question that cannot change.
+        static const float effectEmissiveScale
+            = envFloat("OPENMW_REMIX_PARTICLE_EMISSIVE", Settings::remix().mParticleEmissive);
+        const float declaredEmissiveScale = blendForAnimatedUv ? effectEmissiveScale : materialEmissiveScale;
         if (emissiveIntensity <= 0.0f && surface.mMaterialEmissive > 0.0f)
         {
-            emissiveIntensity = surface.mMaterialEmissive * materialEmissiveScale;
+            emissiveIntensity = surface.mMaterialEmissive * declaredEmissiveScale;
 
             // An intensity alone makes the surface emit a flat colour, which is not what the asset asked for.
             //
@@ -5348,6 +5596,13 @@ namespace MWRender
 
         if (auto found = mMaterials.find(key); found != mMaterials.end())
             return found->second;
+
+        // A diagnostic that named every surface taking real transparency on the strength of its texcoords
+        // being driven lived here, with its emissive arithmetic and texture hash. Removed once it had done its
+        // job: it established that the classification catches smoke, waterfalls, mist, lava crust, animated
+        // water and the cloudy sky and nothing else, and it supplied the hashes needed to find the mod-side
+        // material override that was replacing the candle smoke's albedo. The material log below reports the
+        // same blend decision on demand, so this was duplicating it for one question that is now answered.
 
         // One line per distinct material, capped. Each of these has cost real time to work out from the
         // screen alone: "alpha is not working" has three indistinguishable causes -- no cutout requested,
@@ -5664,20 +5919,49 @@ namespace MWRender
         const bool worldSpace = userData != nullptr && userData->getNumDescriptions() > 0
             && userData->getDescriptions()[0] == "worldspace";
 
-        // Emissive only for additive particles. This is the distinction kParticleEmissive's own comment
-        // said was worth making once particles were on screen and could be judged -- they are, and smoke
-        // was coming through as a solid white puff, because a fixed emissive of 6.0 over a pale grey smoke
-        // texture saturates every channel long before it reaches the tonemapper.
+        // Emissive only for additive particles. Handing every particle the same fixed 6.0 was worth
+        // revisiting once particles were on screen and could be judged: smoke was arriving as a solid white
+        // puff, because that much emission over a pale grey smoke texture saturates every channel long
+        // before it reaches the tonemapper.
         //
         // Flames, glows, sparks and magic blend additively and genuinely emit, so they keep the term. Smoke,
         // fog and dust blend with ONE_MINUS_SRC_ALPHA: they occlude what is behind them and are lit by the
         // scene like anything else, which is what a path tracer is good at. Handing them an emissive term
         // does not merely brighten them, it removes them from the lighting solution entirely -- an emitter
         // takes no shadow and picks up no colour from its surroundings, so smoke stops being smoke.
+        //
+        // The two figures, and why they are different quantities rather than one number.
+        //
+        // The alpha one multiplies the emission the asset actually declares, so a mesh carrying none still
+        // gets none and only what Morrowind marked as self-lit is affected. Its 1.5 default sits between two
+        // visible failures: at 6.0 a pale smoke texture saturates to solid white, and at 0 -- which is what
+        // shipped -- smoke and steam are lit only by whatever reaches a thin billboard in a dim interior,
+        // which is nearly nothing.
+        //
+        // The additive one is a flat radiance handed to a surface on the grounds that additive blending means
+        // it emits by construction. Its 6.0 should be treated as unmeasured against this code rather than as
+        // a tuned figure, because it was calibrated ten hours before the change that made it redundant and
+        // the two were never compared. When 94bfe1779f set it, an additive particle took the alpha-test
+        // cutout path: it occluded, it did not accumulate, and the runtime gave it no emissive handling, so a
+        // flame was a solid quad and 6.0 is what it took to read as light. a22710def5 then gave particles
+        // real transparency and handed additive ones kBlendTypeAlphaEmissive, which is the runtime doing the
+        // accumulating and the glowing itself -- see the note at that assignment in materialFor, which says
+        // this is the term to drop if flames come out blown. It was not dropped, so both are paid.
+        //
+        // That double count is also the only reading that explains white AND opaque together, which no
+        // amount of staring at the blend detection did. Saturating white IS opaque: a quad that accumulates
+        // to 1.0 in every channel hides what is behind it as completely as a wall, and being an emitter it
+        // takes no shadow and picks up no bounce colour, so it cannot read as smoke either.
+        //
+        // Both are reachable because the defensible figure depends on the exposure the rest of the scene
+        // settles at, and cannot be settled from here. The additive one especially, for a second reason: it
+        // assumes additive means flame, and an asset is free to author smoke as SRC_ALPHA/ONE.
         static const float alphaEmissiveScale
             = envFloat("OPENMW_REMIX_PARTICLE_EMISSIVE", Settings::remix().mParticleEmissive);
+        static const float additiveEmissiveScale = envFloat(
+            "OPENMW_REMIX_PARTICLE_ADDITIVE_EMISSIVE", Settings::remix().mParticleAdditiveEmissive);
         const float particleEmissive
-            = surface.mAdditive ? kParticleEmissive : surface.mMaterialEmissive * alphaEmissiveScale;
+            = surface.mAdditive ? additiveEmissiveScale : surface.mMaterialEmissive * alphaEmissiveScale;
         const unsigned long long material = materialFor(surface, particleEmissive);
         if (material == 0)
             return;

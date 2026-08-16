@@ -52,6 +52,20 @@ namespace Settings
         SettingValue<float> mGlowIntensity{ mIndex, "Remix", "glow intensity", makeMaxSanitizerFloat(0) };
         SettingValue<float> mParticleEmissive{ mIndex, "Remix", "particle emissive",
             makeMaxSanitizerFloat(0) };
+        // The additive counterpart. Separate because the two mean different things: this is a flat radiance
+        // handed to a surface on the grounds that additive blending means it emits, where "particle emissive"
+        // multiplies an emission the asset actually declares. Reachable because its default stacks with the
+        // emissive blend type the material already carries -- it predates that blend type and was not
+        // rechecked against it -- so the figure that holds for both flames and smoke has to be found against
+        // the screen. See submitParticles for the provenance.
+        SettingValue<float> mParticleAdditiveEmissive{ mIndex, "Remix", "particle additive emissive",
+            makeMaxSanitizerFloat(0) };
+        // Whether a surface whose texcoords are driven by a controller gets real transparency instead of the
+        // cutout that is substituted for alpha blending otherwise. Morrowind authors smoke, steam, mist and
+        // waterfalls as UV-scrolled tri-shapes rather than particles, and a cutout renders those as opaque
+        // fragments of their densest texels. Reachable because it is one signal standing in for a judgement
+        // about a whole class of assets. See materialFor.
+        SettingValue<bool> mBlendAnimatedUv{ mIndex, "Remix", "blend animated uv" };
         SettingValue<float> mParallaxDepth{ mIndex, "Remix", "parallax depth", makeMaxSanitizerFloat(0) };
         SettingValue<float> mLightRadius{ mIndex, "Remix", "light radius", makeMaxSanitizerFloat(0) };
         SettingValue<float> mLightIntensity{ mIndex, "Remix", "light intensity", makeMaxSanitizerFloat(0) };

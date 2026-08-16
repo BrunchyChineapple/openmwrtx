@@ -328,6 +328,19 @@ namespace MWRender
             /// Whether mTexMat differs from identity, so the common case costs one bool rather than six
             /// float comparisons per drawable per frame.
             bool mHasTexMat = false;
+            /// Whether a controller is driving this surface's texture coordinates at all, whatever the
+            /// matrix currently reads.
+            ///
+            /// Deliberately not mHasTexMat, and the difference is the whole reason this exists. That one
+            /// tests the live matrix against identity, which a scrolling matrix passes through every time
+            /// its offset wraps; anything that changed a *material* on the strength of it would flip the
+            /// material for one frame each cycle and leave two entries in the cache for one asset. This
+            /// records the presence of the attribute, which is fixed for the life of the asset.
+            ///
+            /// Read by materialFor as the one signal separating a soft effect plane from foliage: both
+            /// arrive as "blend on, no alpha test", but Morrowind animates the texcoords of smoke, steam
+            /// and waterfalls and does not animate a leaf.
+            bool mUvAnimated = false;
             /// Water gets a refractive material rather than whatever texture it happens to carry.
             bool mIsWater = false;
             /// Tangent-space normal map, when one is bound. Found by reading each texture unit's
@@ -1084,6 +1097,7 @@ namespace MWRender
         // the answer was "never in 45 samples", which is not an answer.
         /// Read from the [Remix] "material log limit" setting at construction. 0 switches these lines off.
         unsigned int mMaterialLogLimit = 4096;
+
 
         /// Capped like the material log, but higher: the point of it is to be able to look up an arbitrary
         /// hash seen in Remix's texture list, so covering only the first few textures of a session would
