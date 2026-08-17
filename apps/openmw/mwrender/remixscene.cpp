@@ -1827,8 +1827,13 @@ namespace
                 // mAlphaBlend and mAdditive are deliberately left to mergeState, which reads the actual
                 // BlendFunc. A particle system that genuinely is not blended should stay opaque.
                 particleSurface.mPreferBlend = true;
+                // Terrain masked out for the same reason as the main submit path below: a mask inherited from
+                // the quadtree root says "terrain" about everything under it, and a particle system is not
+                // terrain under any reading. Cheaper to state here than to have the runtime force a terrain
+                // layer's coverage rules onto a puff of smoke.
                 mScene.submitParticles(*particles, particleSurface, mMatrix, mRight, mUp,
-                    currentCategories() | categoriesFor(drawable.getNodeMask()));
+                    (currentCategories() | categoriesFor(drawable.getNodeMask()))
+                        & ~RemixRT::Runtime::Category_Terrain);
                 return;
             }
 
@@ -1880,8 +1885,38 @@ namespace
             // parent, so water was never recognised as water and took the opaque grey fallback material.
             // That quad is CellSizeInUnits * 150 across -- over a million units -- so it read as a flat
             // grey plane lidding the world out to the horizon, which is easy to mistake for the terrain.
-            const unsigned int categories
-                = currentCategories() | categoriesFor(drawable.getNodeMask());
+            unsigned int categories = currentCategories() | categoriesFor(drawable.getNodeMask());
+
+            // Terrain comes from the drawable's type, not from the node mask it inherits.
+            //
+            // QuadTreeWorld::addChunkManager ORs each chunk manager's node mask into the quadtree root, and
+            // that root starts life as Mask_Terrain. ObjectPaging contributes Mask_Static and Groundcover
+            // contributes Mask_Groundcover, so the root ends up masked Mask_Terrain | Mask_Static |
+            // Mask_Groundcover, and every chunk manager's output hangs beneath it. Paged statics, grass and
+            // any paged water therefore inherit a mask that categoriesFor reads as "this is terrain".
+            //
+            // Measured on a Vivec capture before this: 9058 prims came back tagged terrain, against 24 in an
+            // interior, and 26 of them were water. That is not cosmetic. The runtime forces opacity to
+            // albedo alpha * vertex alpha for anything tagged terrain, and with terrain-as-decals selected
+            // it also relabels the draw DecalStatic -- so a canal surface got composited as a decal over
+            // whatever was behind it. It reads as a flat pasted texture, which is exactly how Vivec's water
+            // was coming through, and untagging it in the toolkit is what revealed the real shading
+            // underneath.
+            //
+            // categoriesFor's own guard cannot catch this. That guard rejects masks carrying bits outside the
+            // VisMask set, which is what makes OSG's 0xffffffff default harmless, but the quadtree root's
+            // mask is a perfectly legitimate union of known bits and reads as an identity.
+            //
+            // Terrain::TerrainDrawable is the honest test, and it is the same one the material path below
+            // already depends on. Distant chunks stay covered because their composite-map handling lives
+            // inside that type test too: a chunk that reaches Remix as a composite is still a
+            // TerrainDrawable. Stated in both directions so the category tracks the type rather than
+            // whatever the graph happened to contribute.
+            const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable);
+            if (terrain != nullptr)
+                categories |= RemixRT::Runtime::Category_Terrain;
+            else
+                categories &= ~RemixRT::Runtime::Category_Terrain;
 
             MWRender::RemixScene::SurfaceState surface = currentSurface();
             surface.mIsWater = (categories & RemixRT::Runtime::Category_AnimatedWater) != 0;
@@ -1920,7 +1955,7 @@ namespace
             // distant chunks, which takes the first of the quads a CompositeMap composites from, and the
             // blend itself, which the runtime's terrain baker performs from the masks rather than this host
             // flattening the layers on the CPU.
-            const auto* terrain = dynamic_cast<const Terrain::TerrainDrawable*>(&drawable);
+            // `terrain` was resolved above, where the Terrain category is decided from it.
             if (terrain != nullptr)
             {
                 const auto& passes = terrain->getPasses();
