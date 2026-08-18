@@ -36,7 +36,25 @@ namespace
         }
         void apply(osg::StateSet* stateset, osg::NodeVisitor* nv) override
         {
-            osg::Camera* camera = nv->asCullVisitor()->getCurrentCamera();
+            // Only a cull traversal has a current camera, and this is reachable from one that is not.
+            //
+            // The Remix submit traversal walks the sky and evaluates every StateSetUpdater it finds as a
+            // cull callback, because that is the only way NIF state animation reaches it -- see
+            // SubmitVisitor::pushState in remixscene.cpp. asCullVisitor() returns null for any visitor that
+            // is not a CullVisitor, so the unguarded form dereferenced null: a 100% reproducible crash on
+            // the first frame after stepping out of an interior into rain, since PrecipitationOccluder
+            // hangs this updater on the sky root the moment precipitation resumes. It needs "weather
+            // particle occlusion" enabled, which is off by default, which is why it went unnoticed.
+            //
+            // Returning is the right answer rather than a fallback matrix: there is no camera here to
+            // derive one from, and the consumer of this uniform is the ordinary render path, which is
+            // always driven by a real cull and will overwrite it on the next frame regardless.
+            osgUtil::CullVisitor* cullVisitor = nv->asCullVisitor();
+            if (cullVisitor == nullptr)
+                return;
+            osg::Camera* camera = cullVisitor->getCurrentCamera();
+            if (camera == nullptr)
+                return;
             stateset->getUniform("depthSpaceMatrix")->set(camera->getViewMatrix() * camera->getProjectionMatrix());
         }
 
@@ -71,7 +89,14 @@ namespace
         }
         void apply(osg::StateSet* stateset, osg::NodeVisitor* nv) override
         {
-            osg::Camera* camera = nv->asCullVisitor()->getCurrentCamera();
+            // Same hazard as PrecipitationOcclusionUpdater above: a visitor that is not a CullVisitor has
+            // no current camera, and asCullVisitor() hands back null rather than refusing.
+            osgUtil::CullVisitor* cullVisitor = nv->asCullVisitor();
+            if (cullVisitor == nullptr)
+                return;
+            osg::Camera* camera = cullVisitor->getCurrentCamera();
+            if (camera == nullptr)
+                return;
             stateset->getUniform("projectionMatrix")->set(camera->getProjectionMatrix());
         }
 

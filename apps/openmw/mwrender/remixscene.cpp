@@ -3340,6 +3340,17 @@ namespace
 
                 // Merged after the node's own state set so the animated value wins, which is the precedence
                 // the cull path produces by pushing it on top.
+                //
+                // apply() is handed this visitor, which is not a CullVisitor, and an updater written for the
+                // cull path is entitled to assume it is one. Two in the engine did: both updaters in
+                // precipitationocclusion.cpp opened with nv->asCullVisitor()->getCurrentCamera(), which is a
+                // null dereference from here, and it was a reproducible crash on stepping out of an interior
+                // into rain. They are guarded at the source rather than filtered here, because filtering
+                // would have cost real state -- TransparencyUpdater is also a cull callback on this path,
+                // carries no SceneUtil::Controller so any "controllers only" test drops it, and its actor
+                // alpha is state this traversal needs. If an upstream merge reintroduces an unguarded
+                // asCullVisitor() in a StateSetUpdater attached as a cull callback, this line is where it
+                // will crash.
                 osg::StateSet& animated = mScene.animatedStateFor(*updater);
                 updater->apply(&animated, this);
                 mergeState(animated, surface);
