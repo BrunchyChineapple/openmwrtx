@@ -4183,11 +4183,11 @@ namespace MWRender
                              << " identities, " << mTexturesReleased << " released and " << mMaterialsReleased
                              << " materials with them"
                              // The number that decides whether the runtime's NEE cache prefix-sum index
-                             // holds. Note the real ceiling is 16,777,214 and not the 67,108,863 the runtime
-                             // logs -- see kPrimitiveBudget for why. Instances turned away being non-zero
-                             // means the budget is binding, and since admission is nearest-first what is
-                             // missing is the far field; it staying zero means the scene fits and this cost
-                             // nothing.
+                             // holds. Both that and the primitive index are 27 bits as of 2026-08-18, so the
+                             // ceiling the runtime logs is now the real one -- see kPrimitiveBudget for the
+                             // history. Instances turned away being non-zero means the budget is binding, and
+                             // since admission is nearest-first what is missing is the far field; it staying
+                             // zero means the scene fits and this cost nothing.
                              << "; " << mPrimitivesSubmitted << " triangles submitted of "
                              << primitiveBudget() << " budgeted, " << mInstancesOverBudget
                              << " instances turned away"

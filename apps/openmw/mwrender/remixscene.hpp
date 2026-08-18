@@ -1039,23 +1039,32 @@ namespace MWRender
 
         /// Default ceiling on triangles submitted in one frame.
         ///
-        /// **The 67,108,863 figure the runtime logs is not the real limit.** `PRIMITIVE_INDEX_BIT_COUNT`
-        /// is 26 in the runtime's `instance_definitions.h`, but grepping the runtime for it finds exactly
-        /// one use: the log message that prints it. Nothing packs a primitive index into 26 bits. The field
-        /// that actually constrains the count is the NEE cache's prefix-sum ID, which is **24** bits --
-        /// `NEE_CACHE_INVALID_ID` is `0xffffff`, and `update_nee_cache.comp.slang` masks tasks with
-        /// `& 0xffffff` and packs them as `(range << 24) | prefixSumID`. With the sentinel reserved the
-        /// usable range is 16,777,214.
+        /// **The ceiling the runtime logs is the real one as of 2026-08-18.** It was not before then, and
+        /// the history is kept because it inverts the advice below. `PRIMITIVE_INDEX_BIT_COUNT` used to be
+        /// 26 with exactly one use -- the log message that printed it -- while the field that actually
+        /// constrained the count was the NEE cache's prefix-sum ID at **24** bits: `NEE_CACHE_INVALID_ID`
+        /// was `0xffffff` and `update_nee_cache.comp.slang` packed tasks as `(range << 24) | prefixSumID`,
+        /// giving a usable range of 16,777,214. So the logged 67,108,863 was fiction and this default sat
+        /// 3.3x above what really bound.
         ///
-        /// So this default is **3.3x above the real ceiling**, not comfortably below a 67M one. It is left
-        /// where it is only because lowering it was unsafe while the budget dropped arbitrary geometry;
-        /// with flushSubmissions sorting nearest-first that objection is gone, and the number wants
-        /// re-measuring downwards. Use OPENMW_REMIX_PRIMITIVE_BUDGET to try values without a rebuild.
+        /// NVIDIA's "Raise primitive id bitcount at cost of reducing range bits", cherry-picked into the
+        /// runtime fork, took `PRIMITIVE_INDEX_BIT_COUNT` to **27** and made the NEE cache derive its
+        /// packing from it instead of carrying its own width. `NEE_CACHE_INVALID_ID` is now
+        /// `PRIMITIVE_INDEX_MAX_VALUE`, the packing is `(range << PRIMITIVE_INDEX_BIT_COUNT) | prefixSumID`,
+        /// and the NEE limit is 134,217,726 -- exactly one below the primitive index ceiling of
+        /// 134,217,727, because it still reserves all-ones for "invalid". The two limits are now within one
+        /// of each other, so there is no hidden tighter one to account for.
+        ///
+        /// So this default is **2.4x below** the real ceiling rather than 3.3x above it, and the standing
+        /// note to re-measure it downwards no longer applies as a safety matter -- that was motivated by
+        /// the 16.7M limit, which is gone. Lowering it is now purely a frame-time question. Use
+        /// OPENMW_REMIX_PRIMITIVE_BUDGET to try values without a rebuild.
         ///
         /// What exceeding it costs: truncated prefix-sum IDs resolve to a garbage surface and primitive,
         /// which the runtime's own source notes "can cause an out-of-range shared memory access in the
-        /// update shader" (`integrator_indirect.slangh`). Measured at 143,278,765 triangles -- 8.5x the
-        /// real ceiling -- arriving as an AppHangTransient with three nvlddmkm resets behind it.
+        /// update shader" (`integrator_indirect.slangh`). Measured at 143,278,765 triangles arriving as an
+        /// AppHangTransient with three nvlddmkm resets behind it -- and that total still exceeds
+        /// 134,217,726, so the widened field does not make that scene safe.
         ///
         /// Set below whatever limit is chosen rather than at it, because this counts what this traversal
         /// hands over and the runtime adds its own replacement geometry on top.
