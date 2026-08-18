@@ -830,6 +830,19 @@ namespace MWRender
         /// Material handle to the textures it references.
         std::unordered_map<unsigned long long, MaterialTextures> mMaterialAlbedoHashes;
 
+        /// Material handle to the uniform opacity its asset asked for, for the few that ask for one.
+        ///
+        /// The runtime will not take this on a material. opaque_surface_material_interaction.slangh reads
+        /// albedoOpacityConstant.a only when no albedo texture is bound and otherwise replaces it with the
+        /// texture's own alpha channel, so a material-level opacity is discarded for every textured surface.
+        /// The value that does survive is the instance's texture factor, which means the submit path needs
+        /// to recover a material property from a mesh handle -- mMeshes gives the material, this gives the
+        /// alpha.
+        ///
+        /// Only surfaces on the blend path with an alpha below 1 get an entry, which measured at 46 in a
+        /// session against 762 textures, so a miss is the common case and costs one probe.
+        std::unordered_map<unsigned long long, float> mMaterialAlphaScale;
+
         /// Texture-and-outcome pairs the particle diagnostic has already reported, so it says each once.
         ///
         /// Particles are rebuilt and resubmitted every frame, so an unguarded line here would be thousands a
@@ -974,6 +987,9 @@ namespace MWRender
             unsigned int mCategoryFlags;
             const SceneUtil::RigGeometry* mRig;
             unsigned int mPickingValue;
+            /// Uniform opacity for the whole instance, 1 when the material asked for none. Carried
+            /// here because the runtime only accepts it per instance -- see drawInstance.
+            float mMaterialAlpha;
             float mDistanceSquared;
             unsigned int mPrimitives; ///< Zero for an identity with no recorded triangle count.
             bool mDoubleSided;

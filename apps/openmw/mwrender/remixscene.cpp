@@ -3597,6 +3597,7 @@ namespace MWRender
         }
         mMaterials.clear();
         mMaterialAlbedoHashes.clear();
+        mMaterialAlphaScale.clear();
         // Walked by identity rather than by cache entry, because mTextures is keyed per image and several
         // images can name one identity -- iterating it destroyed a shared texture once per image that
         // referenced it. Harmless at process exit, but this loop is the obvious model for anyone adding a
@@ -5275,9 +5276,36 @@ namespace MWRender
             = envFlag("OPENMW_REMIX_BLEND_ANIMATED_UV", Settings::remix().mBlendAnimatedUv);
         const bool blendForAnimatedUv = blendAnimatedUv && surface.mUvAnimated && surface.mAlphaBlend
             && !surface.mPreferBlend && !surface.mAdditive;
+
+        // A material that asks for partial alpha gets real blending, because a cutout cannot express it.
+        //
+        // This is the third asset class to need the same exemption, after particles and animated-UV effects,
+        // and it is the one the cutout substitution fails hardest. The substitution is calibrated for
+        // foliage, whose transparency lives in a texture alpha that is effectively binary -- leaf or gap.
+        // NiMaterialProperty's mAlpha is the opposite kind of statement: one uniform opacity across the
+        // whole surface, with no per-texel variation for a threshold to pick apart. Testing it against a
+        // threshold has exactly two outcomes, both wrong -- fully solid above, fully gone below.
+        //
+        // Morrowind's ghosts are the visible case. A Guardian Wraith is an ordinary alpha-blended mesh with
+        // no UV animation and no particle system, so it fell through to the cutout branch, and its ~0.5
+        // material alpha tested as solid across every texel. The result is an opaque wraith with its death
+        // ash piles showing through underneath. Spell and enchantment effects are built the same way and
+        // fail the same way.
+        //
+        // Cheap to test, and unambiguous: mMaterialAlpha is only below 1 when the NIF said so. nifloader
+        // attaches a material solely when its values differ from the defaults, and forces diffuse to white
+        // where vertex colours are routed into it, so foliage does not reach this and keeps its cutout.
+        //
+        // Gated like its two siblings above so a wrong call does not need a rebuild to undo.
+        static const bool blendMaterialAlpha
+            = envFlag("OPENMW_REMIX_BLEND_MATERIAL_ALPHA", true);
+        const bool blendForMaterialAlpha = blendMaterialAlpha && surface.mAlphaBlend
+            && surface.mMaterialAlpha < 1.0f;
+
         unsigned char alphaTestReference = surface.mAlphaTestReference;
         int blendType = kBlendTypeNone;
-        if (surface.mAlphaBlend && (surface.mPreferBlend || surface.mAdditive || blendForAnimatedUv))
+        if (surface.mAlphaBlend
+            && (surface.mPreferBlend || surface.mAdditive || blendForAnimatedUv || blendForMaterialAlpha))
         {
             // Additive gets the emissive blend type, which is the same translation the runtime applies to a
             // legacy SRC_ALPHA/ONE draw call. Note this stacks with the emissive term materialFor is handed
@@ -5675,6 +5703,30 @@ namespace MWRender
                                      ? ""
                                      : (hasGlowMap ? " (glow map)"
                                                       : (emissive > 0.0f ? " (caller)" : " (material)")))
+                             // The material's own alpha, and which condition put this surface on the blend
+                             // path rather than the cutout path.
+                             //
+                             // "blend yes -> blend alpha" is four different states wearing one label, and
+                             // telling them apart is the difference between knowing a fix worked and assuming
+                             // it did. A Guardian Wraith logged as blend alpha with no way to see whether
+                             // that came from its material alpha, a particle flag, an additive blend or a UV
+                             // animation -- so a change aimed at material alpha could not be confirmed to
+                             // have fired at all.
+                             //
+                             // matAlpha is also the value the instance's texture factor carries, so a
+                             // surface logged as blendVia matAlpha is exactly one whose opacity is being
+                             // modulated at the alpha stage rather than taken from its albedo's alpha.
+                             << "; matAlpha " << surface.mMaterialAlpha
+                             << " blendVia "
+                             << (!surface.mAlphaBlend
+                                     ? "none"
+                                     : (surface.mAdditive
+                                            ? "additive"
+                                            : (surface.mPreferBlend
+                                                   ? "prefer"
+                                                   : (blendForMaterialAlpha
+                                                          ? "matAlpha"
+                                                          : (blendForAnimatedUv ? "animatedUv" : "cutout")))))
                              << (mMaterialsLogged == mMaterialLogLimit ? " (last of these)" : "");
         }
 
@@ -5699,6 +5751,43 @@ namespace MWRender
         // two different surface states -- foliage and fabric, blended in one place and alpha-cutout at a
         // specific threshold in another -- and keying on the texture alone collapses each pair onto whichever
         // was created first.
+        // The material's alpha rides on the instance's texture factor, not on the material's own constant.
+        //
+        // Both look like they should work and only one does. opacityConstant lands in the runtime's
+        // albedoOpacityConstant, and opaque_surface_material_interaction.slangh reads it only as a fallback:
+        // `opacity = albedoOpacityConstant.a` is immediately overwritten by `opacity = albedoOpacitySample.a`
+        // whenever an albedo texture is bound, which here is always. So the alpha was computed, submitted and
+        // discarded, and every surface took whatever its texture's alpha channel happened to say.
+        //
+        // Which for Morrowind's ghosts is 1. Measured on pc_crea_wraith_01.dds -- DXT5, 512x512 -- 12,336 of
+        // its 16,384 alpha blocks are a flat 255/255, the rest being the cut-away background and its edges.
+        // A Guardian Wraith therefore resolved at opacity 1.0, tripped the
+        // `opacity >= resolveOpaquenessThreshold` early out in resolve.slangh and was recorded as a final
+        // opaque hit, never reaching the stochastic alpha blend forty lines below it -- which is the mechanism
+        // that would have made it see-through. Hence a solid wraith with its death ash piles showing through
+        // underneath, and the same failure on everything else asking for uniform partial opacity.
+        //
+        // The fix is on the instance, in drawInstance: Modulate(Texture, TFactor) with the alpha in the
+        // texture factor, which is how the fixed-function pipeline applies NiMaterialProperty's alpha and
+        // what the runtime still evaluates. This end of it only has to stop applying the same alpha twice --
+        // on a surface with no albedo texture the constant *is* read, and would then be modulated by itself.
+        // Restricted to the blend path, which is the same condition that records the value for the instance.
+        // A cutout keeps its constant, because there the alpha is tested rather than blended and moving it
+        // would move the threshold.
+        //
+        // Rejected: making these surfaces translucent materials. Built, measured, reverted -- it renders a
+        // lit interior's ghosts black. A translucent surface's visible texture is its "diffuse layer", and
+        // that layer is not shaded by the scene's lights at all:
+        // translucent_surface_material_interaction.slangh folds it into diffuseLayerWeight and takes its
+        // radiance from the volumetric radiance cache, on the PSR path only. In a candle-lit cell that is
+        // close to zero, so the wraith came out as a silhouette with its red tunic gone. The unordered TLAS
+        // is no better and for the same reason, recorded at the terrain exclusion in
+        // rtx_instance_manager.cpp: it shades from the froxel cache with no sun and no shadows. Only the
+        // primary TLAS lights a surface properly, so the fix has to keep the surface there and give it a
+        // real opacity -- which is what the texture factor does.
+        if (blendForMaterialAlpha && blendType == kBlendTypeAlpha)
+            opacityConstant = 1.0f;
+
         const unsigned long long handle = mRuntime.createTexturedMaterial(key | 1ull, textureHash, roughness,
             metallic, alphaTestReference, normalHash, emissiveIntensity, blendType, maskHash,
             maskHash != 0 ? maskTransform : nullptr, roughnessHash, glowHash, albedoConstant,
@@ -5717,6 +5806,18 @@ namespace MWRender
         // texture. An albedo-only index cannot enumerate the materials that name a normal map, so releasing
         // one would leave a live material pointing at a destroyed texture with nothing to detect it.
         mMaterialAlbedoHashes[handle] = MaterialTextures{ textureHash, normalHash, glowHash, maskHash };
+
+        // Remembered so the submit path can put this alpha on the instance.
+        //
+        // It cannot travel on the material, which is where it belongs and where it does nothing: the
+        // runtime overwrites a material's opacity constant with the albedo texture's alpha channel. So the
+        // value has to arrive per instance instead, as the texture factor, and the submit path only has a
+        // mesh handle to work from -- hence this, looked up through the mesh's material.
+        //
+        // Only populated for surfaces that actually asked for partial opacity, so it holds tens of entries
+        // rather than one per material, and a miss is the answer for everything else.
+        if (blendForMaterialAlpha && blendType == kBlendTypeAlpha)
+            mMaterialAlphaScale[handle] = surface.mMaterialAlpha;
 
         // Coverage summary, reported every 64 materials rather than per material.
         //
@@ -5795,6 +5896,22 @@ namespace MWRender
         pending.mPickingValue = pickingValue;
         pending.mDistanceSquared = distanceSquared;
         pending.mDoubleSided = doubleSided;
+
+        // The material's uniform opacity, recovered through the mesh because that is the only handle here.
+        //
+        // A mesh carries exactly one material, so this is unambiguous. Two lookups rather than a third map:
+        // mMeshes already records the material a mesh was built with, and mMaterialAlphaScale holds an entry
+        // only for the surfaces that asked for partial opacity. Particle meshes are not in mMeshes and fall
+        // through to 1, which is correct -- a particle's fade lives in its vertex colour alpha, and the fork
+        // points the alpha stage at that for anything tagged Particle, so a texture factor would be
+        // overwritten there anyway.
+        pending.mMaterialAlpha = 1.0f;
+        if (const auto cached = mMeshes.find(mesh); cached != mMeshes.end())
+        {
+            if (const auto alpha = mMaterialAlphaScale.find(cached->second.mMaterial);
+                alpha != mMaterialAlphaScale.end())
+                pending.mMaterialAlpha = alpha->second;
+        }
 
         // Unknown identities are admitted unweighed: particle meshes and the probe quad are individually
         // tiny, and the point of the budget is the merged distant chunks, which are always in the map
@@ -5886,10 +6003,12 @@ namespace MWRender
         const bool doubleSided = pending.mDoubleSided;
         const SceneUtil::RigGeometry* const rig = pending.mRig;
         const unsigned int pickingValue = pending.mPickingValue;
+        const float materialAlpha = pending.mMaterialAlpha;
 
         if (rig == nullptr)
         {
-            mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided, nullptr, 0, pickingValue);
+            mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided, nullptr, 0, pickingValue,
+                materialAlpha);
             return;
         }
 
@@ -5930,7 +6049,7 @@ namespace MWRender
         }
 
         if (mRuntime.drawInstance(mesh, transform, categoryFlags, doubleSided,
-                mBoneTransformScratch.data(), boneCount, pickingValue))
+                mBoneTransformScratch.data(), boneCount, pickingValue, materialAlpha))
             ++mSkinnedInstances;
     }
 
@@ -6319,6 +6438,7 @@ namespace MWRender
                     key = (key->second == handle) ? mMaterials.erase(key) : std::next(key);
 
                 mRuntime.destroyMaterial(handle);
+                mMaterialAlphaScale.erase(handle);
                 mat = mMaterialAlbedoHashes.erase(mat);
                 ++mMaterialsReleased;
             }

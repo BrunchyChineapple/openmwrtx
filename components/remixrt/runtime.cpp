@@ -1382,7 +1382,7 @@ namespace RemixRT
 
     bool Runtime::drawInstance(unsigned long long mesh, const float* transform,
         unsigned int categoryFlags, bool doubleSided, const float* boneTransforms, unsigned int boneCount,
-        unsigned int objectPickingValue)
+        unsigned int objectPickingValue, float materialAlpha)
     {
         if (!mImpl->mStarted || mImpl->mApi.DrawInstance == nullptr || mesh == 0 || transform == nullptr)
             return false;
@@ -1431,6 +1431,48 @@ namespace RemixRT
             picking.objectPickingValue = objectPickingValue;
             picking.pNext = instance.pNext;
             instance.pNext = &picking;
+        }
+
+        // Uniform material opacity, carried on the texture factor because nothing else survives.
+        //
+        // The runtime composes a surface's opacity through the fixed-function alpha stage:
+        // opaque_surface_material_interaction.slangh starts from the material's albedoOpacityConstant.a,
+        // replaces it with the albedo texture's alpha channel whenever a texture is bound, and then runs
+        // chooseTextureOperationAlpha over textureAlphaArg1Source / Arg2Source. An instance submitted
+        // without this extension keeps LegacyMaterialData's defaults there -- SelectArg1 with
+        // arg1 = Texture -- which selects the albedo's own alpha and discards everything else. So a
+        // material-level opacity reaches the runtime and is thrown away for every textured surface.
+        //
+        // Modulate(Texture, TFactor) is what D3D9 fixed function does for the same asset, and gives
+        // `texture alpha * material alpha`. The alpha lives in the top byte, matching D3DRS_TEXTUREFACTOR's
+        // ARGB packing -- the runtime reads it as `surface.tFactor >> 24` when deciding opacity micromap
+        // eligibility, and the shader unpacks the same word with a .bgra swizzle.
+        //
+        // Attached only when there is something to say, so an ordinary surface is submitted exactly as
+        // before. Every other field mirrors what LegacyMaterialData already holds for an API draw, because
+        // this extension replaces that whole block rather than merging into it: the colour stage stays
+        // Modulate(Texture, None) which is inert, the blend mode stays zeroed because the material -- not
+        // this struct -- is what declares blending unless it opts into useDrawCallAlphaState, and
+        // isVertexColorBakedLighting stays 1 to match rtx.vertexColorIsBakedLighting's default, which is
+        // the value the runtime would otherwise have substituted here.
+        remixapi_InstanceInfoBlendEXT blend = {};
+        if (materialAlpha < 1.0f)
+        {
+            const unsigned int alpha = static_cast<unsigned int>(
+                std::clamp(materialAlpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+
+            blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+            blend.alphaTestCompareOp = 7; // VK_COMPARE_OP_ALWAYS, i.e. no alpha test
+            blend.textureColorArg1Source = 1; // Texture
+            blend.textureColorArg2Source = 0; // None
+            blend.textureColorOperation = 3; // Modulate
+            blend.textureAlphaArg1Source = 1; // Texture
+            blend.textureAlphaArg2Source = 3; // TFactor
+            blend.textureAlphaOperation = 3; // Modulate
+            blend.tFactor = 0x00ffffffu | (alpha << 24);
+            blend.isVertexColorBakedLighting = 1;
+            blend.pNext = instance.pNext;
+            instance.pNext = &blend;
         }
 
         return mImpl->mApi.DrawInstance(&instance) == REMIXAPI_ERROR_CODE_SUCCESS;

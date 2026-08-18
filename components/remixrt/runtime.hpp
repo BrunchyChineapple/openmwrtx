@@ -574,9 +574,19 @@ namespace RemixRT
         /// @param objectPickingValue identifies this draw to the developer menu, so clicking the scene
         ///        selects what is under the cursor. Must be non-zero and distinct per draw within a
         ///        frame; zero opts out and leaves the instance unpickable.
+        /// @param materialAlpha uniform opacity for the whole instance, multiplied into whatever its
+        ///        albedo alpha says. 1 leaves the surface exactly as its material describes it.
+        ///
+        ///        Sent as the alpha of D3DRS_TEXTUREFACTOR with the alpha stage set to
+        ///        Modulate(Texture, TFactor), which is how the fixed-function pipeline applies
+        ///        NiMaterialProperty's alpha and what the runtime still evaluates for every surface.
+        ///        It has to travel this way rather than on the material: the runtime reads a material's
+        ///        opacity constant only when no albedo texture is bound, and overwrites it with the
+        ///        texture's own alpha channel otherwise -- so a material-level alpha is silently dropped
+        ///        for every textured surface, which is all of them.
         bool drawInstance(unsigned long long mesh, const float* transform, unsigned int categoryFlags,
             bool doubleSided, const float* boneTransforms = nullptr, unsigned int boneCount = 0,
-            unsigned int objectPickingValue = 0);
+            unsigned int objectPickingValue = 0, float materialAlpha = 1.0f);
 
         /// Most bones one skinned instance can have. The runtime packs bone indices one per byte, so
         /// this is a hard limit rather than a tuning value.
