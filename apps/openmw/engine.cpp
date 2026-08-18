@@ -2590,6 +2590,31 @@ void OMW::Engine::go()
     osg::ref_ptr<Resource::StatsHandler> resourcesHandler = new Resource::StatsHandler(stats.is_open(), *mVFS);
     mViewer->addEventHandler(resourcesHandler);
 
+    // In PRESENT mode OpenMW's own framebuffer is never swapped, so the F3 profiler and F4 resource
+    // overlays draw where nothing reaches the screen from. MyGUI's camera is routed into Remix's overlay
+    // image back in prepareEngine; these two need the same bracket to be visible at all.
+    //
+    // They get their own brackets rather than joining MyGUI's because OSG runs them from the graphics
+    // context, after the master camera's entire stage tree that MyGUI lives inside, and there is no
+    // callback spanning the two. GuiOverlayTarget clears once per frame instead of once per bracket so the
+    // three accumulate into one image rather than overwriting each other.
+    //
+    // Composited mode leaves mRemixOverlayTarget null and these cameras untouched: there they already draw
+    // on top of the composite, for that same reason of running after the master camera's tree.
+    if (mRemixOverlayTarget != nullptr)
+    {
+        // Both cameras exist from construction and only acquire a graphics context when first toggled on,
+        // so installing the callbacks now is enough -- they are still in place whenever drawing starts.
+        for (osg::Camera* overlayCamera : { statsHandler->getCamera(), resourcesHandler->getCamera() })
+        {
+            if (overlayCamera == nullptr)
+                continue;
+
+            overlayCamera->setPreDrawCallback(new RemixRT::GuiOverlayBegin(mRemixOverlayTarget.get()));
+            overlayCamera->setPostDrawCallback(new RemixRT::GuiOverlayEnd(mRemixOverlayTarget.get()));
+        }
+    }
+
     if (stats.is_open())
         Resource::collectStatistics(*mViewer);
 

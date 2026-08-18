@@ -9,6 +9,7 @@
 #include <osg/Camera>
 #include <osg/Drawable>
 #include <osg/GraphicsContext>
+#include <osg/RenderInfo>
 #include <osg/ref_ptr>
 
 #include "runtime.hpp"
@@ -291,6 +292,11 @@ namespace RemixRT
         mutable unsigned int mFramebuffer = 0;
         mutable bool mFailed = false;
         mutable bool mLoggedReady = false;
+        /// Frame the target was last cleared on, so the clear happens once a frame rather than once per
+        /// bracket. More than one camera draws here -- the interface, and the F3/F4 overlays, which sit in
+        /// a later scheduling tier and so need brackets of their own. ~0u because frame numbers start at 0
+        /// and nothing should compare equal before the first clear.
+        mutable unsigned int mLastClearedFrame = ~0u;
         /// Saved across begin/end so the GUI camera's drawing does not leak its target into whatever OSG
         /// draws next. Only valid between the two calls.
         mutable int mSavedFramebuffer = 0;
@@ -312,6 +318,22 @@ namespace RemixRT
         mutable bool mLoggedScratch = false;
     };
 
+    /// True when the camera currently being drawn is switched off, so its bracket can be skipped whole.
+    ///
+    /// The F3 and F4 overlays stay attached to the graphics context once they have been toggled on for the
+    /// first time; turning them off only drops the camera's node mask to zero. Without this their brackets
+    /// would still bind, blit and restore every frame in order to draw nothing.
+    ///
+    /// Both adapters test it, so a skipped begin is always matched by a skipped end and the target never
+    /// ends up half-entered. Safe to pair, because a node mask only changes during event handling and
+    /// cannot change between one camera's pre- and post-draw. A camera we cannot identify is treated as
+    /// visible, leaving the bracket to behave exactly as it did before.
+    inline bool overlayCameraHidden(osg::RenderInfo& renderInfo)
+    {
+        const osg::Camera* camera = renderInfo.getCurrentCamera();
+        return camera != nullptr && camera->getNodeMask() == 0;
+    }
+
     /// Adapters that drive GuiOverlayTarget from a camera's pre- and post-draw callbacks.
     ///
     /// Two classes rather than one with a flag, because OSG identifies a callback by which slot it was
@@ -323,7 +345,13 @@ namespace RemixRT
             : mTarget(target)
         {
         }
-        void operator()(osg::RenderInfo& renderInfo) const override { mTarget->begin(renderInfo); }
+        void operator()(osg::RenderInfo& renderInfo) const override
+        {
+            if (overlayCameraHidden(renderInfo))
+                return;
+
+            mTarget->begin(renderInfo);
+        }
 
     private:
         osg::ref_ptr<GuiOverlayTarget> mTarget;
@@ -336,7 +364,13 @@ namespace RemixRT
             : mTarget(target)
         {
         }
-        void operator()(osg::RenderInfo& renderInfo) const override { mTarget->end(renderInfo); }
+        void operator()(osg::RenderInfo& renderInfo) const override
+        {
+            if (overlayCameraHidden(renderInfo))
+                return;
+
+            mTarget->end(renderInfo);
+        }
 
     private:
         osg::ref_ptr<GuiOverlayTarget> mTarget;

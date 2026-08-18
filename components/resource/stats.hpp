@@ -50,6 +50,11 @@ namespace Resource
         /** Get the keyboard and mouse usage of this manipulator.*/
         void getUsage(osg::ApplicationUsage& usage) const override;
 
+        /// The HUD camera this overlay draws into. Exposed to match osgViewer::StatsHandler::getCamera,
+        /// so a backend that does not present OpenMW's own framebuffer can route the overlay somewhere
+        /// visible. Non-null from construction; it only acquires a graphics context on first toggle.
+        osg::Camera* getCamera() { return mCamera.get(); }
+
     private:
         unsigned mPage = 0;
         bool mInitialized = false;

@@ -1474,12 +1474,25 @@ namespace RemixRT
         ext->glBindFramebuffer(kFramebuffer, mScratchBound ? mScratchFramebuffer : mFramebuffer);
         glViewport(0, 0, static_cast<GLsizei>(mWidth), static_cast<GLsizei>(mHeight));
 
-        // Transparent black, every frame. The whole image is replaced rather than accumulated: the GUI is
-        // redrawn from scratch each frame, and anything left behind would persist as a ghost of a window
-        // that has since closed. Alpha zero is what makes Remix's blend leave the path-traced image alone
-        // wherever nothing was drawn.
-        glClearColor(0.f, 0.f, 0.f, 0.f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        // Transparent black, once per frame. The image is replaced rather than accumulated across frames:
+        // the interface is redrawn from scratch each frame, and anything left behind would persist as a
+        // ghost of a window that has since closed. Alpha zero is what makes Remix's blend leave the
+        // path-traced image alone wherever nothing was drawn.
+        //
+        // Once per frame and not once per bracket, though. Several cameras draw into this image -- MyGUI's,
+        // and the F3 and F4 overlay cameras, which OSG runs from the graphics context after the master
+        // camera's whole tree and so cannot share one bracket. Clearing on every begin would leave only
+        // whichever camera happened to draw last, so the frame stamp decides: the first bracket of a frame
+        // starts from transparent black and the rest draw on top of it.
+        const osg::FrameStamp* frameStamp = state->getFrameStamp();
+        if (frameStamp == nullptr || frameStamp->getFrameNumber() != mLastClearedFrame)
+        {
+            if (frameStamp != nullptr)
+                mLastClearedFrame = frameStamp->getFrameNumber();
+
+            glClearColor(0.f, 0.f, 0.f, 0.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
 
         if (!mLoggedReady)
         {
